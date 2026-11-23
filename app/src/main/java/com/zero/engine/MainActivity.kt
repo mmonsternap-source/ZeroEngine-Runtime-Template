@@ -7,13 +7,11 @@ import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
 import android.net.Uri
-import android.opengl.GLSurfaceView
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Base64
 import android.view.Gravity
-import android.view.MotionEvent
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.JavascriptInterface
@@ -24,6 +22,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import org.json.JSONArray
 import java.io.File
+import java.util.Collections
 
 class MainActivity : Activity() {
 
@@ -33,12 +32,12 @@ class MainActivity : Activity() {
 
     private lateinit var container: FrameLayout
     private var editorWebView: WebView? = null
-    private var glView: GLSurfaceView? = null
-    private var scriptRuntime: ScriptRuntime? = null
+    private var engineView: ZeroEngineView? = null
     private var isPlaying = false
     private val PICK_IMAGE_CODE = 1001
     private val uiHandler = Handler(Looper.getMainLooper())
-    private var profilerTask: Runnable? = null
+    private val consoleLogs = Collections.synchronizedList(mutableListOf<String>())
+    private var liveConsoleView: TextView? = null
 
     private var currentProject: String = "DefaultProject"
 
@@ -50,11 +49,28 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun appendConsoleLog(msg: String) {
+        synchronized(consoleLogs) {
+            consoleLogs.add(msg)
+            if (consoleLogs.size > 200) {
+                consoleLogs.removeAt(0)
+            }
+        }
+        uiHandler.post {
+            liveConsoleView?.text = getRecentLogs(3)
+        }
+    }
+
+    private fun getRecentLogs(limit: Int): String {
+        synchronized(consoleLogs) {
+            return consoleLogs.takeLast(limit).joinToString("\n")
+        }
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        AudioEngine.init()
         getProjectDir()
 
         container = FrameLayout(this)
@@ -67,10 +83,13 @@ class MainActivity : Activity() {
                 addJavascriptInterface(EngineBridge(), "ZeroBridge")
                 loadUrl("file:///android_asset/editor.html")
             }
-            container.addView(editorWebView, FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            ))
+            container.addView(
+                editorWebView,
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+            )
         } else {
             val defaultJson = assets.open("main.scene.json").bufferedReader().use { it.readText() }
             startPlayMode(defaultJson)
@@ -116,13 +135,21 @@ class MainActivity : Activity() {
         }
 
         @JavascriptInterface
-        fun runGame(sceneJson: String) { runOnUiThread { startPlayMode(sceneJson) } }
+        fun runGame(sceneJson: String) {
+            runOnUiThread { startPlayMode(sceneJson) }
+        }
 
         @JavascriptInterface
-        fun getConsoleLogs(): String = EngineConsole.dump()
+        fun getConsoleLogs(): String {
+            synchronized(consoleLogs) {
+                return consoleLogs.joinToString("\n")
+            }
+        }
 
         @JavascriptInterface
-        fun clearConsoleLogs() = EngineConsole.clear()
+        fun clearConsoleLogs() {
+            consoleLogs.clear()
+        }
 
         @JavascriptInterface
         fun pickImage() {
@@ -168,59 +195,29 @@ class MainActivity : Activity() {
         }
     }
 
-    @SuppressLint("ClickableViewAccessibility")
     private fun startPlayMode(sceneJson: String) {
         if (isPlaying) return
         isPlaying = true
-        EngineConsole.clear()
-        EngineConsole.log("Project [$currentProject] Runtime started.")
+        consoleLogs.clear()
+        appendConsoleLog("[SYSTEM] Project [$currentProject] v0.3 Runtime started.")
 
         val projDir = getProjectDir()
-        val rootNode = Node2D("Root")
-        val camera = Camera2D("MainCamera").apply { x = 540f; y = 960f }
-        rootNode.addChild(camera)
-
-        SceneLoader.loadFromString(sceneJson, rootNode)
-
-        val runtime = ScriptRuntime(projDir, rootNode, camera)
-        scriptRuntime = runtime
-        val renderer = GLRenderer(this, projDir, rootNode, camera, runtime)
-
-        val surface = GLSurfaceView(this).apply {
-            setEGLContextClientVersion(2)
-            setRenderer(renderer)
-            renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
-            setOnTouchListener { _, event ->
-                val tx = event.x
-                val ty = event.y
-                when (event.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> {
-                        InputState.isTouching = true
-                        InputState.justPressed = true
-                        InputState.touchX = tx
-                        InputState.touchY = ty
-                        queueEvent { runtime.dispatchInput("down", tx, ty) }
-                    }
-                    MotionEvent.ACTION_MOVE -> {
-                        InputState.touchX = tx
-                        InputState.touchY = ty
-                        queueEvent { runtime.dispatchInput("move", tx, ty) }
-                    }
-                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                        InputState.isTouching = false
-                        InputState.justReleased = true
-                        InputState.touchX = tx
-                        InputState.touchY = ty
-                        queueEvent { runtime.dispatchInput("up", tx, ty) }
-                    }
-                }
-                true
-            }
-        }
-        glView = surface
+        val surface = ZeroEngineView(
+            context = this,
+            projectDir = projDir,
+            sceneJson = sceneJson,
+            onConsoleLog = { msg -> appendConsoleLog(msg) }
+        )
+        engineView = surface
 
         container.removeAllViews()
-        container.addView(surface)
+        container.addView(
+            surface,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
 
         if (EDITOR_MODE) {
             val hudOverlay = LinearLayout(this).apply {
@@ -233,8 +230,8 @@ class MainActivity : Activity() {
                 gravity = Gravity.CENTER_VERTICAL
             }
 
-            val profilerText = TextView(this).apply {
-                text = "FPS: 60 | Nodes: 0 | DC: 0"
+            val statusText = TextView(this).apply {
+                text = "ZeroEngine v0.3 | 2.5D OpenGL ES 2.0"
                 textSize = 12f
                 typeface = Typeface.MONOSPACE
                 setTextColor(Color.parseColor("#34D399"))
@@ -250,11 +247,17 @@ class MainActivity : Activity() {
                 setOnClickListener { stopPlayMode() }
             }
 
-            topRow.addView(profilerText, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = 16 })
-            topRow.addView(stopBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            topRow.addView(
+                statusText,
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = 16 }
+            )
+            topRow.addView(
+                stopBtn,
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            )
 
             val liveConsole = TextView(this).apply {
-                text = ""
+                text = getRecentLogs(3)
                 textSize = 11f
                 typeface = Typeface.MONOSPACE
                 setTextColor(Color.parseColor("#F8FAFC"))
@@ -262,36 +265,33 @@ class MainActivity : Activity() {
                 setPadding(16, 8, 16, 8)
                 maxLines = 4
             }
+            liveConsoleView = liveConsole
 
             hudOverlay.addView(topRow)
-            hudOverlay.addView(liveConsole, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = 8 })
-
-            container.addView(hudOverlay, FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP
-            ))
-
-            profilerTask = object : Runnable {
-                override fun run() {
-                    if (!isPlaying) return
-                    profilerText.text = "FPS: ${renderer.currentFps} | Nodes: ${renderer.nodeCount} | DC: ${renderer.drawCalls}"
-                    liveConsole.text = EngineConsole.dump().lines().takeLast(3).joinToString("\n")
-                    uiHandler.postDelayed(this, 300)
+            hudOverlay.addView(
+                liveConsole,
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                    topMargin = 8
                 }
-            }
-            uiHandler.post(profilerTask!!)
+            )
+
+            container.addView(
+                hudOverlay,
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.TOP
+                )
+            )
         }
     }
 
     private fun stopPlayMode() {
         if (!isPlaying) return
         isPlaying = false
-        profilerTask?.let { uiHandler.removeCallbacks(it) }
-        glView?.queueEvent { scriptRuntime?.release() }
-        glView?.onPause()
-        glView = null
-        scriptRuntime = null
+        liveConsoleView = null
+        engineView?.onPause()
+        engineView = null
         container.removeAllViews()
         editorWebView?.let {
             container.addView(it)
@@ -304,7 +304,13 @@ class MainActivity : Activity() {
         if (EDITOR_MODE && isPlaying) stopPlayMode() else super.onBackPressed()
     }
 
-    override fun onResume() { super.onResume(); glView?.onResume() }
-    override fun onPause() { super.onPause(); glView?.onPause() }
-    override fun onDestroy() { super.onDestroy(); AudioEngine.release() }
+    override fun onResume() {
+        super.onResume()
+        engineView?.onResume()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        engineView?.onPause()
+    }
 }
