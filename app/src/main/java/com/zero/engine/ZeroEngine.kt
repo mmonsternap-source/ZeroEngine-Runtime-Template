@@ -22,16 +22,22 @@ import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.abs
 import kotlin.math.hypot
+import kotlin.math.sin
 import kotlin.random.Random
 
-// ==================== 1. 基础节点树（含点击与传染半径判定） ====================
+// ==================== 1. 基础节点树 ====================
 open class Node2D(val name: String) {
     var x: Float = 0f
     var y: Float = 0f
+    var vx: Float = 0f
+    var vy: Float = 0f
     var rotation: Float = 0f
     var scaleX: Float = 1f
     var scaleY: Float = 1f
     var visible: Boolean = true
+    var behavior: String = "none"
+    var tag: String = "default"
+    var stateFlag: Boolean = false // 通用状态标记（如：是否已感染、是否落地）
 
     val globalX: Float get() = (parent?.globalX ?: 0f) + x
     val globalY: Float get() = (parent?.globalY ?: 0f) + y
@@ -51,10 +57,7 @@ open class Node2D(val name: String) {
         children.remove(child)
     }
 
-    // 计算两个节点之间的像素距离（用于病毒扩散半径判断）
-    fun distanceTo(other: Node2D): Float {
-        return hypot(globalX - other.globalX, globalY - other.globalY)
-    }
+    fun distanceTo(other: Node2D): Float = hypot(globalX - other.globalX, globalY - other.globalY)
 
     inline fun <reified T : Node2D> findNodesByType(): List<T> {
         val result = mutableListOf<T>()
@@ -63,12 +66,8 @@ open class Node2D(val name: String) {
     }
 
     fun <T : Node2D> collectNodes(clazz: Class<T>, out: MutableList<T>) {
-        if (clazz.isInstance(this)) {
-            clazz.cast(this)?.let { out.add(it) }
-        }
-        for (i in children.indices) {
-            children[i].collectNodes(clazz, out)
-        }
+        if (clazz.isInstance(this)) clazz.cast(this)?.let { out.add(it) }
+        for (i in children.indices) children[i].collectNodes(clazz, out)
     }
 
     open fun onReady() {}
@@ -77,17 +76,19 @@ open class Node2D(val name: String) {
 
     internal fun updateTree(delta: Float) {
         onProcess(delta)
-        for (i in children.indices) children[i].updateTree(delta)
+        val snapshot = children.toList()
+        for (i in snapshot.indices) snapshot[i].updateTree(delta)
     }
 
     internal fun drawTree(renderer: GLRenderer) {
         if (!visible) return
         onDraw(renderer)
-        for (i in children.indices) children[i].drawTree(renderer)
+        val snapshot = children.toList()
+        for (i in snapshot.indices) snapshot[i].drawTree(renderer)
     }
 }
 
-// ==================== 2. 静态精灵图节点（支持触控点选判断） ====================
+// ==================== 2. 静态精灵图节点 ====================
 open class Sprite2D(
     name: String,
     var width: Float = 100f,
@@ -99,7 +100,6 @@ open class Sprite2D(
     var a: Float = 1f
 ) : Node2D(name) {
 
-    // 判断手指点击坐标 (px, py) 是否落在该节点范围内
     fun containsPoint(px: Float, py: Float, padding: Float = 20f): Boolean {
         val halfW = (width * scaleX) / 2f + padding
         val halfH = (height * scaleY) / 2f + padding
@@ -118,17 +118,15 @@ open class Sprite2D(
     }
 }
 
-// ==================== 3. 文字显示节点（用于显示感染率%、分数、倒计时） ====================
+// ==================== 3. 文字显示节点 ====================
 class Label2D(
     name: String,
     var text: String = "",
-    var fontSize: Float = 56f,
+    var fontSize: Float = 52f,
     var textColor: Int = Color.WHITE
 ) : Node2D(name) {
     override fun onDraw(renderer: GLRenderer) {
-        if (text.isNotEmpty()) {
-            renderer.drawText(text, globalX, globalY, fontSize, textColor)
-        }
+        if (text.isNotEmpty()) renderer.drawText(text, globalX, globalY, fontSize, textColor)
     }
 }
 
@@ -212,7 +210,7 @@ class Collider2D(
     name: String,
     var width: Float,
     var height: Float,
-    var tag: String = "default"
+    var colliderTag: String = "default"
 ) : Node2D(name) {
     fun intersects(other: Collider2D): Boolean {
         val halfW1 = (width * scaleX) / 2f
@@ -253,7 +251,7 @@ object AudioEngine {
     }
 }
 
-// ==================== 8. JSON 场景加载器 ====================
+// ==================== 8. 通用场景加载器 ====================
 object SceneLoader {
     fun loadFromAssets(context: Context, fileName: String, targetRoot: Node2D) {
         val jsonText = context.assets.open(fileName).bufferedReader().use { it.readText() }
@@ -291,10 +289,13 @@ object SceneLoader {
             node.x = item.optDouble("x", 0.0).toFloat()
             node.y = item.optDouble("y", 0.0).toFloat()
             node.rotation = item.optDouble("rotation", 0.0).toFloat()
+            node.behavior = item.optString("behavior", "none")
+            node.tag = item.optString("tag", "wall")
+
+            if (node.behavior == "patrol") node.vx = 240f
 
             if (item.optBoolean("collider", false)) {
-                val tag = item.optString("tag", "wall")
-                node.addChild(Collider2D("${name}_Collider", w, h, tag))
+                node.addChild(Collider2D("${name}_Collider", w, h, node.tag))
             }
 
             targetRoot.addChild(node)
@@ -302,7 +303,7 @@ object SceneLoader {
     }
 }
 
-// ==================== 9. OpenGL ES 2.0 硬件渲染器（支持图片、色块与动态文字） ====================
+// ==================== 9. OpenGL ES 2.0 硬件渲染器 ====================
 class GLRenderer(private val context: Context, private val rootNode: Node2D) : GLSurfaceView.Renderer {
 
     private var colorProgram = 0
