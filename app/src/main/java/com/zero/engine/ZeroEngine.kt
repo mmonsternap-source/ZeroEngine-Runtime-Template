@@ -2,6 +2,9 @@ package com.zero.engine
 
 import android.content.Context
 import android.graphics.BitmapFactory
+import android.media.AudioAttributes
+import android.media.MediaPlayer
+import android.media.SoundPool
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.GLUtils
@@ -13,6 +16,7 @@ import java.nio.FloatBuffer
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.abs
+import kotlin.random.Random
 
 // ==================== 1. 基础节点树（对标 Godot Node2D） ====================
 open class Node2D(val name: String) {
@@ -72,7 +76,7 @@ open class Node2D(val name: String) {
     }
 }
 
-// ==================== 2. 精灵图与色块节点（支持 PNG/WebP 透明贴图） ====================
+// ==================== 2. 静态精灵图节点（支持 PNG/WebP 透明贴图） ====================
 open class Sprite2D(
     name: String,
     var width: Float = 100f,
@@ -95,7 +99,134 @@ open class Sprite2D(
     }
 }
 
-// ==================== 3. 碰撞体节点（对标 Godot CollisionShape2D） ====================
+// ==================== 3. 序列帧动画节点（对标 Godot AnimatedSprite2D） ====================
+class AnimatedSprite2D(
+    name: String,
+    width: Float = 100f,
+    height: Float = 100f,
+    texturePath: String,
+    var hFrames: Int = 1,
+    var vFrames: Int = 1,
+    var fps: Float = 10f
+) : Sprite2D(name, width, height, texturePath) {
+
+    var frame: Int = 0
+    var playing: Boolean = true
+    var loop: Boolean = true
+
+    private var timer: Float = 0f
+    private val animations = mutableMapOf<String, List<Int>>()
+    private var currentAnimFrames: List<Int>? = null
+    private var currentAnimIndex: Int = 0
+
+    fun addAnimation(animName: String, frames: List<Int>) {
+        animations[animName] = frames
+    }
+
+    fun play(animName: String? = null, reset: Boolean = false) {
+        if (animName != null && animations.containsKey(animName)) {
+            val target = animations[animName]
+            if (currentAnimFrames !== target || reset) {
+                currentAnimFrames = target
+                currentAnimIndex = 0
+                frame = target?.firstOrNull() ?: 0
+                timer = 0f
+            }
+        }
+        playing = true
+    }
+
+    fun stop() {
+        playing = false
+    }
+
+    override fun onProcess(delta: Float) {
+        if (!playing || fps <= 0f) return
+        timer += delta
+        val frameDuration = 1f / fps
+        if (timer >= frameDuration) {
+            timer -= frameDuration
+            val custom = currentAnimFrames
+            if (custom != null && custom.isNotEmpty()) {
+                currentAnimIndex++
+                if (currentAnimIndex >= custom.size) {
+                    if (loop) currentAnimIndex = 0 else {
+                        currentAnimIndex = custom.size - 1
+                        playing = false
+                    }
+                }
+                frame = custom[currentAnimIndex]
+            } else {
+                val total = (hFrames * vFrames).coerceAtLeast(1)
+                frame++
+                if (frame >= total) {
+                    if (loop) frame = 0 else {
+                        frame = total - 1
+                        playing = false
+                    }
+                }
+            }
+        }
+    }
+
+    override fun onDraw(renderer: GLRenderer) {
+        val path = texturePath ?: return
+        val cols = hFrames.coerceAtLeast(1)
+        val rows = vFrames.coerceAtLeast(1)
+        val col = frame % cols
+        val row = (frame / cols) % rows
+        val scaleU = 1f / cols
+        val scaleV = 1f / rows
+        renderer.drawTexture(
+            assetPath = path,
+            x = globalX,
+            y = globalY,
+            width = width * scaleX,
+            height = height * scaleY,
+            rotationDeg = rotation,
+            alpha = a,
+            uvOffsetX = col * scaleU,
+            uvOffsetY = row * scaleV,
+            uvScaleX = scaleU,
+            uvScaleY = scaleV
+        )
+    }
+}
+
+// ==================== 4. 2D 相机与屏幕震动（对标 Godot Camera2D） ====================
+class Camera2D(name: String = "Camera2D") : Node2D(name) {
+    var enabled: Boolean = true
+    var followTarget: Node2D? = null
+    var followLerp: Float = 8f
+
+    private var shakeIntensity: Float = 0f
+    private var shakeTimer: Float = 0f
+    internal var shakeOffsetX: Float = 0f
+    internal var shakeOffsetY: Float = 0f
+
+    fun shake(intensity: Float = 20f, duration: Float = 0.25f) {
+        shakeIntensity = intensity
+        shakeTimer = duration
+    }
+
+    override fun onProcess(delta: Float) {
+        followTarget?.let { target ->
+            val t = (followLerp * delta).coerceIn(0f, 1f)
+            x += (target.globalX - x) * t
+            y += (target.globalY - y) * t
+        }
+        if (shakeTimer > 0f) {
+            shakeTimer -= delta
+            shakeOffsetX = (Random.nextFloat() * 2f - 1f) * shakeIntensity
+            shakeOffsetY = (Random.nextFloat() * 2f - 1f) * shakeIntensity
+        } else {
+            shakeOffsetX = 0f
+            shakeOffsetY = 0f
+        }
+    }
+}
+
+// ==================== 5. 碰撞体节点（对标 Godot CollisionShape2D） ====================
 class Collider2D(
     name: String,
     var width: Float,
@@ -112,7 +243,69 @@ class Collider2D(
     }
 }
 
-// ==================== 4. JSON 数据驱动场景加载器（对标 .tscn） ====================
+// ==================== 6. 双通道音频引擎（低延迟 SFX + 流式 BGM） ====================
+object AudioEngine {
+    private var soundPool: SoundPool? = null
+    private val sfxMap = mutableMapOf<String, Int>()
+    private var bgmPlayer: MediaPlayer? = null
+
+    fun init() {
+        if (soundPool != null) return
+        val attrs = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_GAME)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
+        soundPool = SoundPool.Builder()
+            .setMaxStreams(12)
+            .setAudioAttributes(attrs)
+            .build()
+    }
+
+    fun loadSfx(context: Context, name: String, assetPath: String) {
+        init()
+        try {
+            val afd = context.assets.openFd(assetPath)
+            val id = soundPool?.load(afd, 1) ?: 0
+            if (id != 0) sfxMap[name] = id
+        } catch (_: Exception) {}
+    }
+
+    fun playSfx(name: String, volume: Float = 1f, rate: Float = 1f) {
+        val id = sfxMap[name] ?: return
+        soundPool?.play(id, volume, volume, 1, 0, rate)
+    }
+
+    fun playBgm(context: Context, assetPath: String, loop: Boolean = true, volume: Float = 0.7f) {
+        stopBgm()
+        try {
+            val afd = context.assets.openFd(assetPath)
+            bgmPlayer = MediaPlayer().apply {
+                setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
+                isLooping = loop
+                setVolume(volume, volume)
+                prepare()
+                start()
+            }
+        } catch (_: Exception) {}
+    }
+
+    fun stopBgm() {
+        try {
+            bgmPlayer?.stop()
+            bgmPlayer?.release()
+        } catch (_: Exception) {}
+        bgmPlayer = null
+    }
+
+    fun release() {
+        stopBgm()
+        soundPool?.release()
+        soundPool = null
+        sfxMap.clear()
+    }
+}
+
+// ==================== 7. JSON 数据驱动场景加载器（对标 .tscn） ====================
 object SceneLoader {
     fun loadFromAssets(context: Context, fileName: String, targetRoot: Node2D) {
         val jsonText = context.assets.open(fileName).bufferedReader().use { it.readText() }
@@ -125,45 +318,63 @@ object SceneLoader {
             val w = item.optDouble("width", 100.0).toFloat()
             val h = item.optDouble("height", 100.0).toFloat()
             val tex = item.optString("texture", "")
+            val hFrames = item.optInt("hFrames", 1)
+            val vFrames = item.optInt("vFrames", 1)
 
-            val sprite = Sprite2D(
-                name = name,
-                width = w,
-                height = h,
-                texturePath = tex.ifEmpty { null },
-                r = item.optDouble("r", 1.0).toFloat(),
-                g = item.optDouble("g", 1.0).toFloat(),
-                b = item.optDouble("b", 1.0).toFloat(),
-                a = item.optDouble("a", 1.0).toFloat()
-            ).apply {
-                x = item.optDouble("x", 0.0).toFloat()
-                y = item.optDouble("y", 0.0).toFloat()
-                rotation = item.optDouble("rotation", 0.0).toFloat()
+            val node: Sprite2D = if (tex.isNotEmpty() && (hFrames > 1 || vFrames > 1)) {
+                AnimatedSprite2D(
+                    name = name,
+                    width = w,
+                    height = h,
+                    texturePath = tex,
+                    hFrames = hFrames,
+                    vFrames = vFrames,
+                    fps = item.optDouble("fps", 10.0).toFloat()
+                )
+            } else {
+                Sprite2D(
+                    name = name,
+                    width = w,
+                    height = h,
+                    texturePath = tex.ifEmpty { null },
+                    r = item.optDouble("r", 1.0).toFloat(),
+                    g = item.optDouble("g", 1.0).toFloat(),
+                    b = item.optDouble("b", 1.0).toFloat(),
+                    a = item.optDouble("a", 1.0).toFloat()
+                )
             }
+
+            node.x = item.optDouble("x", 0.0).toFloat()
+            node.y = item.optDouble("y", 0.0).toFloat()
+            node.rotation = item.optDouble("rotation", 0.0).toFloat()
 
             if (item.optBoolean("collider", false)) {
                 val tag = item.optString("tag", "wall")
-                sprite.addChild(Collider2D("${name}_Collider", w, h, tag))
+                node.addChild(Collider2D("${name}_Collider", w, h, tag))
             }
 
-            targetRoot.addChild(sprite)
+            targetRoot.addChild(node)
         }
     }
 }
 
-// ==================== 5. OpenGL ES 2.0 双管线硬件渲染器 ====================
+// ==================== 8. OpenGL ES 2.0 双管线硬件渲染器（支持 UV 切片与相机偏移） ====================
 class GLRenderer(private val context: Context, private val rootNode: Node2D) : GLSurfaceView.Renderer {
 
     private var colorProgram = 0
     private var texProgram = 0
     private var lastFrameTime = System.nanoTime()
+    private var screenW = 1080f
+    private var screenH = 1920f
+
     private val projectionMatrix = FloatArray(16)
+    private val viewMatrix = FloatArray(16)
+    private val vpMatrix = FloatArray(16)
     private val mvpMatrix = FloatArray(16)
     private val modelMatrix = FloatArray(16)
     private val textureCache = mutableMapOf<String, Int>()
 
     private val quadData = floatArrayOf(
-        // X,    Y,    U,  V
         -0.5f, -0.5f, 0f, 0f,
          0.5f, -0.5f, 1f, 0f,
         -0.5f,  0.5f, 0f, 1f,
@@ -188,15 +399,17 @@ class GLRenderer(private val context: Context, private val rootNode: Node2D) : G
         )
 
         texProgram = buildProgram(
-            "uniform mat4 uMVPMatrix; attribute vec4 aPosition; attribute vec2 aTexCoord; varying vec2 vTexCoord; void main() { gl_Position = uMVPMatrix * aPosition; vTexCoord = aTexCoord; }",
+            "uniform mat4 uMVPMatrix; uniform vec2 uUVOffset; uniform vec2 uUVScale; attribute vec4 aPosition; attribute vec2 aTexCoord; varying vec2 vTexCoord; void main() { gl_Position = uMVPMatrix * aPosition; vTexCoord = uUVOffset + aTexCoord * uUVScale; }",
             "precision mediump float; uniform sampler2D uTexture; uniform float uAlpha; varying vec2 vTexCoord; void main() { vec4 c = texture2D(uTexture, vTexCoord); gl_FragColor = vec4(c.rgb, c.a * uAlpha); }"
         )
         lastFrameTime = System.nanoTime()
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
+        screenW = width.toFloat()
+        screenH = height.toFloat()
         GLES20.glViewport(0, 0, width, height)
-        Matrix.orthoM(projectionMatrix, 0, 0f, width.toFloat(), height.toFloat(), 0f, -1f, 1f)
+        Matrix.orthoM(projectionMatrix, 0, 0f, screenW, screenH, 0f, -1f, 1f)
     }
 
     override fun onDrawFrame(gl: GL10?) {
@@ -205,6 +418,17 @@ class GLRenderer(private val context: Context, private val rootNode: Node2D) : G
         lastFrameTime = now
 
         rootNode.updateTree(delta)
+
+        // 计算相机视图矩阵（支持屏幕震动与跟随）
+        Matrix.setIdentityM(viewMatrix, 0)
+        val activeCam = rootNode.findNodesByType<Camera2D>().firstOrNull { it.enabled }
+        if (activeCam != null) {
+            val offsetX = -(activeCam.globalX + activeCam.shakeOffsetX) + screenW / 2f
+            val offsetY = -(activeCam.globalY + activeCam.shakeOffsetY) + screenH / 2f
+            Matrix.translateM(viewMatrix, 0, offsetX, offsetY, 0f)
+        }
+        Matrix.multiplyMM(vpMatrix, 0, projectionMatrix, 0, viewMatrix, 0)
+
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         rootNode.drawTree(this)
     }
@@ -225,7 +449,19 @@ class GLRenderer(private val context: Context, private val rootNode: Node2D) : G
         GLES20.glDisableVertexAttribArray(posHandle)
     }
 
-    fun drawTexture(assetPath: String, x: Float, y: Float, width: Float, height: Float, rotationDeg: Float, alpha: Float = 1f) {
+    fun drawTexture(
+        assetPath: String,
+        x: Float,
+        y: Float,
+        width: Float,
+        height: Float,
+        rotationDeg: Float,
+        alpha: Float = 1f,
+        uvOffsetX: Float = 0f,
+        uvOffsetY: Float = 0f,
+        uvScaleX: Float = 1f,
+        uvScaleY: Float = 1f
+    ) {
         val texId = getOrLoadTexture(assetPath)
         if (texId == 0) {
             drawRect(x, y, width, height, rotationDeg, 1f, 0f, 1f, alpha)
@@ -248,6 +484,8 @@ class GLRenderer(private val context: Context, private val rootNode: Node2D) : G
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(texProgram, "uTexture"), 0)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(texProgram, "uAlpha"), alpha)
+        GLES20.glUniform2f(GLES20.glGetUniformLocation(texProgram, "uUVOffset"), uvOffsetX, uvOffsetY)
+        GLES20.glUniform2f(GLES20.glGetUniformLocation(texProgram, "uUVScale"), uvScaleX, uvScaleY)
         GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(texProgram, "uMVPMatrix"), 1, false, mvpMatrix, 0)
 
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
@@ -260,7 +498,7 @@ class GLRenderer(private val context: Context, private val rootNode: Node2D) : G
         Matrix.translateM(modelMatrix, 0, x, y, 0f)
         if (rot != 0f) Matrix.rotateM(modelMatrix, 0, rot, 0f, 0f, 1f)
         Matrix.scaleM(modelMatrix, 0, w, h, 1f)
-        Matrix.multiplyMM(mvpMatrix, 0, projectionMatrix, 0, modelMatrix, 0)
+        Matrix.multiplyMM(mvpMatrix, 0, vpMatrix, 0, modelMatrix, 0)
     }
 
     private fun getOrLoadTexture(assetPath: String): Int {
