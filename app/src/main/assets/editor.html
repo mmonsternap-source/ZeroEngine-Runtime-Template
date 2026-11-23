@@ -3,16 +3,17 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>ZeroEngine SDK v0.5-Release</title>
+<title>ZeroEngine Pro IDE</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, sans-serif; }
   body { background: #0b0e14; color: #e2e8f0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; user-select: none; }
   header { background: #131822; padding: 5px 8px; display: flex; flex-direction: column; gap: 5px; border-bottom: 1px solid #232c3d; }
   .header-row { display: flex; gap: 4px; align-items: center; width: 100%; overflow-x: auto; }
-  select.proj-sel { background: #0b0e14; color: #38bdf8; border: 1px solid #334155; padding: 4px 5px; border-radius: 4px; font-size: 11px; font-weight: 700; max-width: 118px; }
+  select.proj-sel { background: #0b0e14; color: #38bdf8; border: 1px solid #334155; padding: 4px 5px; border-radius: 4px; font-size: 11px; font-weight: 700; max-width: 115px; }
   button { background: #1e2636; color: #e2e8f0; border: 1px solid #334155; padding: 4px 6px; border-radius: 4px; font-size: 11px; font-weight: 600; white-space: nowrap; }
   button:disabled { opacity: 0.38; }
   button.active-toggle { background: #1d4ed8; border-color: #3b82f6; color: #fff; }
+  button.save-btn { background: #0284c7; border-color: #0369a1; color: #fff; }
   button.export-btn { background: #7c3aed; border-color: #6d28d9; color: #fff; }
   button.play { background: #10b981; border-color: #059669; color: #042f2e; font-weight: 800; margin-left: auto; }
   button.danger { background: #dc2626; border-color: #b91c1c; color: #fff; }
@@ -27,7 +28,7 @@
 
   .viewport { flex: 1; position: relative; background: #07090e; overflow: hidden; touch-action: none; }
   canvas { width: 100%; height: 100%; display: block; }
-  .vp-hud { position: absolute; top: 6px; left: 6px; font-size: 10px; color: #94a3b8; background: rgba(11,14,20,0.8); padding: 3px 6px; border-radius: 4px; pointer-events: none; font-family: monospace; }
+  .vp-hud { position: absolute; top: 6px; left: 6px; font-size: 10px; color: #94a3b8; background: rgba(11,14,20,0.82); padding: 3px 6px; border-radius: 4px; pointer-events: none; font-family: monospace; }
 
   .bottom-dock { height: 285px; background: #131822; border-top: 1px solid #232c3d; display: flex; flex-direction: column; }
   .tabs { display: flex; background: #0e121a; border-bottom: 1px solid #232c3d; }
@@ -55,11 +56,12 @@
   pre#consoleOut, .doc-box { font-family: monospace; font-size: 11px; color: #cbd5e1; white-space: pre-wrap; line-height: 1.45; user-select: text; }
   .doc-box b { color: #38bdf8; }
 
-  .modal-mask { position: fixed; inset: 0; background: rgba(2,6,23,0.82); display: none; align-items: center; justify-content: center; z-index: 999; padding: 20px; }
-  .modal-card { background: #131822; border: 1px solid #334155; border-radius: 8px; padding: 14px; width: 100%; max-width: 320px; display: flex; flex-direction: column; gap: 10px; }
+  .modal-mask { position: fixed; inset: 0; background: rgba(2,6,23,0.84); display: none; align-items: center; justify-content: center; z-index: 999; padding: 18px; }
+  .modal-card { background: #131822; border: 1px solid #334155; border-radius: 8px; padding: 14px; width: 100%; max-width: 340px; display: flex; flex-direction: column; gap: 10px; }
   .modal-title { font-size: 13px; font-weight: 700; color: #38bdf8; }
   .modal-input { background: #090c12; border: 1px solid #3b82f6; color: #fff; padding: 8px; border-radius: 5px; font-size: 13px; user-select: text; }
-  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  .path-box { background: #090c12; border: 1px solid #334155; color: #34d399; padding: 8px; border-radius: 5px; font-family: monospace; font-size: 11px; word-break: break-all; user-select: text; line-height: 1.4; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
   .toast-bar { position: fixed; bottom: 300px; left: 50%; transform: translateX(-50%); background: rgba(15,23,42,0.95); color: #34d399; border: 1px solid #059669; padding: 6px 12px; border-radius: 6px; font-size: 11px; z-index: 998; display: none; white-space: nowrap; }
 </style>
 </head>
@@ -67,11 +69,11 @@
 
 <header>
   <div class="header-row">
+    <button onclick="openNewMenuModal()">📄新建</button>
+    <button class="save-btn" onclick="manualSave()">💾保存</button>
+    <button onclick="showSaveLocationModal()">📂位置</button>
     <select class="proj-sel" id="projSelect" onchange="switchProject(this.value)"></select>
-    <button onclick="openCreateProjectModal()">+工程</button>
     <select class="proj-sel" id="sceneSelect" onchange="switchScene(this.value)"></select>
-    <button onclick="openCreateSceneModal()">+场景</button>
-    <button class="export-btn" onclick="exportBundle()">📦导出</button>
   </div>
   <div class="header-row">
     <button id="undoBtn" onclick="undo()" disabled>↩撤销</button>
@@ -79,6 +81,7 @@
     <button id="modeBtn" class="active-toggle" onclick="toggleCamMode()">2.5D</button>
     <button id="snapBtn" class="active-toggle" onclick="toggleSnap()">吸附</button>
     <button onclick="resetView()">居中</button>
+    <button class="export-btn" onclick="exportBundle()">📦导出</button>
     <button class="play" onclick="playScene()">▶ 运行</button>
   </div>
 </header>
@@ -99,7 +102,7 @@
   </div>
   <div class="viewport" id="vpBox">
     <canvas id="stage"></canvas>
-    <div class="vp-hud" id="vpHud">v0.5-Release | 2.5D 透视</div>
+    <div class="vp-hud" id="vpHud">ZeroEngine IDE | 2.5D</div>
   </div>
 </div>
 
@@ -109,21 +112,50 @@
     <div class="tab" id="tab-script" onclick="switchTab('script')">脚本(JS)</div>
     <div class="tab" id="tab-shader" onclick="switchTab('shader')">着色器</div>
     <div class="tab" id="tab-console" onclick="switchTab('console')">控制台</div>
-    <div class="tab" id="tab-docs" onclick="switchTab('docs')">API手册</div>
+    <div class="tab" id="tab-docs" onclick="switchTab('docs')">工程/API</div>
   </div>
   <div class="dock-body" id="dockBody"></div>
 </div>
 
+<!-- 新建菜单弹窗 -->
+<div class="modal-mask" id="newMenuModal">
+  <div class="modal-card">
+    <div class="modal-title">📄 新建 (New)</div>
+    <div style="font-size:11px;color:#94a3b8;">请选择要创建的类型（所有文件自动存入工程目录）：</div>
+    <button style="padding:8px;text-align:left;" onclick="closeNewMenuModal();openCreateProjectModal(false)">🆕 新建空白游戏工程 (Empty Project)</button>
+    <button style="padding:8px;text-align:left;" onclick="closeNewMenuModal();openCreateProjectModal(true)">🎮 新建 2.5D 动作模板工程 (Template)</button>
+    <button style="padding:8px;text-align:left;" onclick="closeNewMenuModal();openCreateSceneModal()">🗺️ 在当前工程新建关卡场景 (.scene)</button>
+    <div class="modal-actions">
+      <button onclick="closeNewMenuModal()">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- 名称输入弹窗 -->
 <div class="modal-mask" id="inputModal">
   <div class="modal-card">
     <div class="modal-title" id="modalTitle">新建</div>
-    <input class="modal-input" id="modalInput" type="text" placeholder="请输入名称...">
+    <input class="modal-input" id="modalInput" type="text" placeholder="请输入英文或数字名称...">
     <div class="modal-actions">
       <button onclick="closeInputModal()">取消</button>
       <button class="play" style="margin-left:0;" onclick="confirmInputModal()">确定创建</button>
     </div>
   </div>
 </div>
+
+<!-- 存档文件夹位置弹窗 -->
+<div class="modal-mask" id="pathModal">
+  <div class="modal-card">
+    <div class="modal-title">📂 工程文件夹 Save 位置</div>
+    <div style="font-size:11px;color:#94a3b8;">当前工程的 scenes / textures / audio / exports 均保存在手机以下目录：</div>
+    <div class="path-box" id="savePathText">/storage/emulated/0/Android/data/com.zero.engine/files/ZeroEngine/</div>
+    <div class="modal-actions">
+      <button onclick="copySavePath()">复制路径</button>
+      <button class="save-btn" onclick="document.getElementById('pathModal').style.display='none'">知道了</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast-bar" id="toastBar"></div>
 
 <script>
@@ -140,13 +172,12 @@ const GRID_SIZE = 30;
 let tileBrushMode = 'off';
 let brushFrame = 0;
 
-let cameraCfg = { mode: '2.5D', pitch: 48, distance: 1250 };
+let cameraCfg = { mode: '2.5D', pitch: 48, distance: 1250, minX: -2000, maxX: 4000, minY: -2000, maxY: 4000 };
 let camX = 540, camY = 960, camZoom = 0.42;
 let dragMode = null, dragStartWorld = { x: 0, y: 0 }, origNodeState = null;
 let lastPanScreen = { x: 0, y: 0 }, lastPinchDist = 0;
 let modalCallback = null;
 
-// Undo / Redo 历史栈
 const MAX_HISTORY = 40;
 let undoStack = [];
 let redoStack = [];
@@ -221,7 +252,35 @@ function showToast(msg) {
   bar.textContent = msg;
   bar.style.display = 'block';
   clearTimeout(bar._timer);
-  bar._timer = setTimeout(() => { bar.style.display = 'none'; }, 2000);
+  bar._timer = setTimeout(() => { bar.style.display = 'none'; }, 2200);
+}
+
+function openNewMenuModal() { document.getElementById('newMenuModal').style.display = 'flex'; }
+function closeNewMenuModal() { document.getElementById('newMenuModal').style.display = 'none'; }
+
+function getSaveFolderPath() {
+  if (window.ZeroBridge && window.ZeroBridge.getSaveLocation) {
+    return window.ZeroBridge.getSaveLocation();
+  }
+  const curP = (window.ZeroBridge && window.ZeroBridge.getCurrentProject) ? window.ZeroBridge.getCurrentProject() : 'DefaultProject';
+  return `/storage/emulated/0/Android/data/com.zero.engine/files/ZeroEngine/${curP}`;
+}
+
+function showSaveLocationModal() {
+  document.getElementById('savePathText').textContent = getSaveFolderPath();
+  document.getElementById('pathModal').style.display = 'flex';
+}
+
+function copySavePath() {
+  const txt = document.getElementById('savePathText').textContent;
+  if (navigator.clipboard) navigator.clipboard.writeText(txt);
+  showToast("已复制存档文件夹路径");
+}
+
+function manualSave() {
+  autoSave();
+  const proj = (window.ZeroBridge && window.ZeroBridge.getCurrentProject) ? window.ZeroBridge.getCurrentProject() : 'Default';
+  showToast(`💾 已保存: ${proj}/${currentScene}`);
 }
 
 function openInputModal(title, defaultVal, cb) {
@@ -251,7 +310,7 @@ function defaultNodes() {
       name: "GroundFloor", nodeType: "Sprite2D", layer: "World", parent: "", tag: "ground",
       x: 540, y: 960, z: -2, width: 2200, height: 2200, rotation: 0, tiltX: 0, billboard: false,
       scaleX: 1, scaleY: 1, zIndex: -10, texture: "", r: 0.16, g: 0.20, b: 0.28, a: 1,
-      shadowCaster: false, collider: false, isTrigger: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
+      shadowCaster: false, collider: false, isTrigger: false, oneWay: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
       defaultClip: "", clips: [], tiles: [], shader: "", script: ""
     },
     {
@@ -263,14 +322,14 @@ function defaultNodes() {
         { gx: 2, gy: 6, frame: 0 }, { gx: 3, gy: 6, frame: 0 }, { gx: 4, gy: 6, frame: 0 },
         { gx: 2, gy: 7, frame: 0 }, { gx: 2, gy: 8, frame: 0 }
       ],
-      shadowCaster: false, collider: true, isTrigger: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
+      shadowCaster: false, collider: true, isTrigger: false, oneWay: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
       defaultClip: "", clips: [], shader: "", script: ""
     },
     {
       name: "Hero", nodeType: "Sprite2D", layer: "World", parent: "", tag: "player",
       x: 540, y: 960, z: 0, width: 120, height: 150, rotation: 0, tiltX: 0, billboard: true,
       scaleX: 1, scaleY: 1, zIndex: 1, texture: "", r: 0.25, g: 0.82, b: 0.98, a: 1,
-      shadowCaster: true, collider: true, isTrigger: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
+      shadowCaster: true, collider: true, isTrigger: false, oneWay: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
       defaultClip: "idle",
       clips: [
         { name: "idle", start: 0, end: 0, fps: 8, loop: true },
@@ -282,7 +341,6 @@ function onReady() {
   Engine.setCameraMode("2.5D");
   Engine.setCameraTarget(self);
   self.play("idle");
-  Engine.log("ZeroEngine v0.5-Release 已就绪");
 }
 function onProcess(dt) {
   if (Input.isTouching && Input.screenY < 1550) {
@@ -303,55 +361,6 @@ function onProcess(dt) {
     self.play("idle");
   }
   Engine.moveAndSlide(self, dt);
-}
-function onTriggerEnter(other) {
-  if (other.tag === "coin") {
-    Engine.playTone(980, 90);
-    self.flash(0.14);
-    Engine.tween(self, "scaleX", 1.25, 0.12, "easeOut");
-    Engine.destroy(other);
-    Engine.log("拾取金币: " + other.name);
-  }
-}`
-    },
-    {
-      name: "TorchLight", nodeType: "PointLight", layer: "World", parent: "Hero", tag: "light",
-      x: 0, y: 0, z: 60, width: 60, height: 60, rotation: 0, tiltX: 0, billboard: false,
-      scaleX: 1, scaleY: 1, zIndex: 5, texture: "", r: 1.0, g: 0.72, b: 0.28, a: 1,
-      lightRadius: 580, lightIntensity: 1.8, shadowCaster: false, collider: false, isTrigger: false,
-      hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12, defaultClip: "", clips: [], tiles: [], shader: "", script: ""
-    },
-    {
-      name: "EmberParticles", nodeType: "ParticleEmitter", layer: "World", parent: "TorchLight", tag: "fx",
-      x: 0, y: 0, z: 20, width: 40, height: 40, rotation: 0, tiltX: 0, billboard: false,
-      scaleX: 1, scaleY: 1, zIndex: 6, texture: "", r: 1.0, g: 0.65, b: 0.18, a: 0.95,
-      emitRate: 28, particleLife: 1.0, particleSpeed: 130, particleSize: 16, particleGravity: -90,
-      shadowCaster: false, collider: false, isTrigger: false,
-      hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12, defaultClip: "", clips: [], tiles: [], shader: "", script: ""
-    },
-    {
-      name: "GoldCoin", nodeType: "Sprite2D", layer: "World", parent: "", tag: "coin",
-      x: 780, y: 780, z: 0, width: 70, height: 70, rotation: 0, tiltX: 0, billboard: true,
-      scaleX: 1, scaleY: 1, zIndex: 1, texture: "", r: 1.0, g: 0.84, b: 0.12, a: 1,
-      shadowCaster: false, collider: true, isTrigger: true, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
-      defaultClip: "", clips: [], tiles: [], shader: "", script: ""
-    },
-    {
-      name: "ActionBtn", nodeType: "Sprite2D", layer: "UI", parent: "", tag: "ui_btn",
-      x: 880, y: 1680, z: 0, width: 170, height: 170, rotation: 0, tiltX: 0, billboard: false,
-      scaleX: 1, scaleY: 1, zIndex: 100, texture: "", r: 0.95, g: 0.32, b: 0.36, a: 0.85,
-      shadowCaster: false, collider: false, isTrigger: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
-      defaultClip: "", clips: [], tiles: [], shader: "",
-      script: `function onInput(ev) {
-  if (ev.type === "down" && Math.abs(ev.screenX - self.x) < 95 && Math.abs(ev.screenY - self.y) < 95) {
-    Engine.shake(16, 0.15);
-    Engine.playTone(680, 70);
-    Engine.tween(self, "scaleX", 0.82, 0.08, "easeOut");
-    Engine.tween(self, "scaleY", 0.82, 0.08, "easeOut");
-  } else if (ev.type === "up") {
-    Engine.tween(self, "scaleX", 1.0, 0.14, "easeOut");
-    Engine.tween(self, "scaleY", 1.0, 0.14, "easeOut");
-  }
 }`
     }
   ];
@@ -423,19 +432,23 @@ function toggleCamMode() {
   autoSave(); draw();
 }
 
-function openCreateProjectModal() {
-  openInputModal("新建独立游戏工程 (英文/数字)", "Game_" + (Date.now() % 1000), (name) => {
+function openCreateProjectModal(withTemplate) {
+  openInputModal(withTemplate ? "新建模板工程 (英文/数字)" : "新建空白工程 (英文/数字)", "MyGame_" + (Date.now() % 1000), (name) => {
     const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '');
     if (!safeName) { showToast("请输入英文或数字名称"); return; }
-    if (window.ZeroBridge) window.ZeroBridge.setProject(safeName);
+    if (window.ZeroBridge) {
+      if (window.ZeroBridge.createNewProject) window.ZeroBridge.createNewProject(safeName, withTemplate);
+      else window.ZeroBridge.setProject(safeName);
+    }
     currentScene = 'main.scene';
-    nodes = defaultNodes();
+    nodes = withTemplate ? defaultNodes() : [];
+    selectedIndex = nodes.length > 0 ? 0 : -1;
     clearHistory();
     autoSave();
     refreshProjectAndSceneLists();
     refreshAudioList();
     refreshAll();
-    showToast("已创建并切换到新工程: " + safeName);
+    showToast(`已创建工程 ${safeName} (${withTemplate ? '含模板' : '空白'})`);
   });
 }
 
@@ -451,11 +464,12 @@ function switchProject(name) {
 }
 
 function openCreateSceneModal() {
-  openInputModal("新建场景 / 预制体 (英文/数字)", "level_" + (Date.now() % 100), (name) => {
+  openInputModal("新建场景文件 (英文/数字)", "level_" + (Date.now() % 100), (name) => {
     const safeName = name.replace(/[^a-zA-Z0-9._-]/g, '');
     if (!safeName) { showToast("请输入英文或数字文件名"); return; }
     currentScene = safeName.endsWith('.scene') ? safeName : safeName + '.scene';
     nodes = [];
+    selectedIndex = -1;
     clearHistory();
     autoSave();
     refreshProjectAndSceneLists();
@@ -488,7 +502,7 @@ function exportBundle() {
 }
 
 function onExportFinished(ok) {
-  showToast(ok ? "发布包 (.zip) 导出成功！" : "导出失败，请查看控制台");
+  showToast(ok ? "发布包 (.zip) 已导出到工程 exports/ 目录！" : "导出失败，请查看控制台");
 }
 
 function preloadLocalImage(fileName) {
@@ -507,7 +521,7 @@ function pickNativeAudio() { if (window.ZeroBridge && window.ZeroBridge.pickAudi
 function onNativeAudioPicked(fileName) {
   refreshAudioList();
   if (activeTab === 'docs') renderDock();
-  showToast("音频已导入: " + fileName);
+  showToast("音频已存入 audio/: " + fileName);
 }
 
 function onNativeImagePicked(fileName, dataUrl, w, h) {
@@ -523,7 +537,7 @@ function onNativeImagePicked(fileName, dataUrl, w, h) {
         name: fileName.replace(/\.[^.]+$/, ''), nodeType: "Sprite2D", layer: "World", parent: "", tag: "sprite",
         x: 540, y: 960, z: 0, width: w || img.width || 160, height: h || img.height || 160,
         rotation: 0, tiltX: 0, billboard: true, scaleX: 1, scaleY: 1, zIndex: 1,
-        texture: fileName, r: 1, g: 1, b: 1, a: 1, shadowCaster: false, collider: true, isTrigger: false,
+        texture: fileName, r: 1, g: 1, b: 1, a: 1, shadowCaster: false, collider: true, isTrigger: false, oneWay: false,
         hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12, defaultClip: "", clips: [], tiles: [], shader: "", script: ""
       });
       selectedIndex = nodes.length - 1;
@@ -562,7 +576,7 @@ function addNode(type) {
     tileSize: 90, tiles: [],
     lightRadius: 500, lightIntensity: 1.6, shadowCaster: false,
     emitRate: 24, particleLife: 1.0, particleSpeed: 150, particleSize: 16, particleGravity: -60,
-    collider: type === 'Sprite2D' || isTile, isTrigger: false,
+    collider: type === 'Sprite2D' || isTile, isTrigger: false, oneWay: false,
     hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12, defaultClip: "", clips: [], shader: "", script: ""
   });
   selectedIndex = nodes.length - 1;
@@ -577,7 +591,7 @@ function addUINode() {
     name: `UI_Button_${idx}`, nodeType: "Sprite2D", layer: "UI", parent: "", tag: "ui",
     x: 200, y: 1680, z: 0, width: 160, height: 160, rotation: 0, tiltX: 0, billboard: false,
     scaleX: 1, scaleY: 1, zIndex: 100, texture: "", r: 0.3, g: 0.6, b: 1.0, a: 0.85,
-    shadowCaster: false, collider: false, isTrigger: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
+    shadowCaster: false, collider: false, isTrigger: false, oneWay: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
     defaultClip: "", clips: [], tiles: [], shader: "", script: ""
   });
   selectedIndex = nodes.length - 1;
@@ -862,7 +876,7 @@ function draw() {
         ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 3 / camZoom;
         ctx.strokeRect(-w / 2, -h / 2, w, h);
       } else if (n.collider) {
-        ctx.strokeStyle = n.isTrigger ? '#a855f7' : '#38bdf8';
+        ctx.strokeStyle = n.isTrigger ? '#a855f7' : (n.oneWay ? '#34d399' : '#38bdf8');
         ctx.lineWidth = 3 / camZoom; ctx.setLineDash([10 / camZoom, 6 / camZoom]);
         ctx.strokeRect(-w / 2, -h / 2, w, h); ctx.setLineDash([]);
       }
@@ -982,14 +996,15 @@ function renderDock() {
   const body = document.getElementById('dockBody');
   if (activeTab === 'docs') {
     refreshAudioList();
-    const audioStr = audioAssets.length ? audioAssets.join(', ') : '(暂无导入音频，点击左上角 +音 导入)';
+    const audioStr = audioAssets.length ? audioAssets.join(', ') : '(暂无导入音频)';
     body.innerHTML = `<div class="doc-box">
-<b>ZeroEngine SDK v0.5-Release 商业旗舰手册</b><br>
-• <b>已导入音频</b>: ${audioStr}<br>
-• <b>撤销与重做</b>: 顶部栏支持最多 40 步 ↩撤销 / ↪重做（含瓦片涂刷与属性修改）<br>
-• <b>TileMap 瓦片刷</b>: 选中 +瓦 节点后点 +图 导入图集，设置行列数即可在调色板点选图块涂刷<br>
-• <b>一键发布包</b>: 点击顶部「📦导出」生成含 main.scene.json 与全套素材的 .zip 包<br>
-• <b>缓动/闪白/粒子</b>: Engine.tween(self, "scaleX", 1.3, 0.15, "easeOut") / self.flash(0.14) / self.emitBurst(30)
+<b>📂 当前工程 Save 文件夹位置：</b><br>
+<span style="color:#34d399;">${getSaveFolderPath()}</span><br><br>
+<b>📁 目录结构说明：</b><br>
+• <b>scenes/</b>：存放所有 .scene 关卡文件（可用文本编辑器直接查看 JSON）<br>
+• <b>textures/</b>：存放导入的 PNG/JPG 贴图与瓦片图集<br>
+• <b>audio/</b>：已导入音频 (${audioStr})<br>
+• <b>exports/</b>：点击「📦导出」生成的完整游戏发布包 (.zip)<br>
 </div>`;
     return;
   }
@@ -1006,7 +1021,7 @@ function renderDock() {
   }
 
   if (selectedIndex < 0 || !nodes[selectedIndex]) {
-    body.innerHTML = '<div style="color:#64748b;font-size:12px;text-align:center;margin-top:45px;">请在左侧节点树或视口中选择节点</div>';
+    body.innerHTML = '<div style="color:#64748b;font-size:12px;text-align:center;margin-top:45px;">请在左侧节点树或视口中选择节点（或点上方 +精 / +瓦 创建）</div>';
     return;
   }
 
@@ -1130,6 +1145,7 @@ function renderDock() {
       <div class="field row"><input type="checkbox" ${n.shadowCaster ? 'checked' : ''} onchange="updateProp('shadowCaster', this.checked)"><label>投射阴影</label></div>
       <div class="field row"><input type="checkbox" ${n.collider ? 'checked' : ''} onchange="updateProp('collider', this.checked)"><label>开启碰撞体</label></div>
       <div class="field row"><input type="checkbox" ${n.isTrigger ? 'checked' : ''} onchange="updateProp('isTrigger', this.checked)"><label>触发器 (不阻挡)</label></div>
+      <div class="field row"><input type="checkbox" ${n.oneWay ? 'checked' : ''} onchange="updateProp('oneWay', this.checked)"><label>单向平台 (可上穿)</label></div>
     </div>
     ${n.nodeType === 'Sprite2D' ? `
       <div class="clip-box">
