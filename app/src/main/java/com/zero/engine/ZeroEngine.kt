@@ -1,7 +1,11 @@
 package com.zero.engine
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
 import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.media.SoundPool
@@ -17,9 +21,10 @@ import java.nio.FloatBuffer
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.abs
+import kotlin.math.hypot
 import kotlin.random.Random
 
-// ==================== 1. 基础节点树（对标 Godot Node2D） ====================
+// ==================== 1. 基础节点树（含点击与传染半径判定） ====================
 open class Node2D(val name: String) {
     var x: Float = 0f
     var y: Float = 0f
@@ -44,6 +49,11 @@ open class Node2D(val name: String) {
     fun removeChild(child: Node2D) {
         child.parent = null
         children.remove(child)
+    }
+
+    // 计算两个节点之间的像素距离（用于病毒扩散半径判断）
+    fun distanceTo(other: Node2D): Float {
+        return hypot(globalX - other.globalX, globalY - other.globalY)
     }
 
     inline fun <reified T : Node2D> findNodesByType(): List<T> {
@@ -77,7 +87,7 @@ open class Node2D(val name: String) {
     }
 }
 
-// ==================== 2. 静态精灵图节点（支持 PNG/WebP 透明贴图） ====================
+// ==================== 2. 静态精灵图节点（支持触控点选判断） ====================
 open class Sprite2D(
     name: String,
     var width: Float = 100f,
@@ -88,6 +98,14 @@ open class Sprite2D(
     var b: Float = 1f,
     var a: Float = 1f
 ) : Node2D(name) {
+
+    // 判断手指点击坐标 (px, py) 是否落在该节点范围内
+    fun containsPoint(px: Float, py: Float, padding: Float = 20f): Boolean {
+        val halfW = (width * scaleX) / 2f + padding
+        val halfH = (height * scaleY) / 2f + padding
+        return abs(px - globalX) <= halfW && abs(py - globalY) <= halfH
+    }
+
     override fun onDraw(renderer: GLRenderer) {
         val w = width * scaleX
         val h = height * scaleY
@@ -100,7 +118,21 @@ open class Sprite2D(
     }
 }
 
-// ==================== 3. 序列帧动画节点 ====================
+// ==================== 3. 文字显示节点（用于显示感染率%、分数、倒计时） ====================
+class Label2D(
+    name: String,
+    var text: String = "",
+    var fontSize: Float = 56f,
+    var textColor: Int = Color.WHITE
+) : Node2D(name) {
+    override fun onDraw(renderer: GLRenderer) {
+        if (text.isNotEmpty()) {
+            renderer.drawText(text, globalX, globalY, fontSize, textColor)
+        }
+    }
+}
+
+// ==================== 4. 序列帧动画节点 ====================
 class AnimatedSprite2D(
     name: String,
     width: Float = 100f,
@@ -142,7 +174,7 @@ class AnimatedSprite2D(
     }
 }
 
-// ==================== 4. 2D 相机与屏幕震动 ====================
+// ==================== 5. 2D 相机与屏幕震动 ====================
 class Camera2D(name: String = "Camera2D") : Node2D(name) {
     var enabled: Boolean = true
     var followTarget: Node2D? = null
@@ -175,7 +207,7 @@ class Camera2D(name: String = "Camera2D") : Node2D(name) {
     }
 }
 
-// ==================== 5. 碰撞体节点 ====================
+// ==================== 6. 碰撞体节点 ====================
 class Collider2D(
     name: String,
     var width: Float,
@@ -192,7 +224,7 @@ class Collider2D(
     }
 }
 
-// ==================== 6. 双通道音频引擎 ====================
+// ==================== 7. 双通道音频引擎 ====================
 object AudioEngine {
     private var soundPool: SoundPool? = null
     private val sfxMap = mutableMapOf<String, Int>()
@@ -221,7 +253,7 @@ object AudioEngine {
     }
 }
 
-// ==================== 7. JSON 场景加载器（支持文件与实时内存字符串） ====================
+// ==================== 8. JSON 场景加载器 ====================
 object SceneLoader {
     fun loadFromAssets(context: Context, fileName: String, targetRoot: Node2D) {
         val jsonText = context.assets.open(fileName).bufferedReader().use { it.readText() }
@@ -270,7 +302,7 @@ object SceneLoader {
     }
 }
 
-// ==================== 8. OpenGL ES 2.0 双管线渲染器（优先读取手机本地导入的贴图） ====================
+// ==================== 9. OpenGL ES 2.0 硬件渲染器（支持图片、色块与动态文字） ====================
 class GLRenderer(private val context: Context, private val rootNode: Node2D) : GLSurfaceView.Renderer {
 
     private var colorProgram = 0
@@ -285,6 +317,7 @@ class GLRenderer(private val context: Context, private val rootNode: Node2D) : G
     private val mvpMatrix = FloatArray(16)
     private val modelMatrix = FloatArray(16)
     private val textureCache = mutableMapOf<String, Int>()
+    private val textTextureCache = mutableMapOf<String, Triple<Int, Float, Float>>()
 
     private val quadData = floatArrayOf(
         -0.5f, -0.5f, 0f, 0f,
@@ -360,6 +393,32 @@ class GLRenderer(private val context: Context, private val rootNode: Node2D) : G
         GLES20.glDisableVertexAttribArray(posHandle)
     }
 
+    fun drawText(text: String, x: Float, y: Float, fontSize: Float, color: Int) {
+        val key = "$text|$fontSize|$color"
+        val (texId, w, h) = textTextureCache.getOrPut(key) {
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                textSize = fontSize
+                this.color = color
+                isFakeBoldText = true
+            }
+            val tw = (paint.measureText(text) + 24f).toInt().coerceAtLeast(32)
+            val th = (fontSize * 1.5f).toInt().coerceAtLeast(32)
+            val bmp = Bitmap.createBitmap(tw, th, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bmp)
+            canvas.drawText(text, 12f, fontSize * 1.1f, paint)
+
+            val ids = IntArray(1)
+            GLES20.glGenTextures(1, ids, 0)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, ids[0])
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+            bmp.recycle()
+            Triple(ids[0], tw.toFloat(), th.toFloat())
+        }
+        drawRawTexture(texId, x, y, w, h, 0f, 1f, 0f, 0f, 1f, 1f)
+    }
+
     fun drawTexture(
         assetPath: String,
         x: Float, y: Float, width: Float, height: Float, rotationDeg: Float,
@@ -370,6 +429,13 @@ class GLRenderer(private val context: Context, private val rootNode: Node2D) : G
             drawRect(x, y, width, height, rotationDeg, 1f, 0f, 1f, alpha)
             return
         }
+        drawRawTexture(texId, x, y, width, height, rotationDeg, alpha, uvOffsetX, uvOffsetY, uvScaleX, uvScaleY)
+    }
+
+    private fun drawRawTexture(
+        texId: Int, x: Float, y: Float, width: Float, height: Float, rotationDeg: Float,
+        alpha: Float, uvOffsetX: Float, uvOffsetY: Float, uvScaleX: Float, uvScaleY: Float
+    ) {
         GLES20.glUseProgram(texProgram)
         computeMVP(x, y, width, height, rotationDeg)
 
@@ -407,7 +473,6 @@ class GLRenderer(private val context: Context, private val rootNode: Node2D) : G
     private fun getOrLoadTexture(path: String): Int {
         textureCache[path]?.let { return it }
         return try {
-            // 优先从手机本地导入目录加载，找不到再从内置 assets 加载
             val localFile = File(context.filesDir, "textures/$path")
             val bitmap = if (localFile.exists()) {
                 BitmapFactory.decodeFile(localFile.absolutePath)
