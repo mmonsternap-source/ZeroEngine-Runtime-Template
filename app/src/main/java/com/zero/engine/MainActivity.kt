@@ -69,9 +69,6 @@ class MainActivity : Activity() {
         }
     }
 
-    /**
-     * 将本地工程文件同步写入用户选择的 SAF 外部文件夹（如 Documents/ZeroEngine）
-     */
     private fun syncFileToSaf(projName: String, subDir: String, fileName: String, bytes: ByteArray, mimeType: String) {
         val treeUri = getSavedTreeUri() ?: return
         try {
@@ -217,7 +214,7 @@ class MainActivity : Activity() {
         @JavascriptInterface
         fun createNewProject(projName: String, withTemplate: Boolean): Boolean {
             return try {
-                val safe = projName.replace(Regex("[^a-zA-Z0-9_-]"), "")
+                val safe = projName.replace(Regex("[^\\u4e00-\\u9fa5a-zA-Z0-9_-]"), "")
                 if (safe.isEmpty()) return false
                 currentProject = safe
                 getProjectDir(safe)
@@ -238,7 +235,7 @@ class MainActivity : Activity() {
 
         @JavascriptInterface
         fun setProject(projName: String) {
-            val safe = projName.replace(Regex("[^a-zA-Z0-9_-]"), "").ifEmpty { "DefaultProject" }
+            val safe = projName.replace(Regex("[^\\u4e00-\\u9fa5a-zA-Z0-9_-]"), "").ifEmpty { "DefaultProject" }
             currentProject = safe
             getProjectDir(safe)
         }
@@ -410,7 +407,7 @@ class MainActivity : Activity() {
         } else if (requestCode == PICK_AUDIO_CODE) {
             val audioDir = File(getProjectDir(), "audio").apply { mkdirs() }
             val rawName = queryDisplayName(uri) ?: "snd_${System.currentTimeMillis() % 100000}.mp3"
-            val safeName = rawName.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+            val safeName = rawName.replace(Regex("[^\\u4e00-\\u9fa5a-zA-Z0-9._-]"), "_")
             val destFile = File(audioDir, safeName)
 
             contentResolver.openInputStream(uri)?.use { input ->
