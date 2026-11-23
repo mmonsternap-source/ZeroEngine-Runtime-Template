@@ -3,22 +3,21 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>ZeroEngine 手机版</title>
+<title>ZeroEngine 通用引擎</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, sans-serif; user-select: none; }
   body { background: #12141a; color: #e2e8f0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
   header { background: #1a1d26; padding: 8px 10px; display: flex; gap: 6px; align-items: center; border-bottom: 1px solid #2d3343; }
   header h1 { font-size: 13px; color: #34d399; margin-right: auto; font-weight: 800; }
-  button { background: #2b3142; color: #fff; border: 1px solid #3f475e; padding: 6px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; }
-  button:active { opacity: 0.7; }
+  button, select.top-select { background: #2b3142; color: #fff; border: 1px solid #3f475e; padding: 6px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; }
   button.play { background: #10b981; border-color: #059669; color: #042f2e; font-weight: 800; }
   button.danger { background: #ef4444; border-color: #dc2626; }
   .canvas-area { flex: 1; display: flex; justify-content: center; align-items: center; background: #0b0d11; overflow: hidden; touch-action: none; }
   canvas { background: #14171f; border: 2px solid #334155; max-width: 94%; max-height: 94%; }
-  .inspector { background: #1a1d26; border-top: 1px solid #2d3343; padding: 10px; height: 225px; overflow-y: auto; }
+  .inspector { background: #1a1d26; border-top: 1px solid #2d3343; padding: 10px; height: 245px; overflow-y: auto; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
   .field { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: #94a3b8; }
-  .field input[type="text"], .field input[type="number"], .field input[type="color"] { background: #0f1117; border: 1px solid #334155; color: #fff; padding: 5px; border-radius: 4px; font-size: 12px; width: 100%; }
+  .field input, .field select { background: #0f1117; border: 1px solid #334155; color: #fff; padding: 5px; border-radius: 4px; font-size: 12px; width: 100%; }
   .field.row { flex-direction: row; align-items: center; gap: 6px; padding-top: 14px; }
 </style>
 </head>
@@ -26,8 +25,14 @@
 
 <header>
   <h1>ZeroEngine</h1>
+  <select class="top-select" onchange="loadTemplate(this.value); this.value='';">
+    <option value="">模板...</option>
+    <option value="platformer">横版跳跃闯关</option>
+    <option value="shooter">竖屏弹幕射击</option>
+    <option value="virus">病毒感染扩散</option>
+  </select>
   <button onclick="addRectNode()">+ 方块</button>
-  <button onclick="pickNativeImage()">+ 导入PNG</button>
+  <button onclick="pickNativeImage()">+ PNG</button>
   <button class="play" onclick="playScene()">▶ 运行</button>
 </header>
 
@@ -43,20 +48,52 @@ const ctx = canvas.getContext('2d');
 const imageCache = {};
 
 let nodes = [
-  { name: "Wall_Top", x: 540, y: 400, width: 600, height: 80, rotation: 0, texture: "", r: 0.35, g: 0.45, b: 0.65, a: 1, collider: true, tag: "obstacle" },
-  { name: "Wall_Bottom", x: 540, y: 1300, width: 600, height: 80, rotation: 0, texture: "", r: 0.35, g: 0.45, b: 0.65, a: 1, collider: true, tag: "obstacle" }
+  { name: "Player", x: 540, y: 1200, width: 110, height: 110, rotation: 0, texture: "", r: 0.2, g: 0.85, b: 0.6, a: 1, collider: true, behavior: "platformer", tag: "player" },
+  { name: "Ground", x: 540, y: 1550, width: 900, height: 80, rotation: 0, texture: "", r: 0.35, g: 0.45, b: 0.65, a: 1, collider: true, behavior: "none", tag: "wall" },
+  { name: "Platform", x: 680, y: 1150, width: 360, height: 60, rotation: 0, texture: "", r: 0.35, g: 0.45, b: 0.65, a: 1, collider: true, behavior: "none", tag: "wall" },
+  { name: "Coin_1", x: 680, y: 1020, width: 70, height: 70, rotation: 0, texture: "", r: 0.98, g: 0.8, b: 0.1, a: 1, collider: true, behavior: "coin", tag: "coin" }
 ];
 let selectedIndex = 0;
 let dragging = false, dragOffsetX = 0, dragOffsetY = 0;
 
-// 启动时自动从手机本地存储恢复上次编辑的场景
+function loadTemplate(type) {
+  if (!type) return;
+  if (type === 'platformer') {
+    nodes = [
+      { name: "Hero", x: 260, y: 1300, width: 110, height: 110, rotation: 0, texture: "", r: 0.2, g: 0.85, b: 0.6, a: 1, collider: true, behavior: "platformer", tag: "player" },
+      { name: "Floor", x: 540, y: 1550, width: 960, height: 80, rotation: 0, texture: "", r: 0.35, g: 0.45, b: 0.65, a: 1, collider: true, behavior: "none", tag: "wall" },
+      { name: "Step1", x: 700, y: 1220, width: 340, height: 60, rotation: 0, texture: "", r: 0.35, g: 0.45, b: 0.65, a: 1, collider: true, behavior: "none", tag: "wall" },
+      { name: "Enemy", x: 540, y: 1450, width: 90, height: 90, rotation: 0, texture: "", r: 0.95, g: 0.25, b: 0.25, a: 1, collider: true, behavior: "patrol", tag: "enemy" },
+      { name: "Gold", x: 700, y: 1100, width: 70, height: 70, rotation: 0, texture: "", r: 0.98, g: 0.8, b: 0.1, a: 1, collider: true, behavior: "coin", tag: "coin" }
+    ];
+  } else if (type === 'shooter') {
+    nodes = [
+      { name: "Fighter", x: 540, y: 1550, width: 120, height: 120, rotation: 0, texture: "", r: 0.2, g: 0.8, b: 0.95, a: 1, collider: true, behavior: "shooter", tag: "player" },
+      { name: "Boss1", x: 300, y: 420, width: 130, height: 130, rotation: 0, texture: "", r: 0.95, g: 0.3, b: 0.3, a: 1, collider: true, behavior: "patrol", tag: "enemy" },
+      { name: "Boss2", x: 760, y: 650, width: 130, height: 130, rotation: 0, texture: "", r: 0.95, g: 0.45, b: 0.2, a: 1, collider: true, behavior: "patrol", tag: "enemy" }
+    ];
+  } else if (type === 'virus') {
+    nodes = [
+      { name: "Cell_1", x: 320, y: 600, width: 120, height: 120, rotation: 0, texture: "", r: 0.2, g: 0.85, b: 0.6, a: 1, collider: false, behavior: "virus", tag: "cell" },
+      { name: "Cell_2", x: 640, y: 680, width: 120, height: 120, rotation: 0, texture: "", r: 0.2, g: 0.85, b: 0.6, a: 1, collider: false, behavior: "virus", tag: "cell" },
+      { name: "Cell_3", x: 480, y: 980, width: 120, height: 120, rotation: 0, texture: "", r: 0.2, g: 0.85, b: 0.6, a: 1, collider: false, behavior: "virus", tag: "cell" },
+      { name: "Cell_4", x: 760, y: 1220, width: 120, height: 120, rotation: 0, texture: "", r: 0.2, g: 0.85, b: 0.6, a: 1, collider: false, behavior: "virus", tag: "cell" },
+      { name: "Cell_5", x: 300, y: 1300, width: 120, height: 120, rotation: 0, texture: "", r: 0.2, g: 0.85, b: 0.6, a: 1, collider: false, behavior: "virus", tag: "cell" }
+    ];
+  }
+  selectedIndex = 0;
+  autoSave();
+  renderInspector();
+  draw();
+}
+
 window.onload = () => {
   if (window.ZeroBridge) {
     const saved = window.ZeroBridge.loadSavedScene();
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed.nodes)) {
+        if (Array.isArray(parsed.nodes) && parsed.nodes.length > 0) {
           nodes = parsed.nodes;
           nodes.forEach(n => { if (n.texture) preloadLocalImage(n.texture); });
         }
@@ -77,16 +114,10 @@ function preloadLocalImage(fileName) {
   }
 }
 
-// 调用 Android 原生相册选择 PNG 图片
 function pickNativeImage() {
-  if (window.ZeroBridge) {
-    window.ZeroBridge.pickImage();
-  } else {
-    alert("请在手机版 ZeroEngine App 中使用");
-  }
+  if (window.ZeroBridge) window.ZeroBridge.pickImage();
 }
 
-// Android 选完图片后自动回调此函数
 function onNativeImagePicked(fileName, dataUrl, w, h) {
   const img = new Image();
   img.onload = () => {
@@ -94,13 +125,11 @@ function onNativeImagePicked(fileName, dataUrl, w, h) {
     nodes.push({
       name: fileName.replace(/\.[^.]+$/, ''),
       x: 540, y: 960,
-      width: w || img.width || 200,
-      height: h || img.height || 200,
-      rotation: 0,
-      texture: fileName,
+      width: w || img.width || 160,
+      height: h || img.height || 160,
+      rotation: 0, texture: fileName,
       r: 1, g: 1, b: 1, a: 1,
-      collider: true,
-      tag: "prop"
+      collider: true, behavior: "none", tag: "prop"
     });
     selectedIndex = nodes.length - 1;
     autoSave();
@@ -111,17 +140,11 @@ function onNativeImagePicked(fileName, dataUrl, w, h) {
 }
 
 function autoSave() {
-  if (window.ZeroBridge) {
-    window.ZeroBridge.saveScene(JSON.stringify({ nodes }));
-  }
+  if (window.ZeroBridge) window.ZeroBridge.saveScene(JSON.stringify({ nodes }));
 }
 
-// 一键切换到原生 OpenGL 引擎运行当前场景！
 function playScene() {
-  const json = JSON.stringify({ nodes });
-  if (window.ZeroBridge) {
-    window.ZeroBridge.runGame(json);
-  }
+  if (window.ZeroBridge) window.ZeroBridge.runGame(JSON.stringify({ nodes }));
 }
 
 function rgbToHex(r, g, b) {
@@ -134,7 +157,20 @@ function hexToRgb(hex) {
 }
 
 function addRectNode() {
-  nodes.push({ name: `Block_${nodes.length + 1}`, x: 540, y: 960, width: 220, height: 120, rotation: 0, texture: "", r: 0.2, g: 0.8, b: 0.6, a: 1, collider: true, tag: "wall" });
+  nodes.push({ name: `Obj_${nodes.length + 1}`, x: 540, y: 960, width: 160, height: 120, rotation: 0, texture: "", r: 0.2, g: 0.8, b: 0.6, a: 1, collider: true, behavior: "none", tag: "wall" });
+  selectedIndex = nodes.length - 1;
+  autoSave();
+  renderInspector();
+  draw();
+}
+
+function duplicateSelected() {
+  if (selectedIndex < 0) return;
+  const copy = JSON.parse(JSON.stringify(nodes[selectedIndex]));
+  copy.name += "_copy";
+  copy.x += 60;
+  copy.y += 60;
+  nodes.push(copy);
   selectedIndex = nodes.length - 1;
   autoSave();
   renderInspector();
@@ -252,23 +288,35 @@ function updateColor(hex) {
 function renderInspector() {
   const box = document.getElementById('inspector');
   if (selectedIndex < 0 || !nodes[selectedIndex]) {
-    box.innerHTML = '<div style="color:#64748b;font-size:12px;text-align:center;margin-top:40px;">点击上方“+ 方块”或“+ 导入PNG”添加物体</div>';
+    box.innerHTML = '<div style="color:#64748b;font-size:12px;text-align:center;margin-top:40px;">点顶部“模板...”切换游戏类型，或点击画布编辑物体</div>';
     return;
   }
   const n = nodes[selectedIndex];
+  const b = n.behavior || 'none';
   box.innerHTML = `
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-      <strong style="font-size:13px;color:#fbbf24;">${n.name} (${selectedIndex + 1}/${nodes.length})</strong>
+    <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;">
+      <strong style="font-size:13px;color:#fbbf24;margin-right:auto;">${n.name}</strong>
+      <button onclick="duplicateSelected()">复制</button>
       <button class="danger" onclick="deleteSelected()">删除</button>
     </div>
     <div class="grid">
-      <div class="field"><label>节点名称</label><input type="text" value="${n.name}" oninput="updateProp('name', this.value)"></div>
-      <div class="field"><label>颜色 (纯色块)</label><input type="color" value="${rgbToHex(n.r, n.g, n.b)}" oninput="updateColor(this.value)"></div>
+      <div class="field"><label>行为模式 (Gameplay)</label>
+        <select onchange="updateProp('behavior', this.value)">
+          <option value="none" ${b==='none'?'selected':''}>静态物体 / 墙壁</option>
+          <option value="drag" ${b==='drag'?'selected':''}>主角: 手指拖拽移动</option>
+          <option value="platformer" ${b==='platformer'?'selected':''}>主角: 横版重力跳跃</option>
+          <option value="shooter" ${b==='shooter'?'selected':''}>主角: 拖动+自动射击</option>
+          <option value="patrol" ${b==='patrol'?'selected':''}>敌人: 左右自动巡逻</option>
+          <option value="coin" ${b==='coin'?'selected':''}>道具: 收集加分</option>
+          <option value="virus" ${b==='virus'?'selected':''}>细胞: 点击感染扩散</option>
+        </select>
+      </div>
+      <div class="field"><label>颜色 (色块)</label><input type="color" value="${rgbToHex(n.r, n.g, n.b)}" oninput="updateColor(this.value)"></div>
       <div class="field"><label>X 坐标</label><input type="number" value="${n.x}" oninput="updateProp('x', +this.value)"></div>
       <div class="field"><label>Y 坐标</label><input type="number" value="${n.y}" oninput="updateProp('y', +this.value)"></div>
       <div class="field"><label>宽度</label><input type="number" value="${n.width}" oninput="updateProp('width', +this.value)"></div>
       <div class="field"><label>高度</label><input type="number" value="${n.height}" oninput="updateProp('height', +this.value)"></div>
-      <div class="field"><label>旋转角度</label><input type="number" value="${n.rotation || 0}" oninput="updateProp('rotation', +this.value)"></div>
+      <div class="field"><label>旋转</label><input type="number" value="${n.rotation || 0}" oninput="updateProp('rotation', +this.value)"></div>
       <div class="field row"><input type="checkbox" ${n.collider ? 'checked' : ''} onchange="updateProp('collider', this.checked)"><label>开启碰撞体</label></div>
     </div>
   `;
