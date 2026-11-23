@@ -47,8 +47,17 @@ class MainActivity : Activity() {
 
     private var currentProject: String = "DefaultProject"
 
+    /**
+     * 公开存档根目录：/storage/emulated/0/Android/data/com.zero.engine/files/ZeroEngine/
+     * 无需额外存储权限，可用手机文件管理器 / MT管理器 / 电脑USB 直接查看与备份
+     */
+    private fun getProjectsRoot(): File {
+        val baseDir = getExternalFilesDir(null) ?: filesDir
+        return File(baseDir, "ZeroEngine/projects").apply { mkdirs() }
+    }
+
     private fun getProjectDir(projName: String = currentProject): File {
-        return File(filesDir, "projects/$projName").apply {
+        return File(getProjectsRoot(), projName).apply {
             File(this, "scenes").mkdirs()
             File(this, "textures").mkdirs()
             File(this, "audio").mkdirs()
@@ -104,10 +113,31 @@ class MainActivity : Activity() {
     }
 
     inner class EngineBridge {
+
+        @JavascriptInterface
+        fun getSaveLocation(): String {
+            return getProjectDir(currentProject).absolutePath
+        }
+
+        @JavascriptInterface
+        fun createNewProject(projName: String, withTemplate: Boolean): Boolean {
+            return try {
+                val safe = projName.replace(Regex("[^a-zA-Z0-9_-]"), "")
+                if (safe.isEmpty()) return false
+                currentProject = safe
+                getProjectDir(safe)
+                appendConsoleLog("[PROJECT] 新建工程成功: $safe (模板=$withTemplate)")
+                true
+            } catch (e: Exception) {
+                appendConsoleLog("[PROJECT 错误] ${e.message}")
+                false
+            }
+        }
+
         @JavascriptInterface
         fun listProjects(): String {
-            val root = File(filesDir, "projects").apply { mkdirs() }
-            val names = root.listFiles()?.filter { it.isDirectory }?.map { it.name } ?: listOf("DefaultProject")
+            val root = getProjectsRoot()
+            val names = root.listFiles()?.filter { it.isDirectory }?.map { it.name }?.sorted() ?: listOf("DefaultProject")
             return JSONArray(names.ifEmpty { listOf("DefaultProject") }).toString()
         }
 
@@ -124,14 +154,14 @@ class MainActivity : Activity() {
         @JavascriptInterface
         fun listScenes(): String {
             val dir = File(getProjectDir(), "scenes")
-            val list = dir.listFiles()?.filter { it.name.endsWith(".scene") }?.map { it.name } ?: emptyList()
+            val list = dir.listFiles()?.filter { it.name.endsWith(".scene") }?.map { it.name }?.sorted() ?: emptyList()
             return JSONArray(if (list.isEmpty()) listOf("main.scene") else list).toString()
         }
 
         @JavascriptInterface
         fun listAudioFiles(): String {
             val dir = File(getProjectDir(), "audio")
-            val list = dir.listFiles()?.filter { it.isFile }?.map { it.name } ?: emptyList()
+            val list = dir.listFiles()?.filter { it.isFile }?.map { it.name }?.sorted() ?: emptyList()
             return JSONArray(list).toString()
         }
 
