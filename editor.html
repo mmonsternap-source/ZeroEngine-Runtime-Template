@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>ZeroEngine 2D 可视化关卡编辑器</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, sans-serif; }
+  body { background: #12141a; color: #e2e8f0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+  header { background: #1a1d26; padding: 8px 12px; display: flex; gap: 8px; align-items: center; border-bottom: 1px solid #2d3343; flex-wrap: wrap; }
+  header h1 { font-size: 14px; color: #34d399; margin-right: auto; font-weight: 700; }
+  button, .file-btn { background: #2b3142; color: #fff; border: 1px solid #3f475e; padding: 6px 10px; border-radius: 6px; font-size: 12px; cursor: pointer; }
+  button:active { background: #3b435a; }
+  button.primary { background: #10b981; border-color: #059669; color: #06281e; font-weight: 700; }
+  button.danger { background: #ef4444; border-color: #dc2626; }
+  .workspace { display: flex; flex: 1; overflow: hidden; flex-direction: column; }
+  @media (min-width: 768px) { .workspace { flex-direction: row; } }
+  .canvas-area { flex: 1; display: flex; justify-content: center; align-items: center; background: #0b0d11; position: relative; overflow: hidden; touch-action: none; }
+  canvas { background: #14171f; border: 2px solid #334155; box-shadow: 0 0 20px rgba(0,0,0,0.6); max-width: 95%; max-height: 95%; }
+  .inspector { background: #1a1d26; border-top: 1px solid #2d3343; padding: 10px; height: 230px; overflow-y: auto; }
+  @media (min-width: 768px) { .inspector { width: 300px; height: auto; border-top: none; border-left: 1px solid #2d3343; } }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .field { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: #94a3b8; }
+  .field input[type="text"], .field input[type="number"], .field input[type="color"] { background: #0f1117; border: 1px solid #334155; color: #fff; padding: 5px; border-radius: 4px; font-size: 12px; width: 100%; }
+  .field.row { flex-direction: row; align-items: center; gap: 6px; padding-top: 14px; }
+  .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 99; padding: 16px; flex-direction: column; justify-content: center; }
+  .modal.open { display: flex; }
+  .modal-box { background: #1a1d26; border: 1px solid #334155; border-radius: 10px; padding: 14px; max-width: 600px; width: 100%; margin: auto; display: flex; flex-direction: column; gap: 10px; }
+  textarea { width: 100%; height: 240px; background: #0b0d11; color: #34d399; border: 1px solid #334155; border-radius: 6px; padding: 8px; font-family: monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>ZeroEngine 编辑器</h1>
+  <button onclick="addRectNode()">+ 色块节点</button>
+  <label class="file-btn">+ 导入PNG贴图<input type="file" accept="image/*" style="display:none" onchange="addImageNode(event)"></label>
+  <button class="primary" onclick="openExport()">导出 JSON</button>
+</header>
+
+<div class="workspace">
+  <div class="canvas-area">
+    <!-- 逻辑分辨率 1080 x 1920，与引擎正交投影完全一致 -->
+    <canvas id="stage" width="1080" height="1920"></canvas>
+  </div>
+
+  <div class="inspector" id="inspector">
+    <div style="color:#64748b;font-size:12px;text-align:center;margin-top:40px;">点击画布上的物体进行选中与拖拽编辑</div>
+  </div>
+</div>
+
+<div class="modal" id="exportModal">
+  <div class="modal-box">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <strong style="font-size:14px;">复制下方内容覆盖 main.scene.json</strong>
+      <button onclick="closeExport()">关闭</button>
+    </div>
+    <textarea id="jsonOutput" readonly></textarea>
+    <div style="display:flex;gap:8px;">
+      <button class="primary" style="flex:1" onclick="copyJson()">一键复制 JSON</button>
+      <button onclick="importJsonPrompt()">导入已有 JSON</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById('stage');
+const ctx = canvas.getContext('2d');
+const imageCache = {};
+
+let nodes = [
+  { name: "Wall_Top", x: 540, y: 400, width: 600, height: 80, rotation: 0, texture: "", r: 0.35, g: 0.45, b: 0.65, a: 1, collider: true, tag: "obstacle" },
+  { name: "Wall_Bottom", x: 540, y: 1300, width: 600, height: 80, rotation: 0, texture: "", r: 0.35, g: 0.45, b: 0.65, a: 1, collider: true, tag: "obstacle" }
+];
+let selectedIndex = 0;
+let dragging = false;
+let dragOffsetX = 0, dragOffsetY = 0;
+
+function rgbToHex(r, g, b) {
+  const toHex = v => Math.round(Math.min(1, Math.max(0, v)) * 255).toString(16).padStart(2, '0');
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+function hexToRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return { r: +(((n >> 16) & 255) / 255).toFixed(2), g: +(((n >> 8) & 255) / 255).toFixed(2), b: +((n & 255) / 255).toFixed(2) };
+}
+
+function addRectNode() {
+  nodes.push({ name: `Block_${nodes.length + 1}`, x: 540, y: 960, width: 200, height: 120, rotation: 0, texture: "", r: 0.2, g: 0.8, b: 0.6, a: 1, collider: true, tag: "wall" });
+  selectedIndex = nodes.length - 1;
+  renderInspector();
+  draw();
+}
+
+function addImageNode(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = ev => {
+    const img = new Image();
+    img.onload = () => {
+      imageCache[file.name] = img;
+      nodes.push({ name: file.name.replace(/\.[^.]+$/, ''), x: 540, y: 960, width: img.width, height: img.height, rotation: 0, texture: file.name, r: 1, g: 1, b: 1, a: 1, collider: false, tag: "prop" });
+      selectedIndex = nodes.length - 1;
+      renderInspector();
+      draw();
+    };
+    img.src = ev.target.result;
+  };
+  reader.readAsDataURL(file);
+  e.target.value = '';
+}
+
+function deleteSelected() {
+  if (selectedIndex < 0) return;
+  nodes.splice(selectedIndex, 1);
+  selectedIndex = nodes.length - 1;
+  renderInspector();
+  draw();
+}
+
+function getCanvasPos(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: (clientX - rect.left) * (canvas.width / rect.width),
+    y: (clientY - rect.top) * (canvas.height / rect.height)
+  };
+}
+
+function handleDown(clientX, clientY) {
+  const pos = getCanvasPos(clientX, clientY);
+  selectedIndex = -1;
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const n = nodes[i];
+    if (Math.abs(pos.x - n.x) <= n.width / 2 && Math.abs(pos.y - n.y) <= n.height / 2) {
+      selectedIndex = i;
+      dragging = true;
+      dragOffsetX = pos.x - n.x;
+      dragOffsetY = pos.y - n.y;
+      break;
+    }
+  }
+  renderInspector();
+  draw();
+}
+
+function handleMove(clientX, clientY) {
+  if (!dragging || selectedIndex < 0) return;
+  const pos = getCanvasPos(clientX, clientY);
+  nodes[selectedIndex].x = Math.round(pos.x - dragOffsetX);
+  nodes[selectedIndex].y = Math.round(pos.y - dragOffsetY);
+  renderInspector();
+  draw();
+}
+
+canvas.addEventListener('mousedown', e => handleDown(e.clientX, e.clientY));
+window.addEventListener('mousemove', e => handleMove(e.clientX, e.clientY));
+window.addEventListener('mouseup', () => dragging = false);
+
+canvas.addEventListener('touchstart', e => { if (e.touches.length) handleDown(e.touches[0].clientX, e.touches[0].clientY); });
+canvas.addEventListener('touchmove', e => { e.preventDefault(); if (e.touches.length) handleMove(e.touches[0].clientX, e.touches[0].clientY); }, { passive: false });
+canvas.addEventListener('touchend', () => dragging = false);
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  // 绘制参考网格
+  ctx.strokeStyle = '#1e222d';
+  ctx.lineWidth = 2;
+  for (let x = 0; x <= 1080; x += 180) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, 1920); ctx.stroke(); }
+  for (let y = 0; y <= 1920; y += 180) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(1080, y); ctx.stroke(); }
+
+  nodes.forEach((n, idx) => {
+    ctx.save();
+    ctx.translate(n.x, n.y);
+    ctx.rotate((n.rotation || 0) * Math.PI / 180);
+    ctx.globalAlpha = n.a ?? 1;
+
+    if (n.texture && imageCache[n.texture]) {
+      ctx.drawImage(imageCache[n.texture], -n.width / 2, -n.height / 2, n.width, n.height);
+    } else {
+      ctx.fillStyle = rgbToHex(n.r, n.g, n.b);
+      ctx.fillRect(-n.width / 2, -n.height / 2, n.width, n.height);
+      if (n.texture) {
+        ctx.fillStyle = '#fff';
+        ctx.font = '26px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(n.texture, 0, 8);
+      }
+    }
+
+    if (n.collider) {
+      ctx.strokeStyle = '#38bdf8';
+      ctx.lineWidth = 4;
+      ctx.setLineDash([12, 8]);
+      ctx.strokeRect(-n.width / 2, -n.height / 2, n.width, n.height);
+      ctx.setLineDash([]);
+    }
+
+    if (idx === selectedIndex) {
+      ctx.strokeStyle = '#fbbf24';
+      ctx.lineWidth = 6;
+      ctx.strokeRect(-n.width / 2 - 4, -n.height / 2 - 4, n.width + 8, n.height + 8);
+    }
+    ctx.restore();
+  });
+}
+
+function updateProp(key, val) {
+  if (selectedIndex < 0) return;
+  nodes[selectedIndex][key] = val;
+  draw();
+}
+
+function updateColor(hex) {
+  if (selectedIndex < 0) return;
+  const c = hexToRgb(hex);
+  nodes[selectedIndex].r = c.r;
+  nodes[selectedIndex].g = c.g;
+  nodes[selectedIndex].b = c.b;
+  draw();
+}
+
+function renderInspector() {
+  const box = document.getElementById('inspector');
+  if (selectedIndex < 0 || !nodes[selectedIndex]) {
+    box.innerHTML = '<div style="color:#64748b;font-size:12px;text-align:center;margin-top:40px;">点击画布上的物体进行选中与拖拽编辑</div>';
+    return;
+  }
+  const n = nodes[selectedIndex];
+  box.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+      <strong style="font-size:13px;color:#fbbf24;">节点属性 (${selectedIndex + 1}/${nodes.length})</strong>
+      <button class="danger" onclick="deleteSelected()">删除节点</button>
+    </div>
+    <div class="grid">
+      <div class="field"><label>节点名称</label><input type="text" value="${n.name}" oninput="updateProp('name', this.value)"></div>
+      <div class="field"><label>贴图文件名 (assets内)</label><input type="text" value="${n.texture || ''}" placeholder="如 hero.png" oninput="updateProp('texture', this.value)"></div>
+      <div class="field"><label>X 坐标</label><input type="number" value="${n.x}" oninput="updateProp('x', +this.value)"></div>
+      <div class="field"><label>Y 坐标</label><input type="number" value="${n.y}" oninput="updateProp('y', +this.value)"></div>
+      <div class="field"><label>宽度 (Width)</label><input type="number" value="${n.width}" oninput="updateProp('width', +this.value)"></div>
+      <div class="field"><label>高度 (Height)</label><input type="number" value="${n.height}" oninput="updateProp('height', +this.value)"></div>
+      <div class="field"><label>旋转角度</label><input type="number" value="${n.rotation || 0}" oninput="updateProp('rotation', +this.value)"></div>
+      <div class="field"><label>色块颜色</label><input type="color" value="${rgbToHex(n.r, n.g, n.b)}" oninput="updateColor(this.value)"></div>
+      <div class="field row"><input type="checkbox" ${n.collider ? 'checked' : ''} onchange="updateProp('collider', this.checked)"><label>开启碰撞体</label></div>
+      <div class="field"><label>碰撞标签 (Tag)</label><input type="text" value="${n.tag || 'wall'}" oninput="updateProp('tag', this.value)"></div>
+    </div>
+  `;
+}
+
+function openExport() {
+  document.getElementById('jsonOutput').value = JSON.stringify({ nodes }, null, 2);
+  document.getElementById('exportModal').classList.add('open');
+}
+function closeExport() { document.getElementById('exportModal').classList.remove('open'); }
+function copyJson() {
+  const el = document.getElementById('jsonOutput');
+  el.select();
+  document.execCommand('copy');
+  alert('已复制！直接粘贴覆盖 app/src/main/assets/main.scene.json 即可');
+}
+function importJsonPrompt() {
+  const raw = prompt('请粘贴原有的 main.scene.json 内容：');
+  if (!raw) return;
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed.nodes)) {
+      nodes = parsed.nodes;
+      selectedIndex = nodes.length > 0 ? 0 : -1;
+      renderInspector();
+      draw();
+      closeExport();
+    }
+  } catch (e) { alert('JSON 格式有误'); }
+}
+
+renderInspector();
+draw();
+</script>
+</body>
+</html>
