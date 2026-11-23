@@ -1,0 +1,28 @@
+{
+  "nodes": [
+    {
+      "name": "Wall_Top",
+      "x": 540,
+      "y": 400,
+      "width": 600,
+      "height": 80,
+      "r": 0.35,
+      "g": 0.45,
+      "b": 0.65,
+      "collider": true,
+      "tag": "obstacle"
+    },
+    {
+      "name": "Wall_Bottom",
+      "x": 540,
+      "y": 1300,
+      "width": 600,
+      "height": 80,
+      "r": 0.35,
+      "g": 0.45,
+      "b": 0.65,
+      "collider": true,
+      "tag": "obstacle"
+    }
+  ]
+}
