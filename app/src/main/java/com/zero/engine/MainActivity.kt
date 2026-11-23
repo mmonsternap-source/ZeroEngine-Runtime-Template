@@ -24,6 +24,8 @@ import android.widget.TextView
 import org.json.JSONArray
 import java.io.File
 import java.util.Collections
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 class MainActivity : Activity() {
 
@@ -37,6 +39,7 @@ class MainActivity : Activity() {
     private var isPlaying = false
     private val PICK_IMAGE_CODE = 1001
     private val PICK_AUDIO_CODE = 1002
+    private val EXPORT_ZIP_CODE = 1003
     private val uiHandler = Handler(Looper.getMainLooper())
     private val consoleLogs = Collections.synchronizedList(mutableListOf<String>())
     private var liveConsoleView: TextView? = null
@@ -183,6 +186,18 @@ class MainActivity : Activity() {
         }
 
         @JavascriptInterface
+        fun exportProjectBundle() {
+            runOnUiThread {
+                val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = "application/zip"
+                    putExtra(Intent.EXTRA_TITLE, "${currentProject}_Release.zip")
+                }
+                startActivityForResult(intent, EXPORT_ZIP_CODE)
+            }
+        }
+
+        @JavascriptInterface
         fun getTextureBase64(fileName: String): String {
             val file = File(getProjectDir(), "textures/$fileName")
             if (!file.exists()) return ""
@@ -199,6 +214,28 @@ class MainActivity : Activity() {
             }
         }
         return null
+    }
+
+    private fun writeProjectToZip(uri: Uri) {
+        val projDir = getProjectDir()
+        contentResolver.openOutputStream(uri)?.use { rawOut ->
+            ZipOutputStream(rawOut).use { zos ->
+                // 写入根目录 main.scene.json 便于直接替换进独立 APK assets 目录
+                val mainSceneFile = File(projDir, "scenes/main.scene")
+                if (mainSceneFile.exists()) {
+                    zos.putNextEntry(ZipEntry("main.scene.json"))
+                    zos.write(mainSceneFile.readBytes())
+                    zos.closeEntry()
+                }
+                // 递归写入 scenes / textures / audio 全部资源
+                projDir.walkTopDown().filter { it.isFile }.forEach { file ->
+                    val relPath = file.relativeTo(projDir).path.replace("\\", "/")
+                    zos.putNextEntry(ZipEntry(relPath))
+                    file.inputStream().use { it.copyTo(zos) }
+                    zos.closeEntry()
+                }
+            }
+        }
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -235,6 +272,15 @@ class MainActivity : Activity() {
             }
             appendConsoleLog("[AUDIO] 已导入音频资源: $safeName")
             editorWebView?.evaluateJavascript("onNativeAudioPicked('$safeName')", null)
+        } else if (requestCode == EXPORT_ZIP_CODE) {
+            try {
+                writeProjectToZip(uri)
+                appendConsoleLog("[EXPORT] 工程发布包导出成功: ${currentProject}_Release.zip")
+                editorWebView?.evaluateJavascript("onExportFinished(true)", null)
+            } catch (e: Exception) {
+                appendConsoleLog("[EXPORT 错误] ${e.message}")
+                editorWebView?.evaluateJavascript("onExportFinished(false)", null)
+            }
         }
     }
 
@@ -242,7 +288,7 @@ class MainActivity : Activity() {
         if (isPlaying) return
         isPlaying = true
         consoleLogs.clear()
-        appendConsoleLog("[SYSTEM] Project [$currentProject] v0.5-Alpha Runtime started.")
+        appendConsoleLog("[SYSTEM] Project [$currentProject] v0.5-Release Runtime started.")
 
         val projDir = getProjectDir()
         val surface = ZeroEngineView(
@@ -274,7 +320,7 @@ class MainActivity : Activity() {
             }
 
             val statusText = TextView(this).apply {
-                text = "ZeroEngine v0.5-Alpha | GPU Particles + Shadows + Tween"
+                text = "ZeroEngine v0.5-Release | TileMap + Particles + Shadows"
                 textSize = 11f
                 typeface = Typeface.MONOSPACE
                 setTextColor(Color.parseColor("#34D399"))
