@@ -142,14 +142,12 @@ class MainActivity : Activity() {
         }
         rootNode.addChild(hudLabel)
 
-        // 通用多类型游戏逻辑驱动器
         val gameLoop = object : Node2D("UniversalGameLoop") {
             override fun onProcess(delta: Float) {
                 pulseTime += delta * 6f
                 val colliders = rootNode.findNodesByType<Collider2D>()
                 val virusCells = allSprites.filter { it.behavior == "virus" }
 
-                // 1. 更新所有实体行为
                 for (obj in allSprites) {
                     if (!obj.visible) continue
                     when (obj.behavior) {
@@ -169,11 +167,10 @@ class MainActivity : Activity() {
                                 obj.stateFlag = false
                                 jumpRequested = false
                             }
-                            obj.vy += 2200f * delta // 重力加速度
+                            obj.vy += 2200f * delta
                             obj.x = (obj.x + obj.vx * delta).coerceIn(60f, 1020f)
                             obj.y += obj.vy * delta
 
-                            // 地面与平台碰撞落地检测
                             val myCol = obj.findNodesByType<Collider2D>().firstOrNull()
                             if (myCol != null) {
                                 for (other in colliders) {
@@ -187,7 +184,6 @@ class MainActivity : Activity() {
                                                 camera.shake(12f, 0.12f)
                                             }
                                             "patrol" -> {
-                                                // 碰到巡逻敌人，震屏重置回起点
                                                 camera.shake(28f, 0.25f)
                                                 obj.x = 260f; obj.y = 800f; obj.vy = 0f
                                             }
@@ -208,7 +204,7 @@ class MainActivity : Activity() {
                             shootTimer += delta
                             if (shootTimer >= 0.45f) {
                                 shootTimer = 0f
-                                val b = Sprite2D("Bullet", 24f, 48f, r = 0.98f, g: 0.9f, b = 0.2f).apply {
+                                val b = Sprite2D("Bullet", 24f, 48f, r = 0.98f, g = 0.9f, b = 0.2f).apply {
                                     x = obj.x; y = obj.y - obj.height / 2f - 20f
                                     addChild(Collider2D("BCol", 24f, 48f, "bullet"))
                                 }
@@ -226,7 +222,6 @@ class MainActivity : Activity() {
                     }
                 }
 
-                // 2. 子弹飞行与击中敌人检测
                 val bulletIter = bullets.iterator()
                 while (bulletIter.hasNext()) {
                     val b = bulletIter.next()
@@ -253,7 +248,6 @@ class MainActivity : Activity() {
                     }
                 }
 
-                // 3. 病毒传染扩散逻辑
                 if (virusCells.isNotEmpty()) {
                     val infected = virusCells.filter { it.stateFlag }
                     if (infected.isNotEmpty() && infected.size < virusCells.size) {
@@ -282,12 +276,10 @@ class MainActivity : Activity() {
             renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
             setOnTouchListener { _, event ->
                 if (event.action == MotionEvent.ACTION_DOWN) {
-                    // 点击触发病毒细胞感染
                     allSprites.firstOrNull { it.behavior == "virus" && !it.stateFlag && it.containsPoint(event.x, event.y) }
                         ?.let { it.stateFlag = true; camera.shake(22f, 0.2f) }
                 }
                 if (event.action == MotionEvent.ACTION_DOWN || event.action == MotionEvent.ACTION_MOVE) {
-                    // 拖动控制 drag / shooter 节点
                     allSprites.filter { it.behavior == "drag" || it.behavior == "shooter" }.forEach {
                         it.x = event.x
                         it.y = event.y
@@ -301,7 +293,6 @@ class MainActivity : Activity() {
         container.removeAllViews()
         container.addView(surface)
 
-        // 如果场景里有横版跳跃主角，自动在屏幕底部生成虚拟方向键与跳跃键
         if (allSprites.any { it.behavior == "platformer" }) {
             val controls = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
