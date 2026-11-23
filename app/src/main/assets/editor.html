@@ -7,8 +7,9 @@
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, sans-serif; }
   body { background: #0b0e14; color: #e2e8f0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; user-select: none; }
-  header { background: #131822; padding: 5px 8px; display: flex; gap: 5px; align-items: center; border-bottom: 1px solid #232c3d; overflow-x: auto; }
-  select.proj-sel { background: #0b0e14; color: #38bdf8; border: 1px solid #334155; padding: 4px 6px; border-radius: 4px; font-size: 11px; font-weight: 700; }
+  header { background: #131822; padding: 5px 8px; display: flex; flex-direction: column; gap: 5px; border-bottom: 1px solid #232c3d; }
+  .header-row { display: flex; gap: 5px; align-items: center; width: 100%; overflow-x: auto; }
+  select.proj-sel { background: #0b0e14; color: #38bdf8; border: 1px solid #334155; padding: 4px 6px; border-radius: 4px; font-size: 11px; font-weight: 700; max-width: 125px; }
   button { background: #1e2636; color: #e2e8f0; border: 1px solid #334155; padding: 4px 7px; border-radius: 4px; font-size: 11px; font-weight: 600; white-space: nowrap; }
   button.active-toggle { background: #1d4ed8; border-color: #3b82f6; color: #fff; }
   button.export-btn { background: #7c3aed; border-color: #6d28d9; color: #fff; }
@@ -27,7 +28,7 @@
   canvas { width: 100%; height: 100%; display: block; }
   .vp-hud { position: absolute; top: 6px; left: 6px; font-size: 10px; color: #94a3b8; background: rgba(11,14,20,0.8); padding: 3px 6px; border-radius: 4px; pointer-events: none; font-family: monospace; }
 
-  .bottom-dock { height: 295px; background: #131822; border-top: 1px solid #232c3d; display: flex; flex-direction: column; }
+  .bottom-dock { height: 285px; background: #131822; border-top: 1px solid #232c3d; display: flex; flex-direction: column; }
   .tabs { display: flex; background: #0e121a; border-bottom: 1px solid #232c3d; }
   .tab { flex: 1; text-align: center; padding: 6px 2px; font-size: 11px; color: #94a3b8; border-bottom: 2px solid transparent; }
   .tab.active { color: #38bdf8; border-bottom-color: #38bdf8; font-weight: 700; background: #131822; }
@@ -44,30 +45,41 @@
 
   .script-toolbar { display: flex; gap: 4px; overflow-x: auto; padding-bottom: 5px; }
   .script-toolbar button { font-family: monospace; font-size: 10px; padding: 3px 6px; background: #1e293b; }
-  textarea.code-box { width: 100%; height: 195px; background: #080a0f; color: #a5f3fc; border: 1px solid #334155; border-radius: 4px; padding: 7px; font-family: monospace; font-size: 11px; line-height: 1.4; resize: none; user-select: text; }
+  textarea.code-box { width: 100%; height: 185px; background: #080a0f; color: #a5f3fc; border: 1px solid #334155; border-radius: 4px; padding: 7px; font-family: monospace; font-size: 11px; line-height: 1.4; resize: none; user-select: text; }
   pre#consoleOut, .doc-box { font-family: monospace; font-size: 11px; color: #cbd5e1; white-space: pre-wrap; line-height: 1.45; user-select: text; }
   .doc-box b { color: #38bdf8; }
+
+  /* 内置暗黑输入弹窗与提示条 */
+  .modal-mask { position: fixed; inset: 0; background: rgba(2,6,23,0.82); display: none; align-items: center; justify-content: center; z-index: 999; padding: 20px; }
+  .modal-card { background: #131822; border: 1px solid #334155; border-radius: 8px; padding: 14px; width: 100%; max-width: 320px; display: flex; flex-direction: column; gap: 10px; }
+  .modal-title { font-size: 13px; font-weight: 700; color: #38bdf8; }
+  .modal-input { background: #090c12; border: 1px solid #3b82f6; color: #fff; padding: 8px; border-radius: 5px; font-size: 13px; user-select: text; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  .toast-bar { position: fixed; bottom: 300px; left: 50%; transform: translateX(-50%); background: rgba(15,23,42,0.95); color: #34d399; border: 1px solid #059669; padding: 6px 12px; border-radius: 6px; font-size: 11px; z-index: 998; display: none; white-space: nowrap; }
 </style>
 </head>
 <body>
 
 <header>
-  <select class="proj-sel" id="projSelect" onchange="switchProject(this.value)"></select>
-  <button onclick="createNewProject()">+工程</button>
-  <select class="proj-sel" id="sceneSelect" onchange="switchScene(this.value)"></select>
-  <button onclick="createNewScene()">+场景</button>
-  <button id="modeBtn" class="active-toggle" onclick="toggleCamMode()">模式:2.5D</button>
-  <button id="snapBtn" class="active-toggle" onclick="toggleSnap()">吸附:开</button>
-  <button onclick="resetView()">居中</button>
-  <button class="export-btn" onclick="exportBundle()">📦导出</button>
-  <button class="play" onclick="playScene()">▶ 运行</button>
+  <div class="header-row">
+    <select class="proj-sel" id="projSelect" onchange="switchProject(this.value)"></select>
+    <button onclick="openCreateProjectModal()">+工程</button>
+    <select class="proj-sel" id="sceneSelect" onchange="switchScene(this.value)"></select>
+    <button onclick="openCreateSceneModal()">+场景</button>
+  </div>
+  <div class="header-row">
+    <button id="modeBtn" class="active-toggle" onclick="toggleCamMode()">模式:2.5D</button>
+    <button id="snapBtn" class="active-toggle" onclick="toggleSnap()">吸附:开</button>
+    <button onclick="resetView()">居中</button>
+    <button class="export-btn" onclick="exportBundle()">📦导出</button>
+    <button class="play" onclick="playScene()">▶ 运行</button>
+  </div>
 </header>
 
 <div class="workspace">
   <div class="scene-tree">
     <div class="tree-header">
       <button onclick="addNode('Sprite2D')">+精</button>
-      <button onclick="addNode('TileMap')">+瓦</button>
       <button onclick="addNode('ParticleEmitter')">+粒</button>
       <button onclick="pickNativeImage()">+图</button>
       <button onclick="pickNativeAudio()">+音</button>
@@ -94,6 +106,19 @@
   <div class="dock-body" id="dockBody"></div>
 </div>
 
+<!-- 内置输入弹窗 -->
+<div class="modal-mask" id="inputModal">
+  <div class="modal-card">
+    <div class="modal-title" id="modalTitle">新建</div>
+    <input class="modal-input" id="modalInput" type="text" placeholder="请输入名称...">
+    <div class="modal-actions">
+      <button onclick="closeInputModal()">取消</button>
+      <button class="play" style="margin-left:0;" onclick="confirmInputModal()">确定创建</button>
+    </div>
+  </div>
+</div>
+<div class="toast-bar" id="toastBar"></div>
+
 <script>
 const canvas = document.getElementById('stage');
 const ctx = canvas.getContext('2d');
@@ -105,14 +130,41 @@ let currentScene = 'main.scene';
 let snapGrid = true;
 const GRID_SIZE = 30;
 
-// 瓦片画笔状态: off | paint | erase
-let tileBrushMode = 'off';
-let brushFrame = 0;
-
 let cameraCfg = { mode: '2.5D', pitch: 48, distance: 1250 };
 let camX = 540, camY = 960, camZoom = 0.42;
 let dragMode = null, dragStartWorld = { x: 0, y: 0 }, origNodeState = null;
 let lastPanScreen = { x: 0, y: 0 }, lastPinchDist = 0;
+
+let modalCallback = null;
+
+function showToast(msg) {
+  const bar = document.getElementById('toastBar');
+  bar.textContent = msg;
+  bar.style.display = 'block';
+  clearTimeout(bar._timer);
+  bar._timer = setTimeout(() => { bar.style.display = 'none'; }, 2400);
+}
+
+function openInputModal(title, defaultVal, cb) {
+  modalCallback = cb;
+  document.getElementById('modalTitle').textContent = title;
+  const inp = document.getElementById('modalInput');
+  inp.value = defaultVal;
+  document.getElementById('inputModal').style.display = 'flex';
+  setTimeout(() => { inp.focus(); inp.select(); }, 50);
+}
+
+function closeInputModal() {
+  document.getElementById('inputModal').style.display = 'none';
+  modalCallback = null;
+}
+
+function confirmInputModal() {
+  const val = document.getElementById('modalInput').value.trim();
+  const cb = modalCallback;
+  closeInputModal();
+  if (val && cb) cb(val);
+}
 
 function defaultNodes() {
   return [
@@ -121,18 +173,6 @@ function defaultNodes() {
       x: 540, y: 960, z: -2, width: 2200, height: 2200, rotation: 0, tiltX: 0, billboard: false,
       scaleX: 1, scaleY: 1, zIndex: -10, texture: "", r: 0.16, g: 0.20, b: 0.28, a: 1,
       shadowCaster: false, collider: false, isTrigger: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
-      defaultClip: "", clips: [], shader: "", script: ""
-    },
-    {
-      name: "DungeonWalls", nodeType: "TileMap", layer: "World", parent: "", tag: "wall",
-      x: 0, y: 0, z: 0, width: 90, height: 90, rotation: 0, tiltX: 0, billboard: false,
-      scaleX: 1, scaleY: 1, zIndex: 0, texture: "", r: 0.36, g: 0.44, b: 0.56, a: 1,
-      tileSize: 90,
-      tiles: [
-        { gx: 2, gy: 6, frame: 0 }, { gx: 3, gy: 6, frame: 0 }, { gx: 4, gy: 6, frame: 0 },
-        { gx: 2, gy: 7, frame: 0 }, { gx: 2, gy: 8, frame: 0 }
-      ],
-      shadowCaster: false, collider: true, isTrigger: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
       defaultClip: "", clips: [], shader: "", script: ""
     },
     {
@@ -151,7 +191,7 @@ function onReady() {
   Engine.setCameraMode("2.5D");
   Engine.setCameraTarget(self);
   self.play("idle");
-  Engine.log("ZeroEngine v0.5-Release 瓦片地图/粒子/阴影/导出已就绪");
+  Engine.log("ZeroEngine v0.5-Release 已就绪");
 }
 function onProcess(dt) {
   if (Input.isTouching && Input.screenY < 1550) {
@@ -179,7 +219,7 @@ function onTriggerEnter(other) {
     self.flash(0.14);
     Engine.tween(self, "scaleX", 1.25, 0.12, "easeOut");
     Engine.destroy(other);
-    Engine.log("拾取金币并触发补间反馈: " + other.name);
+    Engine.log("拾取金币: " + other.name);
   }
 }`
     },
@@ -196,6 +236,13 @@ function onTriggerEnter(other) {
       scaleX: 1, scaleY: 1, zIndex: 6, texture: "", r: 1.0, g: 0.65, b: 0.18, a: 0.95,
       emitRate: 28, particleLife: 1.0, particleSpeed: 130, particleSize: 16, particleGravity: -90,
       shadowCaster: false, collider: false, isTrigger: false,
+      hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12, defaultClip: "", clips: [], shader: "", script: ""
+    },
+    {
+      name: "StonePillar", nodeType: "Sprite2D", layer: "World", parent: "", tag: "wall",
+      x: 340, y: 760, z: 0, width: 130, height: 130, rotation: 0, tiltX: 0, billboard: true,
+      scaleX: 1, scaleY: 1, zIndex: 1, texture: "", r: 0.45, g: 0.50, b: 0.60, a: 1,
+      shadowCaster: true, collider: true, isTrigger: false,
       hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12, defaultClip: "", clips: [], shader: "", script: ""
     },
     {
@@ -217,14 +264,6 @@ function onTriggerEnter(other) {
     Engine.playTone(680, 70);
     Engine.tween(self, "scaleX", 0.82, 0.08, "easeOut");
     Engine.tween(self, "scaleY", 0.82, 0.08, "easeOut");
-    var hero = Engine.findNode("Hero");
-    if (hero) {
-      Engine.spawn({
-        name: "SlashWave", x: hero.x, y: hero.y, z: 10, width: 90, height: 90, billboard: true,
-        r: 1.0, g: 0.85, b: 0.2,
-        script: "var t=0.35; function onProcess(dt){ t-=dt; self.scaleX+=6*dt; self.scaleY+=6*dt; self.a=t/0.35; if(t<=0) Engine.destroy(self); }"
-      }, "");
-    }
   } else if (ev.type === "up") {
     Engine.tween(self, "scaleX", 1.0, 0.14, "easeOut");
     Engine.tween(self, "scaleY", 1.0, 0.14, "easeOut");
@@ -279,7 +318,6 @@ function loadCurrentSceneFromDisk() {
       nodes = Array.isArray(parsed.nodes) ? parsed.nodes : [];
       nodes.forEach(n => {
         if (!Array.isArray(n.clips)) n.clips = [];
-        if (!Array.isArray(n.tiles)) n.tiles = [];
         if (n.texture) preloadLocalImage(n.texture);
       });
     } catch (e) { nodes = defaultNodes(); }
@@ -297,31 +335,50 @@ function toggleCamMode() {
   autoSave(); draw();
 }
 
-function createNewProject() {
-  const name = prompt("输入新工程名称 (英文/数字):", "Game_" + (Date.now() % 1000));
-  if (!name || !window.ZeroBridge) return;
-  window.ZeroBridge.setProject(name);
-  currentScene = 'main.scene';
-  nodes = defaultNodes();
-  autoSave(); refreshProjectAndSceneLists(); refreshAudioList(); refreshAll();
+function openCreateProjectModal() {
+  openInputModal("新建独立游戏工程 (英文/数字)", "Game_" + (Date.now() % 1000), (name) => {
+    const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '');
+    if (!safeName) { showToast("请输入英文或数字名称"); return; }
+    if (window.ZeroBridge) window.ZeroBridge.setProject(safeName);
+    currentScene = 'main.scene';
+    nodes = defaultNodes();
+    autoSave();
+    refreshProjectAndSceneLists();
+    refreshAudioList();
+    refreshAll();
+    showToast("已创建并切换到新工程: " + safeName);
+  });
 }
 
 function switchProject(name) {
   if (!window.ZeroBridge) return;
   window.ZeroBridge.setProject(name);
   currentScene = 'main.scene';
-  refreshProjectAndSceneLists(); refreshAudioList(); loadCurrentSceneFromDisk(); refreshAll();
+  refreshProjectAndSceneLists();
+  refreshAudioList();
+  loadCurrentSceneFromDisk();
+  refreshAll();
+  showToast("已切换工程: " + name);
 }
 
-function createNewScene() {
-  const name = prompt("输入新场景/预制体文件名:", "prefab_" + (Date.now() % 100) + ".scene");
-  if (!name) return;
-  currentScene = name.endsWith('.scene') ? name : name + '.scene';
-  nodes = [];
-  autoSave(); refreshProjectAndSceneLists(); refreshAll();
+function openCreateSceneModal() {
+  openInputModal("新建场景 / 预制体 (英文/数字)", "level_" + (Date.now() % 100), (name) => {
+    const safeName = name.replace(/[^a-zA-Z0-9._-]/g, '');
+    if (!safeName) { showToast("请输入英文或数字文件名"); return; }
+    currentScene = safeName.endsWith('.scene') ? safeName : safeName + '.scene';
+    nodes = [];
+    autoSave();
+    refreshProjectAndSceneLists();
+    refreshAll();
+    showToast("已新建空白场景: " + currentScene);
+  });
 }
 
-function switchScene(sceneName) { currentScene = sceneName; loadCurrentSceneFromDisk(); refreshAll(); }
+function switchScene(sceneName) {
+  currentScene = sceneName;
+  loadCurrentSceneFromDisk();
+  refreshAll();
+}
 
 function toggleSnap() {
   snapGrid = !snapGrid;
@@ -340,8 +397,7 @@ function exportBundle() {
 }
 
 function onExportFinished(ok) {
-  if (ok) alert("工程发布包（含 main.scene.json 及全套贴图/音频）已导出成功！");
-  else alert("导出失败，请检查控制台日志。");
+  showToast(ok ? "发布包 (.zip) 导出成功！" : "导出失败，请查看控制台");
 }
 
 function preloadLocalImage(fileName) {
@@ -360,7 +416,7 @@ function pickNativeAudio() { if (window.ZeroBridge && window.ZeroBridge.pickAudi
 function onNativeAudioPicked(fileName) {
   refreshAudioList();
   if (activeTab === 'docs') renderDock();
-  alert("音频已导入工程 audio/ 目录: " + fileName + "\n脚本调用: Engine.playSFX('" + fileName + "')");
+  showToast("音频已导入: " + fileName);
 }
 
 function onNativeImagePicked(fileName, dataUrl, w, h) {
@@ -372,7 +428,7 @@ function onNativeImagePicked(fileName, dataUrl, w, h) {
       x: 540, y: 960, z: 0, width: w || img.width || 160, height: h || img.height || 160,
       rotation: 0, tiltX: 0, billboard: true, scaleX: 1, scaleY: 1, zIndex: 1,
       texture: fileName, r: 1, g: 1, b: 1, a: 1, shadowCaster: false, collider: true, isTrigger: false,
-      hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12, defaultClip: "", clips: [], tiles: [], shader: "", script: ""
+      hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12, defaultClip: "", clips: [], shader: "", script: ""
     });
     selectedIndex = nodes.length - 1;
     autoSave(); refreshAll();
@@ -393,26 +449,22 @@ function addNode(type) {
   const idx = nodes.length + 1;
   const isEmitter = type === 'ParticleEmitter';
   const isLight = type === 'PointLight';
-  const isTile = type === 'TileMap';
   nodes.push({
     name: `${type}_${idx}`, nodeType: type, layer: "World", parent: "",
-    tag: isLight ? 'light' : (isEmitter ? 'fx' : (isTile ? 'wall' : 'default')),
-    x: isTile ? 0 : 540, y: isTile ? 0 : 960, z: isLight ? 60 : 0,
-    width: isLight ? 60 : (isTile ? 90 : 140), height: isLight ? 60 : (isTile ? 90 : 140),
+    tag: isLight ? 'light' : (isEmitter ? 'fx' : 'default'),
+    x: 540, y: 960, z: isLight ? 60 : 0, width: isLight ? 60 : 140, height: isLight ? 60 : 140,
     rotation: 0, tiltX: 0, billboard: type === 'Sprite2D', scaleX: 1, scaleY: 1, zIndex: isEmitter ? 6 : 1,
     text: type === 'Label2D' ? 'Label' : '', fontSize: 44, texture: "",
-    r: isLight ? 1.0 : (isEmitter ? 1.0 : (isTile ? 0.36 : 0.25)),
-    g: isLight ? 0.8 : (isEmitter ? 0.65 : (isTile ? 0.44 : 0.85)),
-    b: isLight ? 0.35 : (isEmitter ? 0.2 : (isTile ? 0.56 : 0.65)),
+    r: isLight ? 1.0 : (isEmitter ? 1.0 : 0.25),
+    g: isLight ? 0.8 : (isEmitter ? 0.65 : 0.85),
+    b: isLight ? 0.35 : (isEmitter ? 0.2 : 0.65),
     a: isEmitter ? 0.95 : 1,
-    tileSize: 90, tiles: [],
     lightRadius: 500, lightIntensity: 1.6, shadowCaster: false,
     emitRate: 24, particleLife: 1.0, particleSpeed: 150, particleSize: 16, particleGravity: -60,
-    collider: type === 'Sprite2D' || isTile, isTrigger: false,
+    collider: type === 'Sprite2D', isTrigger: false,
     hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12, defaultClip: "", clips: [], shader: "", script: ""
   });
   selectedIndex = nodes.length - 1;
-  if (isTile) tileBrushMode = 'paint';
   autoSave(); refreshAll();
 }
 
@@ -423,7 +475,7 @@ function addUINode() {
     x: 200, y: 1680, z: 0, width: 160, height: 160, rotation: 0, tiltX: 0, billboard: false,
     scaleX: 1, scaleY: 1, zIndex: 100, texture: "", r: 0.3, g: 0.6, b: 1.0, a: 0.85,
     shadowCaster: false, collider: false, isTrigger: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
-    defaultClip: "", clips: [], tiles: [], shader: "", script: ""
+    defaultClip: "", clips: [], shader: "", script: ""
   });
   selectedIndex = nodes.length - 1;
   autoSave(); refreshAll();
@@ -443,7 +495,6 @@ function deleteSelected() {
   nodes.splice(selectedIndex, 1);
   nodes.forEach(n => { if (n.parent === removedName) n.parent = ""; });
   selectedIndex = nodes.length - 1;
-  tileBrushMode = 'off';
   autoSave(); refreshAll();
 }
 
@@ -468,24 +519,6 @@ function deleteClip(cIdx) {
   if (selectedIndex < 0) return;
   nodes[selectedIndex].clips.splice(cIdx, 1);
   autoSave(); renderDock();
-}
-
-function paintTileAtWorld(wx, wy) {
-  if (selectedIndex < 0 || !nodes[selectedIndex] || nodes[selectedIndex].nodeType !== 'TileMap') return;
-  const n = nodes[selectedIndex];
-  if (!Array.isArray(n.tiles)) n.tiles = [];
-  const gt = getGlobalTransform(n);
-  const ts = Math.max(8, n.tileSize || 90);
-  const gx = Math.floor((wx - gt.gx) / ts);
-  const gy = Math.floor((wy - gt.gy) / ts);
-  const existIdx = n.tiles.findIndex(t => t.gx === gx && t.gy === gy);
-  if (tileBrushMode === 'paint') {
-    if (existIdx >= 0) n.tiles[existIdx].frame = brushFrame;
-    else n.tiles.push({ gx, gy, frame: brushFrame });
-  } else if (tileBrushMode === 'erase') {
-    if (existIdx >= 0) n.tiles.splice(existIdx, 1);
-  }
-  draw();
 }
 
 function getGlobalTransform(n, visited = new Set()) {
@@ -526,13 +559,8 @@ canvas.addEventListener('touchstart', e => {
   }
   if (e.touches.length === 1) {
     const wp = screenToWorld(e.touches[0].clientX, e.touches[0].clientY);
-    if (selectedIndex >= 0 && nodes[selectedIndex] && nodes[selectedIndex].nodeType === 'TileMap' && tileBrushMode !== 'off') {
-      dragMode = 'tile_brush';
-      paintTileAtWorld(wp.x, wp.y);
-      return;
-    }
     const gizmoLen = 110 / camZoom, hitR = 32 / camZoom;
-    if (selectedIndex >= 0 && nodes[selectedIndex] && nodes[selectedIndex].nodeType !== 'TileMap') {
+    if (selectedIndex >= 0 && nodes[selectedIndex]) {
       const sel = nodes[selectedIndex], gt = getGlobalTransform(sel);
       if (Math.hypot(wp.x - (gt.gx + gizmoLen), wp.y - gt.gy) < hitR) { dragMode = 'move_x'; dragStartWorld = wp; origNodeState = { ...sel }; return; }
       if (Math.hypot(wp.x - gt.gx, wp.y - (gt.gy + gizmoLen)) < hitR) { dragMode = 'move_y'; dragStartWorld = wp; origNodeState = { ...sel }; return; }
@@ -540,9 +568,7 @@ canvas.addEventListener('touchstart', e => {
     }
     let hit = -1;
     for (let i = nodes.length - 1; i >= 0; i--) {
-      const n = nodes[i];
-      if (n.nodeType === 'TileMap') continue;
-      const gt = getGlobalTransform(n);
+      const n = nodes[i], gt = getGlobalTransform(n);
       if (Math.abs(wp.x - gt.gx) <= (n.width * gt.gSx) / 2 && Math.abs(wp.y - gt.gy) <= (n.height * gt.gSy) / 2) { hit = i; break; }
     }
     if (hit >= 0) { selectedIndex = hit; dragMode = 'move_xy'; dragStartWorld = wp; origNodeState = { ...nodes[hit] }; refreshAll(); }
@@ -563,11 +589,6 @@ canvas.addEventListener('touchmove', e => {
     draw(); return;
   }
   if (e.touches.length !== 1) return;
-  if (dragMode === 'tile_brush') {
-    const wp = screenToWorld(e.touches[0].clientX, e.touches[0].clientY);
-    paintTileAtWorld(wp.x, wp.y);
-    return;
-  }
   if (dragMode === 'pan') {
     const dpr = window.devicePixelRatio;
     camX -= (e.touches[0].clientX - lastPanScreen.x) * dpr / camZoom;
@@ -589,11 +610,7 @@ canvas.addEventListener('touchmove', e => {
   draw();
 }, { passive: false });
 
-canvas.addEventListener('touchend', () => {
-  if (dragMode === 'tile_brush') { autoSave(); if (activeTab === 'inspector') renderDock(); }
-  else if (dragMode && dragMode !== 'pan' && dragMode !== 'pinch') autoSave();
-  dragMode = null;
-});
+canvas.addEventListener('touchend', () => { if (dragMode && dragMode !== 'pan' && dragMode !== 'pinch') autoSave(); dragMode = null; });
 
 function rgbToHex(r, g, b) {
   const f = v => Math.round(Math.min(1, Math.max(0, v)) * 255).toString(16).padStart(2, '0');
@@ -606,9 +623,7 @@ function hexToRgb(hex) {
 }
 
 function draw() {
-  const brushHint = (selectedIndex >= 0 && nodes[selectedIndex]?.nodeType === 'TileMap' && tileBrushMode !== 'off')
-    ? ` | 🖌️${tileBrushMode === 'paint' ? '刷瓦片' : '橡皮擦'}` : '';
-  document.getElementById('vpHud').textContent = `${cameraCfg.mode} | Zoom:${Math.round(camZoom * 100)}% | ${currentScene}${brushHint}`;
+  document.getElementById('vpHud').textContent = `${cameraCfg.mode} | Zoom:${Math.round(camZoom * 100)}% | ${currentScene}`;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.save();
   ctx.translate(canvas.width / 2, canvas.height / 2);
@@ -629,27 +644,7 @@ function draw() {
     ctx.rotate(gt.gRot * Math.PI / 180);
     ctx.globalAlpha = n.a ?? 1;
 
-    if (n.nodeType === 'TileMap') {
-      const ts = Math.max(8, n.tileSize || 90);
-      const img = (n.texture && imageCache[n.texture]) ? imageCache[n.texture] : null;
-      const hf = Math.max(1, n.hFrames || 1), vf = Math.max(1, n.vFrames || 1);
-      (n.tiles || []).forEach(cell => {
-        const cx = cell.gx * ts, cy = cell.gy * ts;
-        if (img) {
-          const fi = Math.min(hf * vf - 1, Math.max(0, cell.frame || 0));
-          const sw = img.width / hf, sh = img.height / vf;
-          ctx.drawImage(img, (fi % hf) * sw, Math.floor(fi / hf) * sh, sw, sh, cx, cy, ts, ts);
-        } else {
-          ctx.fillStyle = rgbToHex(n.r, n.g, n.b);
-          ctx.fillRect(cx, cy, ts, ts);
-        }
-        if (idx === selectedIndex) {
-          ctx.strokeStyle = 'rgba(56,189,248,0.55)';
-          ctx.lineWidth = 2 / camZoom;
-          ctx.strokeRect(cx, cy, ts, ts);
-        }
-      });
-    } else if (n.nodeType === 'PointLight') {
+    if (n.nodeType === 'PointLight') {
       const grad = ctx.createRadialGradient(0, 0, 5, 0, 0, n.lightRadius || 300);
       grad.addColorStop(0, rgbToHex(n.r, n.g, n.b));
       grad.addColorStop(1, 'rgba(0,0,0,0)');
@@ -675,19 +670,17 @@ function draw() {
       ctx.fillRect(-w / 2, -h / 2, w, h);
     }
 
-    if (n.nodeType !== 'TileMap') {
-      if (n.layer === 'UI') {
-        ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 3 / camZoom;
-        ctx.strokeRect(-w / 2, -h / 2, w, h);
-      } else if (n.collider) {
-        ctx.strokeStyle = n.isTrigger ? '#a855f7' : '#38bdf8';
-        ctx.lineWidth = 3 / camZoom; ctx.setLineDash([10 / camZoom, 6 / camZoom]);
-        ctx.strokeRect(-w / 2, -h / 2, w, h); ctx.setLineDash([]);
-      }
+    if (n.layer === 'UI') {
+      ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 3 / camZoom;
+      ctx.strokeRect(-w / 2, -h / 2, w, h);
+    } else if (n.collider) {
+      ctx.strokeStyle = n.isTrigger ? '#a855f7' : '#38bdf8';
+      ctx.lineWidth = 3 / camZoom; ctx.setLineDash([10 / camZoom, 6 / camZoom]);
+      ctx.strokeRect(-w / 2, -h / 2, w, h); ctx.setLineDash([]);
     }
     ctx.restore();
 
-    if (idx === selectedIndex && n.nodeType !== 'TileMap') {
+    if (idx === selectedIndex) {
       const len = 110 / camZoom, rHandle = 14 / camZoom;
       ctx.save(); ctx.translate(gt.gx, gt.gy);
       ctx.strokeStyle = '#ef4444'; ctx.fillStyle = '#ef4444'; ctx.lineWidth = 4 / camZoom;
@@ -708,20 +701,13 @@ function draw() {
 function renderTree() {
   document.getElementById('treeList').innerHTML = nodes.map((n, i) => {
     const indent = n.parent ? '└ ' : '';
-    const icon = n.nodeType === 'PointLight' ? '💡'
-      : (n.nodeType === 'ParticleEmitter' ? '🔥'
-      : (n.nodeType === 'TileMap' ? '🧱'
-      : (n.layer === 'UI' ? '📱' : (n.billboard ? '🧍' : ''))));
+    const icon = n.nodeType === 'PointLight' ? '💡' : (n.nodeType === 'ParticleEmitter' ? '🔥' : (n.layer === 'UI' ? '📱' : (n.billboard ? '🧍' : '')));
     const badges = (n.script && n.script.trim() ? '📜' : '') + (n.shader && n.shader.trim() ? '✨' : '');
     return `<div class="tree-item ${i === selectedIndex ? 'active' : ''}" onclick="selectNode(${i})">${indent}${icon}${n.name} ${badges}</div>`;
   }).join('');
 }
 
-function selectNode(i) {
-  selectedIndex = i;
-  if (nodes[i]?.nodeType !== 'TileMap') tileBrushMode = 'off';
-  refreshAll();
-}
+function selectNode(i) { selectedIndex = i; refreshAll(); }
 
 function switchTab(tab) {
   activeTab = tab;
@@ -767,9 +753,9 @@ function renderDock() {
     body.innerHTML = `<div class="doc-box">
 <b>ZeroEngine SDK v0.5-Release 商业旗舰手册</b><br>
 • <b>已导入音频</b>: ${audioStr}<br>
-• <b>TileMap 瓦片刷</b>: 添加 +瓦 节点，开启画笔模式直接在视口涂刷墙壁/地形，勾选碰撞体自动阻挡角色<br>
-• <b>一键发布包</b>: 点击顶部「📦导出」生成含 main.scene.json 与全套素材的 .zip 包<br>
-• <b>缓动/闪白/粒子</b>: Engine.tween(self, "scaleX", 1.3, 0.15, "easeOut") / self.flash(0.14) / self.emitBurst(30)<br>
+• <b>缓动补间</b>: Engine.tween(self, "scaleX", 1.3, 0.15, "easeOut")<br>
+• <b>受击闪白与粒子爆发</b>: self.flash(0.14) / self.emitBurst(30)<br>
+• <b>实时动态阴影</b>: 勾选节点「投射阴影」，灯光自动计算投影<br>
 • <b>动画状态机与音频</b>: self.play("run") / Engine.playSFX("hit.wav") / Engine.playBGM("bgm.mp3")
 </div>`;
     return;
@@ -834,13 +820,7 @@ function renderDock() {
   `).join('');
 
   let extraFields = '';
-  if (n.nodeType === 'TileMap') {
-    extraFields = `
-      <div class="field"><label>瓦片尺寸 (TileSize)</label><input type="number" min="16" value="${n.tileSize || 90}" oninput="updateProp('tileSize', Math.max(16,+this.value))"></div>
-      <div class="field"><label>当前画笔图块帧号</label><input type="number" min="0" value="${brushFrame}" oninput="brushFrame = Math.max(0,+this.value)"></div>
-      <div class="field"><label>瓦片颜色</label><input type="color" value="${rgbToHex(n.r, n.g, n.b)}" oninput="updateColor(this.value)"></div>
-      <div class="field"><label>图集列数 (H-Frames)</label><input type="number" min="1" value="${n.hFrames || 1}" oninput="updateProp('hFrames', Math.max(1,+this.value))"></div>`;
-  } else if (n.nodeType === 'PointLight') {
+  if (n.nodeType === 'PointLight') {
     extraFields = `
       <div class="field"><label>光照半径 (Radius)</label><input type="number" value="${n.lightRadius || 450}" oninput="updateProp('lightRadius', +this.value)"></div>
       <div class="field"><label>光照强度 (Intensity)</label><input type="number" step="0.1" value="${n.lightIntensity || 1.4}" oninput="updateProp('lightIntensity', +this.value)"></div>
@@ -861,25 +841,12 @@ function renderDock() {
       <div class="field"><label>序列帧行数 (V-Frames)</label><input type="number" min="1" value="${n.vFrames || 1}" oninput="updateProp('vFrames', Math.max(1,+this.value))"></div>`;
   }
 
-  const tileBrushBar = n.nodeType === 'TileMap' ? `
-    <div class="clip-box" style="margin-bottom:8px;margin-top:0;">
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:4px;">
-        <span style="font-size:11px;font-weight:700;color:#38bdf8;">🧱 瓦片画笔 (已铺 ${(n.tiles||[]).length} 格)</span>
-        <div style="display:flex;gap:4px;">
-          <button class="${tileBrushMode==='off'?'active-toggle':''}" style="padding:2px 6px;font-size:10px;" onclick="tileBrushMode='off';renderDock();draw();">拖动视口</button>
-          <button class="${tileBrushMode==='paint'?'active-toggle':''}" style="padding:2px 6px;font-size:10px;" onclick="tileBrushMode='paint';renderDock();draw();">🖌️刷瓦片</button>
-          <button class="${tileBrushMode==='erase'?'active-toggle':''}" style="padding:2px 6px;font-size:10px;" onclick="tileBrushMode='erase';renderDock();draw();">橡皮擦</button>
-        </div>
-      </div>
-    </div>` : '';
-
   body.innerHTML = `
     <div style="display:flex;gap:6px;align-items:center;margin-bottom:7px;">
       <input style="background:#090c12;border:1px solid #334155;color:#fbbf24;font-weight:700;padding:4px 6px;border-radius:4px;font-size:12px;flex:1;" value="${n.name}" onchange="updateProp('name', this.value)">
       <button onclick="duplicateSelected()">复制</button>
       <button class="danger" onclick="deleteSelected()">删除</button>
     </div>
-    ${tileBrushBar}
     <div class="grid">
       <div class="field"><label>渲染图层 (Layer)</label>
         <select onchange="updateProp('layer', this.value)">
