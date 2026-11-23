@@ -43,7 +43,8 @@ class ZeroEngineView(
         val start: Int,
         val end: Int,
         val fps: Float,
-        val loop: Boolean
+        val loop: Boolean,
+        val events: Map<Int, String> = emptyMap() // 关键帧事件: 帧号 -> 事件名
     )
 
     data class TileCell(
@@ -92,6 +93,9 @@ class ZeroEngineView(
         var scaleY: Float = 1f,
         var zIndex: Int = 0,
         var visible: Boolean = true,
+        // 通用视差滚动系数 (1.0=正常世界空间, <1.0=远景, >1.0=前景)
+        var parallaxX: Float = 1f,
+        var parallaxY: Float = 1f,
         var texture: String = "",
         var text: String = "",
         var fontSize: Float = 44f,
@@ -103,8 +107,29 @@ class ZeroEngineView(
         var lightRadius: Float = 450f,
         var lightIntensity: Float = 1.4f,
         var shadowCaster: Boolean = false,
+        // 通用物理与碰撞参数
         var collider: Boolean = false,
         var isTrigger: Boolean = false,
+        var oneWay: Boolean = false,
+        var bodyMode: String = "kinematic", // kinematic(自由8向) | platformer(横版重力) | rigid(弹跳物理)
+        var gravity: Float = 2200f,
+        var fallMultiplier: Float = 1.55f,
+        var maxFallSpeed: Float = 1450f,
+        var bounciness: Float = 0.5f,
+        var drag: Float = 0f,
+        var isGrounded: Boolean = false,
+        var coyoteTimer: Float = 0f,
+        var coyoteTimeMax: Float = 0.12f,
+        var jumpCount: Int = 0,
+        var maxJumps: Int = 2,
+        var dropThroughTimer: Float = 0f,
+        // 通用战斗判定属性 (适用于动作/RPG/射击/肉鸽)
+        var isHitbox: Boolean = false,
+        var isHurtbox: Boolean = false,
+        var damage: Float = 10f,
+        var invulnTimer: Float = 0f,
+        var hitCooldownMap: MutableMap<String, Float> = mutableMapOf(),
+        // 序列帧与状态机
         var hFrames: Int = 1,
         var vFrames: Int = 1,
         var currentFrame: Int = 0,
@@ -144,6 +169,10 @@ class ZeroEngineView(
     private val textTextureCache = ConcurrentHashMap<String, Int>()
     private val eventListeners = mutableMapOf<String, MutableList<Function>>()
 
+    // 跨关卡持久化全局数据字典
+    private val globalDataStore = ConcurrentHashMap<String, Any?>()
+    @Volatile private var pendingSceneLoad: String? = null
+
     // 音频管理器 (BGM + SFX)
     private var bgmPlayer: MediaPlayer? = null
     private val soundPool: SoundPool = SoundPool.Builder()
@@ -157,7 +186,7 @@ class ZeroEngineView(
         .build()
     private val sfxCache = ConcurrentHashMap<String, Int>()
 
-    // 2D / 2.5D 摄像机状态
+    // 2D / 2.5D 摄像机状态 (支持死区、前瞻与边界限制)
     private var camMode = "2.5D"
     private var camX = 540f
     private var camY = 960f
@@ -165,8 +194,22 @@ class ZeroEngineView(
     private var camDistance = 1250f
     private var camFov = 45f
     private var camTarget: GameNode? = null
+    private var camSmoothSpeed = 9f
+    private var camDeadzoneX = 0f
+    private var camDeadzoneY = 0f
+    private var camLookAheadX = 0f
+    private var camLookAheadY = 0f
+    private var camBoundsEnabled = false
+    private var camMinX = -99999f
+    private var camMinY = -99999f
+    private var camMaxX = 99999f
+    private var camMaxY = 99999f
     private var shakeIntensity = 0f
     private var shakeTimer = 0f
+
+    // 全局顿帧与时间缩放 (支持慢动作与打击顿帧)
+    private var hitstopTimer = 0f
+    private var timeScale = 1f
 
     // 环境光
     private var ambientR = 0.52f
@@ -237,10 +280,20 @@ class ZeroEngineView(
         defaultLitProgram = buildShaderProgram(VERTEX_SHADER, DEFAULT_LIT_FRAGMENT_SHADER)
 
         initRhinoVM()
-        parseSceneJson(sceneJson, nodes)
+        loadSceneContent(sceneJson)
+        lastFrameNs = System.nanoTime()
+    }
+
+    private fun loadSceneContent(rawJson: String) {
+        nodes.clear()
+        pendingAdd.clear()
+        pendingRemove.clear()
+        activeTweens.clear()
+        camTarget = null
+        camBoundsEnabled = false
+        parseSceneJson(rawJson, nodes)
         nodes.forEach { bindNodeScript(it) }
         nodes.toList().forEach { callLifecycle(it, "onReady") }
-        lastFrameNs = System.nanoTime()
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -252,8 +305,30 @@ class ZeroEngineView(
 
     override fun onDrawFrame(gl: GL10?) {
         val now = System.nanoTime()
-        val dt = ((now - lastFrameNs) / 1_000_000_000.0).toFloat().coerceIn(0.001f, 0.05f)
+        val rawDt = ((now - lastFrameNs) / 1_000_000_000.0).toFloat().coerceIn(0.001f, 0.05f)
         lastFrameNs = now
+
+        // 检查异步关卡切换请求
+        pendingSceneLoad?.let { nextSceneFile ->
+            pendingSceneLoad = null
+            val file = File(File(projectDir, "scenes"), nextSceneFile)
+            if (file.exists()) {
+                onConsoleLog("[SCENE] 切换关卡场景 -> $nextSceneFile")
+                loadSceneContent(file.readText())
+            } else {
+                onConsoleLog("[SCENE 错误] 找不到场景文件: $nextSceneFile")
+            }
+        }
+
+        // 处理顿帧 (Hitstop)
+        if (hitstopTimer > 0f) {
+            hitstopTimer = max(0f, hitstopTimer - rawDt)
+            updateCameraMatrices(rawDt)
+            renderSceneFrame()
+            return
+        }
+
+        val dt = rawDt * timeScale
         engineTime += dt
 
         updateCameraMatrices(dt)
@@ -271,6 +346,16 @@ class ZeroEngineView(
         nodes.toList().forEach { n ->
             if (!pendingRemove.contains(n)) {
                 if (n.flashTimer > 0f) n.flashTimer = max(0f, n.flashTimer - dt)
+                if (n.invulnTimer > 0f) n.invulnTimer = max(0f, n.invulnTimer - dt)
+                if (n.dropThroughTimer > 0f) n.dropThroughTimer = max(0f, n.dropThroughTimer - dt)
+                if (n.hitCooldownMap.isNotEmpty()) {
+                    val it = n.hitCooldownMap.iterator()
+                    while (it.hasNext()) {
+                        val entry = it.next()
+                        val left = entry.value - dt
+                        if (left <= 0f) it.remove() else entry.setValue(left)
+                    }
+                }
                 updateSpriteAnimation(n, dt)
                 if (n.nodeType == "ParticleEmitter") {
                     updateParticleEmitter(n, dt)
@@ -279,11 +364,18 @@ class ZeroEngineView(
             }
         }
 
+        // 处理通用战斗 Hitbox / Hurtbox 判定
+        processCombatOverlaps()
+
         if (pendingRemove.isNotEmpty()) {
             nodes.removeAll(pendingRemove)
             pendingRemove.clear()
         }
 
+        renderSceneFrame()
+    }
+
+    private fun renderSceneFrame() {
         val lights = nodes.filter { it.visible && it.nodeType == "PointLight" }.take(8)
         val lightPosArr = FloatArray(8 * 4)
         val lightColArr = FloatArray(8 * 4)
@@ -325,6 +417,36 @@ class ZeroEngineView(
                 renderParticles(n, uiVpMatrix, isWorld = false)
             } else {
                 renderNode(n, uiVpMatrix, isWorld = false, 0, lightPosArr, lightColArr)
+            }
+        }
+    }
+
+    private fun processCombatOverlaps() {
+        val hitboxes = nodes.filter { it.visible && it.isHitbox && !pendingRemove.contains(it) }
+        val hurtboxes = nodes.filter { it.visible && it.isHurtbox && !pendingRemove.contains(it) }
+        if (hitboxes.isEmpty() || hurtboxes.isEmpty()) return
+
+        for (hb in hitboxes) {
+            for (hurt in hurtboxes) {
+                if (hb === hurt || hb.parent == hurt.name || hurt.parent == hb.name) continue
+                if (hurt.invulnTimer > 0f) continue
+                if (hb.hitCooldownMap.containsKey(hurt.name)) continue
+                if (checkOverlap(hb, hurt)) {
+                    hb.hitCooldownMap[hurt.name] = 0.25f
+                    syncToJs(hb)
+                    syncToJs(hurt)
+                    callLifecycle(hb, "onHit", hurt.jsObj)
+                    val scope = hurt.jsObj?.prototype
+                    val fn = if (scope != null) ScriptableObject.getProperty(scope, "onHurt") as? Function else null
+                    if (fn != null && scope != null) {
+                        try {
+                            fn.call(rhino, scope, hurt.jsObj, arrayOf(hb.jsObj, hb.damage.toDouble()))
+                            syncFromJs(hurt)
+                        } catch (e: Exception) {
+                            onConsoleLog("[JS 运行错误 @ ${hurt.name}.onHurt] ${e.message}")
+                        }
+                    }
+                }
             }
         }
     }
@@ -578,8 +700,25 @@ class ZeroEngineView(
     private fun updateCameraMatrices(dt: Float) {
         camTarget?.let { target ->
             val gt = getGlobalTransform(target)
-            camX += (gt.gx - camX) * min(1f, 8f * dt)
-            camY += (gt.gy - camY) * min(1f, 8f * dt)
+            val lookX = if (target.scaleX < 0f) -camLookAheadX else camLookAheadX
+            val desiredX = gt.gx + lookX
+            val desiredY = gt.gy + camLookAheadY
+
+            val dx = desiredX - camX
+            val dy = desiredY - camY
+            if (abs(dx) > camDeadzoneX) {
+                val moveX = dx - sign(dx) * camDeadzoneX
+                camX += moveX * min(1f, camSmoothSpeed * dt)
+            }
+            if (abs(dy) > camDeadzoneY) {
+                val moveY = dy - sign(dy) * camDeadzoneY
+                camY += moveY * min(1f, camSmoothSpeed * dt)
+            }
+        }
+
+        if (camBoundsEnabled) {
+            camX = camX.coerceIn(camMinX, max(camMinX, camMaxX))
+            camY = camY.coerceIn(camMinY, max(camMinY, camMaxY))
         }
 
         var sx = 0f
@@ -734,6 +873,17 @@ class ZeroEngineView(
         while (n.animTimer >= frameDur) {
             n.animTimer -= frameDur
             n.currentFrame++
+            val clip = n.clips[n.currentClipName]
+            val evName = clip?.events?.get(n.currentFrame)
+            if (!evName.isNullOrEmpty()) {
+                val scope = n.jsObj?.prototype
+                val fn = if (scope != null) ScriptableObject.getProperty(scope, "onFrameEvent") as? Function else null
+                if (fn != null && scope != null) {
+                    try {
+                        fn.call(rhino, scope, n.jsObj, arrayOf(n.currentClipName, evName))
+                    } catch (_: Exception) {}
+                }
+            }
             if (n.currentFrame > n.animEnd) {
                 if (n.animLoop) {
                     n.currentFrame = n.animStart
@@ -818,6 +968,31 @@ class ZeroEngineView(
             onConsoleLog("[LOG] $msg")
             null
         })
+        ScriptableObject.putProperty(engineApi, "loadScene", jsFunc { args ->
+            val sName = RhinoContext.toString(args.getOrNull(0) ?: "")
+            if (sName.isNotEmpty()) {
+                pendingSceneLoad = if (sName.endsWith(".scene")) sName else "$sName.scene"
+            }
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "setGlobal", jsFunc { args ->
+            val k = RhinoContext.toString(args.getOrNull(0) ?: "")
+            if (k.isNotEmpty()) globalDataStore[k] = args.getOrNull(1)
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "getGlobal", jsFunc { args ->
+            val k = RhinoContext.toString(args.getOrNull(0) ?: "")
+            globalDataStore[k] ?: args.getOrNull(1)
+        })
+        ScriptableObject.putProperty(engineApi, "hitstop", jsFunc { args ->
+            val sec = (args.getOrNull(0) as? Number)?.toFloat() ?: 0.05f
+            hitstopTimer = max(hitstopTimer, sec.coerceIn(0f, 0.5f))
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "setTimeScale", jsFunc { args ->
+            timeScale = ((args.getOrNull(0) as? Number)?.toFloat() ?: 1f).coerceIn(0.05f, 4f)
+            null
+        })
         ScriptableObject.putProperty(engineApi, "setCameraMode", jsFunc { args ->
             camMode = RhinoContext.toString(args.getOrNull(0) ?: "2.5D")
             null
@@ -831,6 +1006,28 @@ class ZeroEngineView(
         ScriptableObject.putProperty(engineApi, "setCameraTarget", jsFunc { args ->
             val targetObj = args.getOrNull(0) as? Scriptable
             camTarget = nodes.find { it.jsObj === targetObj }
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "setCameraDeadzone", jsFunc { args ->
+            camDeadzoneX = (args.getOrNull(0) as? Number)?.toFloat() ?: 0f
+            camDeadzoneY = (args.getOrNull(1) as? Number)?.toFloat() ?: 0f
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "setCameraLookAhead", jsFunc { args ->
+            camLookAheadX = (args.getOrNull(0) as? Number)?.toFloat() ?: 0f
+            camLookAheadY = (args.getOrNull(1) as? Number)?.toFloat() ?: 0f
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "setCameraBounds", jsFunc { args ->
+            camBoundsEnabled = true
+            camMinX = (args.getOrNull(0) as? Number)?.toFloat() ?: -99999f
+            camMinY = (args.getOrNull(1) as? Number)?.toFloat() ?: -99999f
+            camMaxX = (args.getOrNull(2) as? Number)?.toFloat() ?: 99999f
+            camMaxY = (args.getOrNull(3) as? Number)?.toFloat() ?: 99999f
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "clearCameraBounds", jsFunc {
+            camBoundsEnabled = false
             null
         })
         ScriptableObject.putProperty(engineApi, "getCamera", jsFunc {
@@ -897,6 +1094,24 @@ class ZeroEngineView(
             syncToJs(n)
             null
         })
+        ScriptableObject.putProperty(engineApi, "distance", jsFunc { args ->
+            val a = nodes.find { it.jsObj === (args.getOrNull(0) as? Scriptable) }
+            val b = nodes.find { it.jsObj === (args.getOrNull(1) as? Scriptable) }
+            if (a != null && b != null) {
+                val ga = getGlobalTransform(a)
+                val gb = getGlobalTransform(b)
+                hypot(ga.gx - gb.gx, ga.gy - gb.gy).toDouble()
+            } else 999999.0
+        })
+        ScriptableObject.putProperty(engineApi, "angleTo", jsFunc { args ->
+            val a = nodes.find { it.jsObj === (args.getOrNull(0) as? Scriptable) }
+            val b = nodes.find { it.jsObj === (args.getOrNull(1) as? Scriptable) }
+            if (a != null && b != null) {
+                val ga = getGlobalTransform(a)
+                val gb = getGlobalTransform(b)
+                Math.toDegrees(atan2((gb.gy - ga.gy).toDouble(), (gb.gx - ga.gx).toDouble()))
+            } else 0.0
+        })
         ScriptableObject.putProperty(engineApi, "spawn", jsFunc { args ->
             val cfg = args.getOrNull(0) as? Scriptable ?: return@jsFunc null
             val parentName = RhinoContext.toString(args.getOrNull(1) ?: "")
@@ -919,6 +1134,11 @@ class ZeroEngineView(
                 a = getJsFloat(cfg, "a", 1f),
                 collider = getJsBool(cfg, "collider", false),
                 isTrigger = getJsBool(cfg, "isTrigger", false),
+                oneWay = getJsBool(cfg, "oneWay", false),
+                bodyMode = getJsStr(cfg, "bodyMode", "kinematic"),
+                isHitbox = getJsBool(cfg, "isHitbox", false),
+                isHurtbox = getJsBool(cfg, "isHurtbox", false),
+                damage = getJsFloat(cfg, "damage", 10f),
                 shadowCaster = getJsBool(cfg, "shadowCaster", false),
                 lightRadius = getJsFloat(cfg, "lightRadius", 400f),
                 lightIntensity = getJsFloat(cfg, "lightIntensity", 1.5f),
@@ -953,6 +1173,11 @@ class ZeroEngineView(
         ScriptableObject.putProperty(engineApi, "findNode", jsFunc { args ->
             val name = RhinoContext.toString(args.getOrNull(0) ?: "")
             nodes.find { it.name == name }?.jsObj
+        })
+        ScriptableObject.putProperty(engineApi, "findNodesByTag", jsFunc { args ->
+            val t = RhinoContext.toString(args.getOrNull(0) ?: "")
+            val matched = nodes.filter { it.tag == t && !pendingRemove.contains(it) }.mapNotNull { it.jsObj }.toTypedArray()
+            rhino.newArray(globalScope, matched)
         })
         ScriptableObject.putProperty(engineApi, "on", jsFunc { args ->
             val ev = RhinoContext.toString(args.getOrNull(0) ?: "")
@@ -995,6 +1220,44 @@ class ZeroEngineView(
         n.jsObj = selfObj
         syncToJs(n)
 
+        // 通用横版/动作跳跃接口 (含土狼时间与多段跳)
+        ScriptableObject.putProperty(selfObj, "jump", jsFunc { args ->
+            val jumpForce = (args.getOrNull(0) as? Number)?.toFloat() ?: 920f
+            syncFromJs(n)
+            if (n.isGrounded || n.coyoteTimer > 0f) {
+                n.vy = -abs(jumpForce)
+                n.isGrounded = false
+                n.coyoteTimer = 0f
+                n.jumpCount = 1
+                syncToJs(n)
+                return@jsFunc true
+            } else if (n.jumpCount < n.maxJumps) {
+                n.vy = -abs(jumpForce) * 0.9f
+                n.jumpCount++
+                syncToJs(n)
+                return@jsFunc true
+            }
+            false
+        })
+        // 通用单向平台向下穿跃
+        ScriptableObject.putProperty(selfObj, "dropThrough", jsFunc { args ->
+            val dur = (args.getOrNull(0) as? Number)?.toFloat() ?: 0.22f
+            n.dropThroughTimer = dur
+            n.isGrounded = false
+            null
+        })
+        // 通用物理弹跳 / 下劈反弹 / 后坐力
+        ScriptableObject.putProperty(selfObj, "bounce", jsFunc { args ->
+            val bvx = (args.getOrNull(0) as? Number)?.toFloat()
+            val bvy = (args.getOrNull(1) as? Number)?.toFloat() ?: -760f
+            syncFromJs(n)
+            if (bvx != null) n.vx = bvx
+            n.vy = bvy
+            n.isGrounded = false
+            n.jumpCount = 1
+            syncToJs(n)
+            null
+        })
         ScriptableObject.putProperty(selfObj, "play", jsFunc { args ->
             val clipName = RhinoContext.toString(args.getOrNull(0) ?: "")
             val forceRestart = (args.getOrNull(1) as? Boolean) ?: false
@@ -1083,6 +1346,17 @@ class ZeroEngineView(
         ScriptableObject.putProperty(o, "tiltX", n.tiltX.toDouble())
         ScriptableObject.putProperty(o, "scaleX", n.scaleX.toDouble())
         ScriptableObject.putProperty(o, "scaleY", n.scaleY.toDouble())
+        ScriptableObject.putProperty(o, "parallaxX", n.parallaxX.toDouble())
+        ScriptableObject.putProperty(o, "parallaxY", n.parallaxY.toDouble())
+        ScriptableObject.putProperty(o, "bodyMode", n.bodyMode)
+        ScriptableObject.putProperty(o, "gravity", n.gravity.toDouble())
+        ScriptableObject.putProperty(o, "fallMultiplier", n.fallMultiplier.toDouble())
+        ScriptableObject.putProperty(o, "maxJumps", n.maxJumps)
+        ScriptableObject.putProperty(o, "isGrounded", n.isGrounded)
+        ScriptableObject.putProperty(o, "isHitbox", n.isHitbox)
+        ScriptableObject.putProperty(o, "isHurtbox", n.isHurtbox)
+        ScriptableObject.putProperty(o, "damage", n.damage.toDouble())
+        ScriptableObject.putProperty(o, "invulnTimer", n.invulnTimer.toDouble())
         ScriptableObject.putProperty(o, "r", n.r.toDouble())
         ScriptableObject.putProperty(o, "g", n.g.toDouble())
         ScriptableObject.putProperty(o, "b", n.b.toDouble())
@@ -1108,6 +1382,16 @@ class ZeroEngineView(
         n.tiltX = getJsFloat(o, "tiltX", n.tiltX)
         n.scaleX = getJsFloat(o, "scaleX", n.scaleX)
         n.scaleY = getJsFloat(o, "scaleY", n.scaleY)
+        n.parallaxX = getJsFloat(o, "parallaxX", n.parallaxX)
+        n.parallaxY = getJsFloat(o, "parallaxY", n.parallaxY)
+        n.bodyMode = getJsStr(o, "bodyMode", n.bodyMode)
+        n.gravity = getJsFloat(o, "gravity", n.gravity)
+        n.fallMultiplier = getJsFloat(o, "fallMultiplier", n.fallMultiplier)
+        n.maxJumps = getJsInt(o, "maxJumps", n.maxJumps)
+        n.isHitbox = getJsBool(o, "isHitbox", n.isHitbox)
+        n.isHurtbox = getJsBool(o, "isHurtbox", n.isHurtbox)
+        n.damage = getJsFloat(o, "damage", n.damage)
+        n.invulnTimer = getJsFloat(o, "invulnTimer", n.invulnTimer)
         n.r = getJsFloat(o, "r", n.r)
         n.g = getJsFloat(o, "g", n.g)
         n.b = getJsFloat(o, "b", n.b)
@@ -1121,28 +1405,74 @@ class ZeroEngineView(
     private fun moveAndSlideNode(n: GameNode, dt: Float) {
         val collidedSolids = mutableSetOf<GameNode>()
 
+        // 根据物理模式施加重力或阻尼
+        if (n.bodyMode == "platformer" || n.bodyMode == "rigid") {
+            val gMul = if (n.vy > 0f) n.fallMultiplier else 1f
+            n.vy = min(n.maxFallSpeed, n.vy + n.gravity * gMul * dt)
+            if (n.drag > 0f) {
+                n.vx *= max(0f, 1f - n.drag * dt)
+            }
+        }
+
+        val prevBottom = n.y + (n.height * abs(n.scaleY)) * 0.5f
+
+        // X 轴位移与碰撞
         n.x += n.vx * dt
         if (n.collider && !n.isTrigger) {
             for (other in nodes) {
-                if (other !== n && other.visible && other.collider && !other.isTrigger && other.layer == n.layer) {
+                if (other !== n && other.visible && other.collider && !other.isTrigger && !other.oneWay && other.layer == n.layer) {
                     if (checkOverlap(n, other)) {
                         n.x -= n.vx * dt
+                        if (n.bodyMode == "rigid") n.vx = -n.vx * n.bounciness else n.vx = 0f
                         collidedSolids.add(other)
                     }
                 }
             }
         }
 
+        // Y 轴位移与碰撞 (含单向平台与地面检测)
+        val wasGrounded = n.isGrounded
+        n.isGrounded = false
         n.y += n.vy * dt
         if (n.collider && !n.isTrigger) {
             for (other in nodes) {
                 if (other !== n && other.visible && other.collider && !other.isTrigger && other.layer == n.layer) {
-                    if (checkOverlap(n, other)) {
+                    if (other.oneWay) {
+                        // 单向平台：仅当从上方下落且未按下穿时阻挡
+                        if (n.vy >= 0f && n.dropThroughTimer <= 0f) {
+                            val gb = getGlobalTransform(other)
+                            val otherTop = gb.gy - (other.height * abs(gb.gSy)) * 0.5f
+                            if (prevBottom <= otherTop + 14f && checkOverlap(n, other)) {
+                                n.y -= n.vy * dt
+                                n.vy = 0f
+                                n.isGrounded = true
+                                n.jumpCount = 0
+                                n.coyoteTimer = n.coyoteTimeMax
+                                collidedSolids.add(other)
+                            }
+                        }
+                    } else if (checkOverlap(n, other)) {
+                        val fallingDown = n.vy > 0f
                         n.y -= n.vy * dt
+                        if (fallingDown) {
+                            n.isGrounded = true
+                            n.jumpCount = 0
+                            n.coyoteTimer = n.coyoteTimeMax
+                        }
+                        if (n.bodyMode == "rigid" && abs(n.vy) > 90f) {
+                            n.vy = -n.vy * n.bounciness
+                        } else {
+                            n.vy = 0f
+                        }
                         collidedSolids.add(other)
                     }
                 }
             }
+        }
+
+        if (!n.isGrounded) {
+            if (wasGrounded) n.coyoteTimer = n.coyoteTimeMax
+            else n.coyoteTimer = max(0f, n.coyoteTimer - dt)
         }
 
         n.z += n.vz * dt
@@ -1195,11 +1525,15 @@ class ZeroEngineView(
     data class GlobalTransform(val gx: Float, val gy: Float, val gz: Float, val gRot: Float, val gSx: Float, val gSy: Float)
 
     private fun getGlobalTransform(n: GameNode, visited: MutableSet<String> = mutableSetOf()): GlobalTransform {
+        val pxOffset = if (n.layer == "World" && n.parallaxX != 1f) (camX - 540f) * (1f - n.parallaxX) else 0f
+        val pyOffset = if (n.layer == "World" && n.parallaxY != 1f) (camY - 960f) * (1f - n.parallaxY) else 0f
+
         if (n.parent.isEmpty() || visited.contains(n.name)) {
-            return GlobalTransform(n.x, n.y, n.z, n.rotation, n.scaleX, n.scaleY)
+            return GlobalTransform(n.x + pxOffset, n.y + pyOffset, n.z, n.rotation, n.scaleX, n.scaleY)
         }
         visited.add(n.name)
-        val p = nodes.find { it.name == n.parent } ?: return GlobalTransform(n.x, n.y, n.z, n.rotation, n.scaleX, n.scaleY)
+        val p = nodes.find { it.name == n.parent }
+            ?: return GlobalTransform(n.x + pxOffset, n.y + pyOffset, n.z, n.rotation, n.scaleX, n.scaleY)
         val pt = getGlobalTransform(p, visited)
         val rad = Math.toRadians(pt.gRot.toDouble())
         val sx = n.x * pt.gSx
@@ -1271,12 +1605,22 @@ class ZeroEngineView(
                         val co = clipsArr.getJSONObject(cIdx)
                         val cName = co.optString("name", "")
                         if (cName.isNotEmpty()) {
+                            val evMap = mutableMapOf<Int, String>()
+                            val evObj = co.optJSONObject("events")
+                            if (evObj != null) {
+                                val keys = evObj.keys()
+                                while (keys.hasNext()) {
+                                    val k = keys.next()
+                                    k.toIntOrNull()?.let { fIdx -> evMap[fIdx] = evObj.optString(k, "") }
+                                }
+                            }
                             clipMap[cName] = AnimClip(
                                 name = cName,
                                 start = co.optInt("start", 0),
                                 end = co.optInt("end", 0),
                                 fps = co.optDouble("fps", 12.0).toFloat(),
-                                loop = co.optBoolean("loop", true)
+                                loop = co.optBoolean("loop", true),
+                                events = evMap
                             )
                         }
                     }
@@ -1314,6 +1658,8 @@ class ZeroEngineView(
                     scaleY = o.optDouble("scaleY", 1.0).toFloat(),
                     zIndex = o.optInt("zIndex", 0),
                     visible = o.optBoolean("visible", true),
+                    parallaxX = o.optDouble("parallaxX", 1.0).toFloat(),
+                    parallaxY = o.optDouble("parallaxY", 1.0).toFloat(),
                     texture = o.optString("texture", ""),
                     text = o.optString("text", ""),
                     fontSize = o.optDouble("fontSize", 44.0).toFloat(),
@@ -1326,6 +1672,17 @@ class ZeroEngineView(
                     shadowCaster = o.optBoolean("shadowCaster", false),
                     collider = o.optBoolean("collider", false),
                     isTrigger = o.optBoolean("isTrigger", false),
+                    oneWay = o.optBoolean("oneWay", false),
+                    bodyMode = o.optString("bodyMode", "kinematic"),
+                    gravity = o.optDouble("gravity", 2200.0).toFloat(),
+                    fallMultiplier = o.optDouble("fallMultiplier", 1.55).toFloat(),
+                    maxFallSpeed = o.optDouble("maxFallSpeed", 1450.0).toFloat(),
+                    bounciness = o.optDouble("bounciness", 0.5).toFloat(),
+                    drag = o.optDouble("drag", 0.0).toFloat(),
+                    maxJumps = o.optInt("maxJumps", 2),
+                    isHitbox = o.optBoolean("isHitbox", false),
+                    isHurtbox = o.optBoolean("isHurtbox", false),
+                    damage = o.optDouble("damage", 10.0).toFloat(),
                     hFrames = o.optInt("hFrames", 1),
                     vFrames = o.optInt("vFrames", 1),
                     currentFrame = o.optInt("currentFrame", 0),
@@ -1463,6 +1820,8 @@ class ZeroEngineView(
 
     private fun getJsFloat(s: Scriptable, k: String, def: Float): Float =
         (ScriptableObject.getProperty(s, k) as? Number)?.toFloat() ?: def
+    private fun getJsInt(s: Scriptable, k: String, def: Int): Int =
+        (ScriptableObject.getProperty(s, k) as? Number)?.toInt() ?: def
     private fun getJsStr(s: Scriptable, k: String, def: String): String =
         ScriptableObject.getProperty(s, k)?.takeIf { it !== Scriptable.NOT_FOUND }?.toString() ?: def
     private fun getJsBool(s: Scriptable, k: String, def: Boolean): Boolean =
