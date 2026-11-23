@@ -18,6 +18,7 @@ import android.opengl.Matrix
 import android.view.MotionEvent
 import org.json.JSONArray
 import org.json.JSONObject
+import org.mozilla.javascript.Callable
 import org.mozilla.javascript.Context as RhinoContext
 import org.mozilla.javascript.Function
 import org.mozilla.javascript.NativeJSON
@@ -1092,7 +1093,15 @@ class ZeroEngineView(
             val file = File(File(projectDir, "saves"), "$safeName.json")
             if (!file.exists()) return null
             val raw = file.readText()
-            NativeJSON.parse(rhino, globalScope, raw) { _, _, value -> value }
+            val reviver = object : Callable {
+                override fun call(
+                    cx: RhinoContext?,
+                    scope: Scriptable?,
+                    thisObj: Scriptable?,
+                    args: Array<out Any?>
+                ): Any? = args.getOrNull(1)
+            }
+            NativeJSON.parse(rhino, globalScope, raw, reviver)
         } catch (e: Exception) {
             onConsoleLog("[LOAD 磁盘读档失败] ${e.message}")
             null
