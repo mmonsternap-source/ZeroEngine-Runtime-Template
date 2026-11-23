@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.OpenableColumns
 import android.util.Base64
 import android.view.Gravity
 import android.view.ViewGroup
@@ -35,6 +36,7 @@ class MainActivity : Activity() {
     private var engineView: ZeroEngineView? = null
     private var isPlaying = false
     private val PICK_IMAGE_CODE = 1001
+    private val PICK_AUDIO_CODE = 1002
     private val uiHandler = Handler(Looper.getMainLooper())
     private val consoleLogs = Collections.synchronizedList(mutableListOf<String>())
     private var liveConsoleView: TextView? = null
@@ -122,6 +124,13 @@ class MainActivity : Activity() {
         }
 
         @JavascriptInterface
+        fun listAudioFiles(): String {
+            val dir = File(getProjectDir(), "audio")
+            val list = dir.listFiles()?.filter { it.isFile }?.map { it.name } ?: emptyList()
+            return JSONArray(list).toString()
+        }
+
+        @JavascriptInterface
         fun saveSceneFile(sceneFileName: String, sceneJson: String) {
             val safeName = if (sceneFileName.endsWith(".scene")) sceneFileName else "$sceneFileName.scene"
             File(getProjectDir(), "scenes/$safeName").writeText(sceneJson)
@@ -163,6 +172,17 @@ class MainActivity : Activity() {
         }
 
         @JavascriptInterface
+        fun pickAudio() {
+            runOnUiThread {
+                val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = "audio/*"
+                }
+                startActivityForResult(intent, PICK_AUDIO_CODE)
+            }
+        }
+
+        @JavascriptInterface
         fun getTextureBase64(fileName: String): String {
             val file = File(getProjectDir(), "textures/$fileName")
             if (!file.exists()) return ""
@@ -171,10 +191,22 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun queryDisplayName(uri: Uri): String? {
+        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (idx >= 0 && cursor.moveToFirst()) {
+                return cursor.getString(idx)
+            }
+        }
+        return null
+    }
+
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == PICK_IMAGE_CODE && resultCode == RESULT_OK) {
-            val uri: Uri = data?.data ?: return
+        if (resultCode != RESULT_OK) return
+        val uri: Uri = data?.data ?: return
+
+        if (requestCode == PICK_IMAGE_CODE) {
             val texDir = File(getProjectDir(), "textures").apply { mkdirs() }
             val fileName = "tex_${System.currentTimeMillis() % 100000}.png"
             val destFile = File(texDir, fileName)
@@ -192,6 +224,17 @@ class MainActivity : Activity() {
                 "onNativeImagePicked('$fileName', '$dataUrl', ${opts.outWidth}, ${opts.outHeight})",
                 null
             )
+        } else if (requestCode == PICK_AUDIO_CODE) {
+            val audioDir = File(getProjectDir(), "audio").apply { mkdirs() }
+            val rawName = queryDisplayName(uri) ?: "snd_${System.currentTimeMillis() % 100000}.mp3"
+            val safeName = rawName.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+            val destFile = File(audioDir, safeName)
+
+            contentResolver.openInputStream(uri)?.use { input ->
+                destFile.outputStream().use { output -> input.copyTo(output) }
+            }
+            appendConsoleLog("[AUDIO] 已导入音频资源: $safeName")
+            editorWebView?.evaluateJavascript("onNativeAudioPicked('$safeName')", null)
         }
     }
 
@@ -199,7 +242,7 @@ class MainActivity : Activity() {
         if (isPlaying) return
         isPlaying = true
         consoleLogs.clear()
-        appendConsoleLog("[SYSTEM] Project [$currentProject] v0.3 Runtime started.")
+        appendConsoleLog("[SYSTEM] Project [$currentProject] v0.4 Runtime started.")
 
         val projDir = getProjectDir()
         val surface = ZeroEngineView(
@@ -231,7 +274,7 @@ class MainActivity : Activity() {
             }
 
             val statusText = TextView(this).apply {
-                text = "ZeroEngine v0.3 | 2.5D OpenGL ES 2.0"
+                text = "ZeroEngine v0.4 | 2.5D + Anim + Audio"
                 textSize = 12f
                 typeface = Typeface.MONOSPACE
                 setTextColor(Color.parseColor("#34D399"))
@@ -290,6 +333,7 @@ class MainActivity : Activity() {
         if (!isPlaying) return
         isPlaying = false
         liveConsoleView = null
+        engineView?.releaseResources()
         engineView?.onPause()
         engineView = null
         container.removeAllViews()
@@ -312,5 +356,10 @@ class MainActivity : Activity() {
     override fun onPause() {
         super.onPause()
         engineView?.onPause()
+    }
+
+    override fun onDestroy() {
+        engineView?.releaseResources()
+        super.onDestroy()
     }
 }

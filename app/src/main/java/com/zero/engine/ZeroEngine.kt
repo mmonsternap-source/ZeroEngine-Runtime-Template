@@ -9,6 +9,8 @@ import android.graphics.Paint
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import android.media.MediaPlayer
+import android.media.SoundPool
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.GLUtils
@@ -35,6 +37,14 @@ class ZeroEngineView(
     private val sceneJson: String,
     private val onConsoleLog: (String) -> Unit
 ) : GLSurfaceView(context), GLSurfaceView.Renderer {
+
+    data class AnimClip(
+        val name: String,
+        val start: Int,
+        val end: Int,
+        val fps: Float,
+        val loop: Boolean
+    )
 
     data class GameNode(
         var name: String,
@@ -74,6 +84,8 @@ class ZeroEngineView(
         var animPlaying: Boolean = false,
         var animLoop: Boolean = true,
         var animTimer: Float = 0f,
+        var currentClipName: String = "",
+        val clips: MutableMap<String, AnimClip> = mutableMapOf(),
         var vx: Float = 0f,
         var vy: Float = 0f,
         var vz: Float = 0f,
@@ -90,18 +102,31 @@ class ZeroEngineView(
     private val textTextureCache = ConcurrentHashMap<String, Int>()
     private val eventListeners = mutableMapOf<String, MutableList<Function>>()
 
+    // 音频管理器 (BGM + SFX)
+    private var bgmPlayer: MediaPlayer? = null
+    private val soundPool: SoundPool = SoundPool.Builder()
+        .setMaxStreams(8)
+        .setAudioAttributes(
+            AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_GAME)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+        )
+        .build()
+    private val sfxCache = ConcurrentHashMap<String, Int>()
+
     // 2D / 2.5D 摄像机状态
-    private var camMode = "2.5D" // "2D" | "2.5D"
+    private var camMode = "2.5D"
     private var camX = 540f
     private var camY = 960f
-    private var camPitch = 48f   // 俯仰角 (0=正俯视, 48=HD-2D斜视角)
+    private var camPitch = 48f
     private var camDistance = 1250f
     private var camFov = 45f
     private var camTarget: GameNode? = null
     private var shakeIntensity = 0f
     private var shakeTimer = 0f
 
-    // 环境光 (默认带一点冷色暗调以凸显点光源)
+    // 环境光
     private var ambientR = 0.55f
     private var ambientG = 0.58f
     private var ambientB = 0.68f
@@ -150,6 +175,17 @@ class ZeroEngineView(
         renderMode = RENDERMODE_CONTINUOUSLY
     }
 
+    fun releaseResources() {
+        try {
+            bgmPlayer?.stop()
+            bgmPlayer?.release()
+            bgmPlayer = null
+        } catch (_: Exception) {}
+        try {
+            soundPool.release()
+        } catch (_: Exception) {}
+    }
+
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES20.glClearColor(0.04f, 0.05f, 0.08f, 1f)
         GLES20.glEnable(GLES20.GL_BLEND)
@@ -178,11 +214,9 @@ class ZeroEngineView(
         lastFrameNs = now
         engineTime += dt
 
-        // 1. 更新摄像机矩阵（用于触控射线检测与渲染）
         updateCameraMatrices(dt)
         updateWorldTouchFromScreen()
 
-        // 2. 分发触控事件与更新脚本逻辑
         flushTouchEvents()
         if (pendingAdd.isNotEmpty()) {
             val added = pendingAdd.toList()
@@ -203,7 +237,7 @@ class ZeroEngineView(
             pendingRemove.clear()
         }
 
-        // 3. 收集最多 8 盏动态点光源
+        // 收集最多 8 盏动态点光源
         val lights = nodes.filter { it.visible && it.nodeType == "PointLight" }.take(8)
         val lightPosArr = FloatArray(8 * 4)
         val lightColArr = FloatArray(8 * 4)
@@ -219,7 +253,6 @@ class ZeroEngineView(
             lightColArr[idx * 4 + 3] = 1f
         }
 
-        // 4. 渲染 World 世界层（按 Z 高度与 Y 深度自动排序，实现 2.5D 遮挡）
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
         val worldNodes = nodes.filter { it.visible && it.layer != "UI" && it.nodeType != "PointLight" }
             .sortedWith(compareBy({ it.zIndex }, { it.tiltX >= -45f }, { getGlobalTransform(it).gy }))
@@ -228,7 +261,6 @@ class ZeroEngineView(
             renderNode(n, vpMatrix, isWorld = true, lights.size, lightPosArr, lightColArr)
         }
 
-        // 5. 渲染 UI 屏幕空间层（虚拟摇杆、HUD 血条、按钮等）
         val uiNodes = nodes.filter { it.visible && it.layer == "UI" }.sortedBy { it.zIndex }
         for (n in uiNodes) {
             renderNode(n, uiVpMatrix, isWorld = false, 0, lightPosArr, lightColArr)
@@ -277,7 +309,6 @@ class ZeroEngineView(
         Matrix.invertM(invVpMatrix, 0, vpMatrix, 0)
     }
 
-    // 屏幕触控点射线投射到 Z=0 游戏地面，精准获取 2.5D 世界坐标
     private fun updateWorldTouchFromScreen() {
         val ndcX = (touchScreenX / 1080f) * 2f - 1f
         val ndcY = 1f - (touchScreenY / 1920f) * 2f
@@ -318,7 +349,6 @@ class ZeroEngineView(
         Matrix.translateM(modelMatrix, 0, gt.gx, gt.gy, gt.gz)
 
         if (isWorld && camMode == "2.5D" && n.billboard) {
-            // HD-2D 立牌：垂直立于地面并面向摄像机仰角
             Matrix.rotateM(modelMatrix, 0, -90f + camPitch * 0.65f, 1f, 0f, 0f)
         } else if (isWorld && n.tiltX != 0f) {
             Matrix.rotateM(modelMatrix, 0, n.tiltX, 1f, 0f, 0f)
@@ -347,7 +377,6 @@ class ZeroEngineView(
         GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uColor"), n.r, n.g, n.b, n.a)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uTime"), engineTime)
 
-        // 序列帧 UV 切片计算
         val hf = max(1, n.hFrames)
         val vf = max(1, n.vFrames)
         val fi = n.currentFrame.coerceIn(0, hf * vf - 1)
@@ -357,7 +386,6 @@ class ZeroEngineView(
         val vOffset = (fi / hf) * vScale
         GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uUvRect"), uOffset, vOffset, uScale, vScale)
 
-        // 传入实时光照数据（UI 层不受 3D 光照暗角影响）
         val litFlag = if (isWorld) 1 else 0
         GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uEnableLight"), litFlag)
         GLES20.glUniform3f(GLES20.glGetUniformLocation(prog, "uAmbient"), ambientR, ambientG, ambientB)
@@ -397,12 +425,74 @@ class ZeroEngineView(
             n.animTimer -= frameDur
             n.currentFrame++
             if (n.currentFrame > n.animEnd) {
-                if (n.animLoop) n.currentFrame = n.animStart
-                else {
+                if (n.animLoop) {
+                    n.currentFrame = n.animStart
+                } else {
                     n.currentFrame = n.animEnd
                     n.animPlaying = false
+                    val finishedClip = n.currentClipName
+                    n.currentClipName = ""
+                    if (finishedClip.isNotEmpty()) {
+                        callLifecycle(n, "onAnimFinished", finishedClip)
+                    }
                 }
             }
+        }
+    }
+
+    // ==================== 音频播放引擎 ====================
+    private fun playBGMFile(fileName: String, loop: Boolean, volume: Float) {
+        try {
+            bgmPlayer?.stop()
+            bgmPlayer?.release()
+            bgmPlayer = null
+            val file = File(File(projectDir, "audio"), fileName)
+            if (!file.exists()) {
+                onConsoleLog("[AUDIO 警告] 找不到 BGM 文件: $fileName")
+                return
+            }
+            bgmPlayer = MediaPlayer().apply {
+                setDataSource(file.absolutePath)
+                isLooping = loop
+                setVolume(volume.coerceIn(0f, 1f), volume.coerceIn(0f, 1f))
+                prepare()
+                start()
+            }
+        } catch (e: Exception) {
+            onConsoleLog("[AUDIO BGM 错误] ${e.message}")
+        }
+    }
+
+    private fun stopBGMFile() {
+        try {
+            bgmPlayer?.stop()
+            bgmPlayer?.release()
+            bgmPlayer = null
+        } catch (_: Exception) {}
+    }
+
+    private fun playSFXFile(fileName: String, volume: Float) {
+        try {
+            val vol = volume.coerceIn(0f, 1f)
+            val cachedId = sfxCache[fileName]
+            if (cachedId != null) {
+                soundPool.play(cachedId, vol, vol, 1, 0, 1.0f)
+                return
+            }
+            val file = File(File(projectDir, "audio"), fileName)
+            if (!file.exists()) {
+                onConsoleLog("[AUDIO 警告] 找不到音效文件: $fileName")
+                return
+            }
+            val sid = soundPool.load(file.absolutePath, 1)
+            sfxCache[fileName] = sid
+            soundPool.setOnLoadCompleteListener { sp, sampleId, status ->
+                if (status == 0 && sampleId == sid) {
+                    sp.play(sampleId, vol, vol, 1, 0, 1.0f)
+                }
+            }
+        } catch (e: Exception) {
+            onConsoleLog("[AUDIO SFX 错误] ${e.message}")
         }
     }
 
@@ -458,6 +548,23 @@ class ZeroEngineView(
             playToneAsync(hz, ms)
             null
         })
+        ScriptableObject.putProperty(engineApi, "playBGM", jsFunc { args ->
+            val fileName = RhinoContext.toString(args.getOrNull(0) ?: "")
+            val loop = (args.getOrNull(1) as? Boolean) ?: true
+            val vol = (args.getOrNull(2) as? Number)?.toFloat() ?: 0.8f
+            if (fileName.isNotEmpty()) playBGMFile(fileName, loop, vol)
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "stopBGM", jsFunc {
+            stopBGMFile()
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "playSFX", jsFunc { args ->
+            val fileName = RhinoContext.toString(args.getOrNull(0) ?: "")
+            val vol = (args.getOrNull(1) as? Number)?.toFloat() ?: 1.0f
+            if (fileName.isNotEmpty()) playSFXFile(fileName, vol)
+            null
+        })
         ScriptableObject.putProperty(engineApi, "moveAndSlide", jsFunc { args ->
             val selfObj = args.getOrNull(0) as? Scriptable ?: return@jsFunc null
             val dt = (args.getOrNull(1) as? Number)?.toFloat() ?: 0.016f
@@ -487,6 +594,8 @@ class ZeroEngineView(
                 g = getJsFloat(cfg, "g", 1f),
                 b = getJsFloat(cfg, "b", 1f),
                 a = getJsFloat(cfg, "a", 1f),
+                collider = getJsBool(cfg, "collider", false),
+                isTrigger = getJsBool(cfg, "isTrigger", false),
                 lightRadius = getJsFloat(cfg, "lightRadius", 400f),
                 lightIntensity = getJsFloat(cfg, "lightIntensity", 1.5f),
                 script = getJsStr(cfg, "script", "")
@@ -562,17 +671,43 @@ class ZeroEngineView(
         n.jsObj = selfObj
         syncToJs(n)
 
+        // 命名动画状态机播放：self.play("run")
+        ScriptableObject.putProperty(selfObj, "play", jsFunc { args ->
+            val clipName = RhinoContext.toString(args.getOrNull(0) ?: "")
+            val forceRestart = (args.getOrNull(1) as? Boolean) ?: false
+            val clip = n.clips[clipName]
+            if (clip != null) {
+                if (!forceRestart && n.animPlaying && n.currentClipName == clipName) {
+                    return@jsFunc null
+                }
+                n.currentClipName = clipName
+                n.animStart = clip.start
+                n.animEnd = clip.end
+                n.animFps = clip.fps
+                n.animLoop = clip.loop
+                n.currentFrame = clip.start
+                n.animTimer = 0f
+                n.animPlaying = true
+            } else {
+                onConsoleLog("[ANIM 警告 @ ${n.name}] 未找到动画片段: $clipName")
+            }
+            null
+        })
+        // 兼容旧版帧号播放：self.playAnim(start, end, fps, loop)
         ScriptableObject.putProperty(selfObj, "playAnim", jsFunc { args ->
+            n.currentClipName = ""
             n.animStart = (args.getOrNull(0) as? Number)?.toInt() ?: 0
             n.animEnd = (args.getOrNull(1) as? Number)?.toInt() ?: 0
             n.animFps = (args.getOrNull(2) as? Number)?.toFloat() ?: 12f
             n.animLoop = (args.getOrNull(3) as? Boolean) ?: true
             n.currentFrame = n.animStart
+            n.animTimer = 0f
             n.animPlaying = true
             null
         })
         ScriptableObject.putProperty(selfObj, "stopAnim", jsFunc {
             n.animPlaying = false
+            n.currentClipName = ""
             null
         })
         ScriptableObject.putProperty(nodeScope, "self", selfObj)
@@ -622,6 +757,7 @@ class ZeroEngineView(
         ScriptableObject.putProperty(o, "a", n.a.toDouble())
         ScriptableObject.putProperty(o, "visible", n.visible)
         ScriptableObject.putProperty(o, "text", n.text)
+        ScriptableObject.putProperty(o, "currentClip", n.currentClipName)
         ScriptableObject.putProperty(o, "lightRadius", n.lightRadius.toDouble())
         ScriptableObject.putProperty(o, "lightIntensity", n.lightIntensity.toDouble())
     }
@@ -651,23 +787,57 @@ class ZeroEngineView(
     }
 
     private fun moveAndSlideNode(n: GameNode, dt: Float) {
+        val collidedSolids = mutableSetOf<GameNode>()
+
         n.x += n.vx * dt
         if (n.collider && !n.isTrigger) {
             for (other in nodes) {
                 if (other !== n && other.visible && other.collider && !other.isTrigger && other.layer == n.layer) {
-                    if (checkOverlap(n, other)) n.x -= n.vx * dt
+                    if (checkOverlap(n, other)) {
+                        n.x -= n.vx * dt
+                        collidedSolids.add(other)
+                    }
                 }
             }
         }
+
         n.y += n.vy * dt
         if (n.collider && !n.isTrigger) {
             for (other in nodes) {
                 if (other !== n && other.visible && other.collider && !other.isTrigger && other.layer == n.layer) {
-                    if (checkOverlap(n, other)) n.y -= n.vy * dt
+                    if (checkOverlap(n, other)) {
+                        n.y -= n.vy * dt
+                        collidedSolids.add(other)
+                    }
                 }
             }
         }
+
         n.z += n.vz * dt
+
+        // 触发实体碰撞回调 onCollision(other)
+        for (other in collidedSolids) {
+            if (!pendingRemove.contains(n) && !pendingRemove.contains(other)) {
+                callLifecycle(n, "onCollision", other.jsObj)
+                callLifecycle(other, "onCollision", n.jsObj)
+            }
+        }
+
+        // 检测触发器重叠并触发回调 onTriggerEnter(other)
+        if (n.collider) {
+            for (other in nodes.toList()) {
+                if (other !== n && other.visible && other.collider && other.layer == n.layer) {
+                    if (n.isTrigger || other.isTrigger) {
+                        if (checkOverlap(n, other)) {
+                            if (!pendingRemove.contains(n) && !pendingRemove.contains(other)) {
+                                callLifecycle(n, "onTriggerEnter", other.jsObj)
+                                callLifecycle(other, "onTriggerEnter", n.jsObj)
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private fun checkOverlap(a: GameNode, b: GameNode): Boolean {
@@ -749,7 +919,25 @@ class ZeroEngineView(
             val arr = root.optJSONArray("nodes") ?: JSONArray()
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
-                outList.add(GameNode(
+                val clipMap = mutableMapOf<String, AnimClip>()
+                val clipsArr = o.optJSONArray("clips")
+                if (clipsArr != null) {
+                    for (cIdx in 0 until clipsArr.length()) {
+                        val co = clipsArr.getJSONObject(cIdx)
+                        val cName = co.optString("name", "")
+                        if (cName.isNotEmpty()) {
+                            clipMap[cName] = AnimClip(
+                                name = cName,
+                                start = co.optInt("start", 0),
+                                end = co.optInt("end", 0),
+                                fps = co.optDouble("fps", 12.0).toFloat(),
+                                loop = co.optBoolean("loop", true)
+                            )
+                        }
+                    }
+                }
+                val defaultClipName = o.optString("defaultClip", "")
+                val node = GameNode(
                     name = o.optString("name", "Node_$i"),
                     nodeType = o.optString("nodeType", "Sprite2D"),
                     layer = o.optString("layer", "World"),
@@ -782,9 +970,21 @@ class ZeroEngineView(
                     vFrames = o.optInt("vFrames", 1),
                     currentFrame = o.optInt("currentFrame", 0),
                     animFps = o.optDouble("animFps", 12.0).toFloat(),
+                    clips = clipMap,
                     shader = o.optString("shader", ""),
                     script = o.optString("script", "")
-                ))
+                )
+                if (defaultClipName.isNotEmpty() && clipMap.containsKey(defaultClipName)) {
+                    val dc = clipMap[defaultClipName]!!
+                    node.currentClipName = defaultClipName
+                    node.animStart = dc.start
+                    node.animEnd = dc.end
+                    node.animFps = dc.fps
+                    node.animLoop = dc.loop
+                    node.currentFrame = dc.start
+                    node.animPlaying = true
+                }
+                outList.add(node)
             }
         } catch (e: Exception) {
             onConsoleLog("[场景解析异常] ${e.message}")
