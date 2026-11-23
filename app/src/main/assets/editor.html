@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>ZeroEngine SDK v0.3</title>
+<title>ZeroEngine SDK v0.4</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, sans-serif; }
   body { background: #0b0e14; color: #e2e8f0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; user-select: none; }
@@ -26,7 +26,7 @@
   canvas { width: 100%; height: 100%; display: block; }
   .vp-hud { position: absolute; top: 6px; left: 6px; font-size: 10px; color: #94a3b8; background: rgba(11,14,20,0.8); padding: 3px 6px; border-radius: 4px; pointer-events: none; font-family: monospace; }
 
-  .bottom-dock { height: 280px; background: #131822; border-top: 1px solid #232c3d; display: flex; flex-direction: column; }
+  .bottom-dock { height: 290px; background: #131822; border-top: 1px solid #232c3d; display: flex; flex-direction: column; }
   .tabs { display: flex; background: #0e121a; border-bottom: 1px solid #232c3d; }
   .tab { flex: 1; text-align: center; padding: 6px 2px; font-size: 11px; color: #94a3b8; border-bottom: 2px solid transparent; }
   .tab.active { color: #38bdf8; border-bottom-color: #38bdf8; font-weight: 700; background: #131822; }
@@ -35,11 +35,15 @@
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
   .field { display: flex; flex-direction: column; gap: 2px; font-size: 10px; color: #94a3b8; }
   .field input, .field select { background: #090c12; border: 1px solid #334155; color: #fff; padding: 4px 5px; border-radius: 4px; font-size: 11px; width: 100%; }
-  .field.row { flex-direction: row; align-items: center; gap: 5px; padding-top: 10px; }
+  .field.row { flex-direction: row; align-items: center; gap: 5px; padding-top: 8px; }
+
+  .clip-box { margin-top: 10px; padding: 7px; background: #0c1018; border: 1px solid #232c3d; border-radius: 6px; }
+  .clip-row { display: grid; grid-template-columns: 1.3fr 0.7fr 0.7fr 0.7fr auto auto; gap: 4px; align-items: center; margin-top: 5px; font-size: 10px; }
+  .clip-row input { background: #090c12; border: 1px solid #334155; color: #fff; padding: 3px 4px; border-radius: 3px; font-size: 10px; width: 100%; }
 
   .script-toolbar { display: flex; gap: 4px; overflow-x: auto; padding-bottom: 5px; }
   .script-toolbar button { font-family: monospace; font-size: 10px; padding: 3px 6px; background: #1e293b; }
-  textarea.code-box { width: 100%; height: 190px; background: #080a0f; color: #a5f3fc; border: 1px solid #334155; border-radius: 4px; padding: 7px; font-family: monospace; font-size: 11px; line-height: 1.4; resize: none; user-select: text; }
+  textarea.code-box { width: 100%; height: 195px; background: #080a0f; color: #a5f3fc; border: 1px solid #334155; border-radius: 4px; padding: 7px; font-family: monospace; font-size: 11px; line-height: 1.4; resize: none; user-select: text; }
   pre#consoleOut, .doc-box { font-family: monospace; font-size: 11px; color: #cbd5e1; white-space: pre-wrap; line-height: 1.45; user-select: text; }
   .doc-box b { color: #38bdf8; }
 </style>
@@ -62,9 +66,10 @@
     <div class="tree-header">
       <button onclick="addNode('Sprite2D')">+精</button>
       <button onclick="pickNativeImage()">+图</button>
+      <button onclick="pickNativeAudio()">+音</button>
       <button onclick="addNode('PointLight')">+光</button>
       <button onclick="addNode('Label2D')">+文</button>
-      <button onclick="addUINode()">+UI键</button>
+      <button onclick="addUINode()">+UI</button>
     </div>
     <div class="tree-list" id="treeList"></div>
   </div>
@@ -89,6 +94,7 @@
 const canvas = document.getElementById('stage');
 const ctx = canvas.getContext('2d');
 const imageCache = {};
+let audioAssets = [];
 let activeTab = 'inspector';
 let selectedIndex = 0;
 let currentScene = 'main.scene';
@@ -107,19 +113,25 @@ function defaultNodes() {
       x: 540, y: 960, z: -2, width: 2200, height: 2200, rotation: 0, tiltX: 0, billboard: false,
       scaleX: 1, scaleY: 1, zIndex: -10, texture: "", r: 0.16, g: 0.20, b: 0.28, a: 1,
       collider: false, isTrigger: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
-      shader: "", script: ""
+      defaultClip: "", clips: [], shader: "", script: ""
     },
     {
       name: "Hero", nodeType: "Sprite2D", layer: "World", parent: "", tag: "player",
       x: 540, y: 960, z: 0, width: 120, height: 150, rotation: 0, tiltX: 0, billboard: true,
       scaleX: 1, scaleY: 1, zIndex: 1, texture: "", r: 0.25, g: 0.82, b: 0.98, a: 1,
       collider: true, isTrigger: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
+      defaultClip: "idle",
+      clips: [
+        { name: "idle", start: 0, end: 0, fps: 8, loop: true },
+        { name: "run", start: 0, end: 0, fps: 12, loop: true }
+      ],
       shader: "",
       script: `var speed = 460;
 function onReady() {
   Engine.setCameraMode("2.5D");
   Engine.setCameraTarget(self);
-  Engine.log("ZeroEngine v0.3 2.5D 透视与动态光照已启动");
+  self.play("idle");
+  Engine.log("ZeroEngine v0.4 动画状态机/音频/碰撞已就绪");
 }
 function onProcess(dt) {
   if (Input.isTouching && Input.screenY < 1550) {
@@ -130,9 +142,23 @@ function onProcess(dt) {
       self.vx = (dx / dist) * speed;
       self.vy = (dy / dist) * speed;
       self.scaleX = dx < 0 ? -1 : 1;
-    } else { self.vx = 0; self.vy = 0; }
-  } else { self.vx = 0; self.vy = 0; }
+      self.play("run");
+    } else {
+      self.vx = 0; self.vy = 0;
+      self.play("idle");
+    }
+  } else {
+    self.vx = 0; self.vy = 0;
+    self.play("idle");
+  }
   Engine.moveAndSlide(self, dt);
+}
+function onTriggerEnter(other) {
+  if (other.tag === "coin") {
+    Engine.playTone(980, 90);
+    Engine.destroy(other);
+    Engine.log("拾取金币: " + other.name);
+  }
 }`
     },
     {
@@ -140,14 +166,21 @@ function onProcess(dt) {
       x: 0, y: 0, z: 60, width: 60, height: 60, rotation: 0, tiltX: 0, billboard: false,
       scaleX: 1, scaleY: 1, zIndex: 5, texture: "", r: 1.0, g: 0.72, b: 0.28, a: 1,
       lightRadius: 560, lightIntensity: 1.8, collider: false, isTrigger: false,
-      hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12, shader: "", script: ""
+      hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12, defaultClip: "", clips: [], shader: "", script: ""
+    },
+    {
+      name: "GoldCoin", nodeType: "Sprite2D", layer: "World", parent: "", tag: "coin",
+      x: 780, y: 780, z: 0, width: 70, height: 70, rotation: 0, tiltX: 0, billboard: true,
+      scaleX: 1, scaleY: 1, zIndex: 1, texture: "", r: 1.0, g: 0.84, b: 0.12, a: 1,
+      collider: true, isTrigger: true, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
+      defaultClip: "", clips: [], shader: "", script: ""
     },
     {
       name: "ActionBtn", nodeType: "Sprite2D", layer: "UI", parent: "", tag: "ui_btn",
       x: 880, y: 1680, z: 0, width: 170, height: 170, rotation: 0, tiltX: 0, billboard: false,
       scaleX: 1, scaleY: 1, zIndex: 100, texture: "", r: 0.95, g: 0.32, b: 0.36, a: 0.85,
       collider: false, isTrigger: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
-      shader: "",
+      defaultClip: "", clips: [], shader: "",
       script: `function onInput(ev) {
   if (ev.type === "down" && Math.abs(ev.screenX - self.x) < 95 && Math.abs(ev.screenY - self.y) < 95) {
     Engine.shake(16, 0.15);
@@ -180,10 +213,20 @@ window.onload = () => {
   resizeCanvas();
   if (window.ZeroBridge) {
     refreshProjectAndSceneLists();
+    refreshAudioList();
     loadCurrentSceneFromDisk();
   }
   refreshAll();
 };
+
+function refreshAudioList() {
+  if (!window.ZeroBridge || !window.ZeroBridge.listAudioFiles) return;
+  try {
+    audioAssets = JSON.parse(window.ZeroBridge.listAudioFiles());
+  } catch (e) {
+    audioAssets = [];
+  }
+}
 
 function refreshProjectAndSceneLists() {
   if (!window.ZeroBridge) return;
@@ -203,7 +246,10 @@ function loadCurrentSceneFromDisk() {
       const parsed = JSON.parse(raw);
       if (parsed.camera) cameraCfg = parsed.camera;
       nodes = Array.isArray(parsed.nodes) ? parsed.nodes : [];
-      nodes.forEach(n => { if (n.texture) preloadLocalImage(n.texture); });
+      nodes.forEach(n => {
+        if (!Array.isArray(n.clips)) n.clips = [];
+        if (n.texture) preloadLocalImage(n.texture);
+      });
     } catch (e) { nodes = defaultNodes(); }
   } else {
     nodes = currentScene === 'main.scene' ? defaultNodes() : [];
@@ -228,6 +274,7 @@ function createNewProject() {
   nodes = defaultNodes();
   autoSave();
   refreshProjectAndSceneLists();
+  refreshAudioList();
   refreshAll();
 }
 
@@ -236,6 +283,7 @@ function switchProject(name) {
   window.ZeroBridge.setProject(name);
   currentScene = 'main.scene';
   refreshProjectAndSceneLists();
+  refreshAudioList();
   loadCurrentSceneFromDisk();
   refreshAll();
 }
@@ -272,6 +320,13 @@ function preloadLocalImage(fileName) {
 }
 
 function pickNativeImage() { if (window.ZeroBridge) window.ZeroBridge.pickImage(); }
+function pickNativeAudio() { if (window.ZeroBridge && window.ZeroBridge.pickAudio) window.ZeroBridge.pickAudio(); }
+
+function onNativeAudioPicked(fileName) {
+  refreshAudioList();
+  if (activeTab === 'docs') renderDock();
+  alert("音频已导入工程 audio/ 目录: " + fileName + "\n脚本调用: Engine.playSFX('" + fileName + "')");
+}
 
 function onNativeImagePicked(fileName, dataUrl, w, h) {
   const img = new Image();
@@ -282,7 +337,7 @@ function onNativeImagePicked(fileName, dataUrl, w, h) {
       x: 540, y: 960, z: 0, width: w || img.width || 160, height: h || img.height || 160,
       rotation: 0, tiltX: 0, billboard: true, scaleX: 1, scaleY: 1, zIndex: 1,
       texture: fileName, r: 1, g: 1, b: 1, a: 1, collider: true, isTrigger: false,
-      hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12, shader: "", script: ""
+      hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12, defaultClip: "", clips: [], shader: "", script: ""
     });
     selectedIndex = nodes.length - 1;
     autoSave(); refreshAll();
@@ -308,7 +363,7 @@ function addNode(type) {
     text: type === 'Label2D' ? 'Label' : '', fontSize: 44, texture: "",
     r: type === 'PointLight' ? 1.0 : 0.25, g: type === 'PointLight' ? 0.8 : 0.85, b: type === 'PointLight' ? 0.35 : 0.65, a: 1,
     lightRadius: 500, lightIntensity: 1.6, collider: type === 'Sprite2D', isTrigger: false,
-    hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12, shader: "", script: ""
+    hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12, defaultClip: "", clips: [], shader: "", script: ""
   });
   selectedIndex = nodes.length - 1;
   autoSave(); refreshAll();
@@ -321,7 +376,7 @@ function addUINode() {
     x: 200, y: 1680, z: 0, width: 160, height: 160, rotation: 0, tiltX: 0, billboard: false,
     scaleX: 1, scaleY: 1, zIndex: 100, texture: "", r: 0.3, g: 0.6, b: 1.0, a: 0.85,
     collider: false, isTrigger: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
-    shader: "", script: ""
+    defaultClip: "", clips: [], shader: "", script: ""
   });
   selectedIndex = nodes.length - 1;
   autoSave(); refreshAll();
@@ -342,6 +397,29 @@ function deleteSelected() {
   nodes.forEach(n => { if (n.parent === removedName) n.parent = ""; });
   selectedIndex = nodes.length - 1;
   autoSave(); refreshAll();
+}
+
+function addClip() {
+  if (selectedIndex < 0) return;
+  const n = nodes[selectedIndex];
+  if (!Array.isArray(n.clips)) n.clips = [];
+  const idx = n.clips.length + 1;
+  n.clips.push({ name: `anim_${idx}`, start: 0, end: 0, fps: 12, loop: true });
+  autoSave(); renderDock();
+}
+
+function updateClip(cIdx, key, val) {
+  if (selectedIndex < 0) return;
+  const n = nodes[selectedIndex];
+  if (!n.clips || !n.clips[cIdx]) return;
+  n.clips[cIdx][key] = val;
+  autoSave();
+}
+
+function deleteClip(cIdx) {
+  if (selectedIndex < 0) return;
+  nodes[selectedIndex].clips.splice(cIdx, 1);
+  autoSave(); renderDock();
 }
 
 function getGlobalTransform(n, visited = new Set()) {
@@ -566,13 +644,15 @@ function refreshConsoleFromNative() { if (activeTab === 'console') renderDock();
 function renderDock() {
   const body = document.getElementById('dockBody');
   if (activeTab === 'docs') {
+    refreshAudioList();
+    const audioStr = audioAssets.length ? audioAssets.join(', ') : '(暂无导入音频，点击左上角 +音 导入)';
     body.innerHTML = `<div class="doc-box">
-<b>ZeroEngine SDK v0.3 (2D + 2.5D 伪3D内核) API 手册</b><br>
-• <b>2.5D 摄像机</b>: Engine.setCameraMode("2.5D"|"2D") / Engine.setCameraTilt(pitch, dist, fov) / Engine.setCameraTarget(node)<br>
-• <b>触控双坐标</b>: Input.screenX, Input.screenY (UI坐标) / Input.worldX, Input.worldY (2.5D地面射线拾取坐标)<br>
-• <b>动态光照</b>: Engine.setAmbientLight(r, g, b) / PointLight 节点支持 lightRadius 与 lightIntensity<br>
-• <b>独立UI层</b>: 将节点渲染层设为 UI (CanvasLayer)，永远固定在屏幕最上层<br>
-• <b>物理与预制体</b>: Engine.moveAndSlide(self, dt) / Engine.instantiate("enemy.scene", x, y, z) / Engine.spawn({...}, parent)
+<b>ZeroEngine SDK v0.4 工业管线 API 手册</b><br>
+• <b>当前工程已导入音频</b>: ${audioStr}<br>
+• <b>动画状态机</b>: self.play("run") / self.stopAnim() / 回调 function onAnimFinished(name)<br>
+• <b>原生音频播放</b>: Engine.playBGM("bgm.mp3", true, 0.8) / Engine.stopBGM() / Engine.playSFX("hit.wav", 1.0)<br>
+• <b>物理与触发器回调</b>: function onCollision(other) / function onTriggerEnter(other)<br>
+• <b>2.5D 摄像机与触控</b>: Engine.setCameraMode("2.5D"|"2D") / Input.worldX, Input.worldY / Input.screenX, Input.screenY
 </div>`;
     return;
   }
@@ -597,12 +677,12 @@ function renderDock() {
   if (activeTab === 'script') {
     body.innerHTML = `
       <div class="script-toolbar">
-        <button onclick="insertCode('scriptEditor','function onReady() {\\n  \\n}\\n')">+onReady</button>
-        <button onclick="insertCode('scriptEditor','function onProcess(dt) {\\n  \\n}\\n')">+onProcess</button>
-        <button onclick="insertCode('scriptEditor','function onInput(ev) {\\n  \\n}\\n')">+onInput</button>
-        <button onclick="insertCode('scriptEditor','Input.worldX')">worldX</button>
-        <button onclick="insertCode('scriptEditor','Engine.moveAndSlide(self, dt)')">moveAndSlide</button>
-        <button onclick="insertCode('scriptEditor','Engine.instantiate(\\'\\', self.x, self.y, 0)')">instantiate</button>
+        <button onclick="insertCode('scriptEditor','self.play(\\'run\\')')">self.play</button>
+        <button onclick="insertCode('scriptEditor','Engine.playSFX(\\'\\', 1.0)')">playSFX</button>
+        <button onclick="insertCode('scriptEditor','Engine.playBGM(\\'\\', true, 0.8)')">playBGM</button>
+        <button onclick="insertCode('scriptEditor','function onCollision(other) {\\n  \\n}\\n')">+onCollision</button>
+        <button onclick="insertCode('scriptEditor','function onTriggerEnter(other) {\\n  \\n}\\n')">+onTrigger</button>
+        <button onclick="insertCode('scriptEditor','function onAnimFinished(name) {\\n  \\n}\\n')">+onAnimEnd</button>
       </div>
       <textarea id="scriptEditor" class="code-box" spellcheck="false" oninput="updateProp('script', this.value)">${n.script || ''}</textarea>`;
     return;
@@ -622,6 +702,17 @@ function renderDock() {
   const parentOptions = [`<option value="">(根节点 Root)</option>`]
     .concat(nodes.filter((_, idx) => idx !== selectedIndex).map(p => `<option value="${p.name}" ${n.parent === p.name ? 'selected' : ''}>${p.name}</option>`))
     .join('');
+
+  const clipsHtml = (n.clips || []).map((c, cIdx) => `
+    <div class="clip-row">
+      <input value="${c.name}" placeholder="名称" onchange="updateClip(${cIdx}, 'name', this.value)">
+      <input type="number" min="0" value="${c.start}" title="起始帧" oninput="updateClip(${cIdx}, 'start', +this.value)">
+      <input type="number" min="0" value="${c.end}" title="结束帧" oninput="updateClip(${cIdx}, 'end', +this.value)">
+      <input type="number" min="1" value="${c.fps}" title="帧率FPS" oninput="updateClip(${cIdx}, 'fps', +this.value)">
+      <label style="display:flex;align-items:center;gap:2px;color:#94a3b8;"><input type="checkbox" ${c.loop ? 'checked' : ''} onchange="updateClip(${cIdx}, 'loop', this.checked)">循环</label>
+      <button class="danger" style="padding:2px 5px;font-size:10px;" onclick="deleteClip(${cIdx})">×</button>
+    </div>
+  `).join('');
 
   body.innerHTML = `
     <div style="display:flex;gap:6px;align-items:center;margin-bottom:7px;">
@@ -654,9 +745,18 @@ function renderDock() {
            <div class="field"><label>序列帧列数 (H-Frames)</label><input type="number" min="1" value="${n.hFrames || 1}" oninput="updateProp('hFrames', Math.max(1,+this.value))"></div>
            <div class="field"><label>序列帧行数 (V-Frames)</label><input type="number" min="1" value="${n.vFrames || 1}" oninput="updateProp('vFrames', Math.max(1,+this.value))"></div>`
       }
-      <div class="field row"><input type="checkbox" ${n.billboard ? 'checked' : ''} onchange="updateProp('billboard', this.checked)"><label>HD-2D 立牌 (Billboard)</label></div>
-      <div class="field row"><input type="checkbox" ${n.collider ? 'checked' : ''} onchange="updateProp('collider', this.checked)"><label>碰撞体 (Collider)</label></div>
-    </div>`;
+      <div class="field row"><input type="checkbox" ${n.billboard ? 'checked' : ''} onchange="updateProp('billboard', this.checked)"><label>HD-2D 立牌</label></div>
+      <div class="field row"><input type="checkbox" ${n.collider ? 'checked' : ''} onchange="updateProp('collider', this.checked)"><label>开启碰撞体</label></div>
+      <div class="field row"><input type="checkbox" ${n.isTrigger ? 'checked' : ''} onchange="updateProp('isTrigger', this.checked)"><label>触发器 (不阻挡)</label></div>
+    </div>
+    ${n.nodeType === 'Sprite2D' ? `
+      <div class="clip-box">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:11px;font-weight:700;color:#38bdf8;">🎬 动画片段库 (名 / 起 / 止 / FPS)</span>
+          <button style="padding:2px 6px;font-size:10px;" onclick="addClip()">+新增动画</button>
+        </div>
+        ${clipsHtml || '<div style="font-size:10px;color:#64748b;margin-top:4px;">暂无片段，点击右上角添加如 idle / run</div>'}
+      </div>` : ''}`;
 }
 
 function refreshAll() { renderTree(); renderDock(); draw(); }
