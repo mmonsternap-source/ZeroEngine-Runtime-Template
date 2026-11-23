@@ -3,120 +3,252 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>ZeroEngine 2D 可视化关卡编辑器</title>
+<title>ZeroEngine 2D Studio</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, sans-serif; }
-  body { background: #12141a; color: #e2e8f0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
-  header { background: #1a1d26; padding: 8px 12px; display: flex; gap: 8px; align-items: center; border-bottom: 1px solid #2d3343; flex-wrap: wrap; }
-  header h1 { font-size: 14px; color: #34d399; margin-right: auto; font-weight: 700; }
-  button, .file-btn { background: #2b3142; color: #fff; border: 1px solid #3f475e; padding: 6px 10px; border-radius: 6px; font-size: 12px; cursor: pointer; }
-  button:active { background: #3b435a; }
-  button.primary { background: #10b981; border-color: #059669; color: #06281e; font-weight: 700; }
-  button.danger { background: #ef4444; border-color: #dc2626; }
-  .workspace { display: flex; flex: 1; overflow: hidden; flex-direction: column; }
-  @media (min-width: 768px) { .workspace { flex-direction: row; } }
-  .canvas-area { flex: 1; display: flex; justify-content: center; align-items: center; background: #0b0d11; position: relative; overflow: hidden; touch-action: none; }
-  canvas { background: #14171f; border: 2px solid #334155; box-shadow: 0 0 20px rgba(0,0,0,0.6); max-width: 95%; max-height: 95%; }
-  .inspector { background: #1a1d26; border-top: 1px solid #2d3343; padding: 10px; height: 230px; overflow-y: auto; }
-  @media (min-width: 768px) { .inspector { width: 300px; height: auto; border-top: none; border-left: 1px solid #2d3343; } }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, sans-serif; }
+  body { background: #0d1017; color: #e2e8f0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; user-select: none; }
+  header { background: #161b26; padding: 6px 10px; display: flex; gap: 6px; align-items: center; border-bottom: 1px solid #262e3f; }
+  header h1 { font-size: 13px; color: #38bdf8; margin-right: auto; font-weight: 800; letter-spacing: 0.5px; }
+  button { background: #232b3b; color: #e2e8f0; border: 1px solid #334155; padding: 5px 8px; border-radius: 5px; font-size: 11px; font-weight: 600; }
+  button.play { background: #10b981; border-color: #059669; color: #042f2e; font-weight: 800; }
+  button.danger { background: #dc2626; border-color: #b91c1c; color: #fff; }
+
+  .workspace { flex: 1; display: flex; overflow: hidden; }
+  .scene-tree { width: 130px; background: #121620; border-right: 1px solid #262e3f; display: flex; flex-direction: column; }
+  .tree-header { padding: 6px; font-size: 11px; color: #94a3b8; border-bottom: 1px solid #1e2533; display: flex; justify-content: space-between; align-items: center; }
+  .tree-list { flex: 1; overflow-y: auto; padding: 4px; }
+  .tree-item { padding: 6px 6px; font-size: 11px; border-radius: 4px; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #cbd5e1; }
+  .tree-item.active { background: #1e3a8a; color: #93c5fd; font-weight: 700; }
+
+  .viewport { flex: 1; display: flex; justify-content: center; align-items: center; background: #090b10; position: relative; touch-action: none; }
+  canvas { background: #11151f; border: 1px solid #2d3748; max-width: 96%; max-height: 96%; }
+
+  .bottom-dock { height: 270px; background: #161b26; border-top: 1px solid #262e3f; display: flex; flex-direction: column; }
+  .tabs { display: flex; background: #11151e; border-bottom: 1px solid #262e3f; }
+  .tab { flex: 1; text-align: center; padding: 7px; font-size: 12px; color: #94a3b8; border-bottom: 2px solid transparent; }
+  .tab.active { color: #38bdf8; border-bottom-color: #38bdf8; font-weight: 700; background: #161b26; }
+  .dock-body { flex: 1; overflow-y: auto; padding: 8px; }
+
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
   .field { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: #94a3b8; }
-  .field input[type="text"], .field input[type="number"], .field input[type="color"] { background: #0f1117; border: 1px solid #334155; color: #fff; padding: 5px; border-radius: 4px; font-size: 12px; width: 100%; }
-  .field.row { flex-direction: row; align-items: center; gap: 6px; padding-top: 14px; }
-  .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 99; padding: 16px; flex-direction: column; justify-content: center; }
-  .modal.open { display: flex; }
-  .modal-box { background: #1a1d26; border: 1px solid #334155; border-radius: 10px; padding: 14px; max-width: 600px; width: 100%; margin: auto; display: flex; flex-direction: column; gap: 10px; }
-  textarea { width: 100%; height: 240px; background: #0b0d11; color: #34d399; border: 1px solid #334155; border-radius: 6px; padding: 8px; font-family: monospace; font-size: 12px; }
+  .field input, .field select { background: #0b0e14; border: 1px solid #334155; color: #fff; padding: 5px; border-radius: 4px; font-size: 12px; width: 100%; }
+  .field.row { flex-direction: row; align-items: center; gap: 6px; padding-top: 12px; }
+
+  .script-toolbar { display: flex; gap: 4px; overflow-x: auto; padding-bottom: 6px; }
+  .script-toolbar button { font-family: monospace; font-size: 11px; padding: 4px 6px; background: #1e293b; white-space: nowrap; }
+  textarea#codeEditor { width: 100%; height: 175px; background: #090c12; color: #a5f3fc; border: 1px solid #334155; border-radius: 4px; padding: 8px; font-family: monospace; font-size: 12px; line-height: 1.4; resize: none; user-select: text; }
+  pre#consoleOut { font-family: monospace; font-size: 11px; color: #cbd5e1; white-space: pre-wrap; line-height: 1.4; user-select: text; }
 </style>
 </head>
 <body>
 
 <header>
-  <h1>ZeroEngine 编辑器</h1>
-  <button onclick="addRectNode()">+ 色块节点</button>
-  <label class="file-btn">+ 导入PNG贴图<input type="file" accept="image/*" style="display:none" onchange="addImageNode(event)"></label>
-  <button class="primary" onclick="openExport()">导出 JSON</button>
+  <h1>ZeroEngine 2D</h1>
+  <button onclick="addNode('Sprite2D')">+ 精灵</button>
+  <button onclick="addNode('Label2D')">+ 文本</button>
+  <button onclick="pickNativeImage()">+ PNG</button>
+  <button class="play" onclick="playScene()">▶ 运行</button>
 </header>
 
 <div class="workspace">
-  <div class="canvas-area">
-    <!-- 逻辑分辨率 1080 x 1920，与引擎正交投影完全一致 -->
-    <canvas id="stage" width="1080" height="1920"></canvas>
+  <div class="scene-tree">
+    <div class="tree-header">
+      <span>节点树</span>
+      <button style="padding:2px 5px;font-size:10px;" onclick="resetDefaultProject()">重置</button>
+    </div>
+    <div class="tree-list" id="treeList"></div>
   </div>
-
-  <div class="inspector" id="inspector">
-    <div style="color:#64748b;font-size:12px;text-align:center;margin-top:40px;">点击画布上的物体进行选中与拖拽编辑</div>
+  <div class="viewport">
+    <canvas id="stage" width="1080" height="1920"></canvas>
   </div>
 </div>
 
-<div class="modal" id="exportModal">
-  <div class="modal-box">
-    <div style="display:flex;justify-content:space-between;align-items:center;">
-      <strong style="font-size:14px;">复制下方内容覆盖 main.scene.json</strong>
-      <button onclick="closeExport()">关闭</button>
-    </div>
-    <textarea id="jsonOutput" readonly></textarea>
-    <div style="display:flex;gap:8px;">
-      <button class="primary" style="flex:1" onclick="copyJson()">一键复制 JSON</button>
-      <button onclick="importJsonPrompt()">导入已有 JSON</button>
-    </div>
+<div class="bottom-dock">
+  <div class="tabs">
+    <div class="tab active" id="tab-inspector" onclick="switchTab('inspector')">属性检查器</div>
+    <div class="tab" id="tab-script" onclick="switchTab('script')">脚本 (JS)</div>
+    <div class="tab" id="tab-console" onclick="switchTab('console')">控制台</div>
   </div>
+  <div class="dock-body" id="dockBody"></div>
 </div>
 
 <script>
 const canvas = document.getElementById('stage');
 const ctx = canvas.getContext('2d');
 const imageCache = {};
-
-let nodes = [
-  { name: "Wall_Top", x: 540, y: 400, width: 600, height: 80, rotation: 0, texture: "", r: 0.35, g: 0.45, b: 0.65, a: 1, collider: true, tag: "obstacle" },
-  { name: "Wall_Bottom", x: 540, y: 1300, width: 600, height: 80, rotation: 0, texture: "", r: 0.35, g: 0.45, b: 0.65, a: 1, collider: true, tag: "obstacle" }
-];
+let activeTab = 'inspector';
 let selectedIndex = 0;
-let dragging = false;
-let dragOffsetX = 0, dragOffsetY = 0;
+let dragging = false, dragOffsetX = 0, dragOffsetY = 0;
 
-function rgbToHex(r, g, b) {
-  const toHex = v => Math.round(Math.min(1, Math.max(0, v)) * 255).toString(16).padStart(2, '0');
-  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
-}
-function hexToRgb(hex) {
-  const n = parseInt(hex.slice(1), 16);
-  return { r: +(((n >> 16) & 255) / 255).toFixed(2), g: +(((n >> 8) & 255) / 255).toFixed(2), b: +((n & 255) / 255).toFixed(2) };
-}
+function defaultNodes() {
+  return [
+    {
+      name: "CoreNode", nodeType: "Sprite2D", parent: "",
+      x: 540, y: 960, width: 120, height: 120, rotation: 0, scaleX: 1, scaleY: 1, zIndex: 1,
+      texture: "", r: 0.22, g: 0.74, b: 0.97, a: 1, collider: true, isTrigger: false, tag: "player",
+      script: `// 完整脚本生命周期示例
+var speed = 420;
 
-function addRectNode() {
-  nodes.push({ name: `Block_${nodes.length + 1}`, x: 540, y: 960, width: 200, height: 120, rotation: 0, texture: "", r: 0.2, g: 0.8, b: 0.6, a: 1, collider: true, tag: "wall" });
-  selectedIndex = nodes.length - 1;
-  renderInspector();
-  draw();
+function onReady() {
+  Engine.log("CoreNode 就绪! 拖动屏幕测试触控与动态生成");
 }
 
-function addImageNode(e) {
-  const file = e.target.files[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = ev => {
+function onProcess(dt) {
+  self.rotation += 45 * dt;
+  if (Input.isTouching) {
+    self.x += (Input.touchX - self.x) * 8 * dt;
+    self.y += (Input.touchY - self.y) * 8 * dt;
+  }
+}
+
+function onInput(ev) {
+  if (ev.type === "down") {
+    Engine.shake(12, 0.12);
+    // 动态生成子节点/子弹示例
+    Engine.spawn({
+      name: "Pulse",
+      x: self.x,
+      y: self.y,
+      width: 36,
+      height: 36,
+      r: 0.98, g: 0.8, b: 0.1,
+      script: "var life=0.6; function onProcess(dt){ life-=dt; self.scaleX+=3*dt; self.scaleY+=3*dt; self.a=life/0.6; if(life<=0) Engine.destroy(self); }"
+    }, "");
+  }
+}`
+    },
+    {
+      name: "OrbitOrb", nodeType: "Sprite2D", parent: "CoreNode",
+      x: 160, y: 0, width: 46, height: 46, rotation: 0, scaleX: 1, scaleY: 1, zIndex: 2,
+      texture: "", r: 0.96, g: 0.25, b: 0.37, a: 1, collider: true, isTrigger: true, tag: "orb",
+      script: "// 作为 CoreNode 的子节点，坐标自动继承父节点旋转与位移"
+    },
+    {
+      name: "HudTitle", nodeType: "Label2D", parent: "",
+      x: 180, y: 120, width: 300, height: 60, rotation: 0, scaleX: 1, scaleY: 1, zIndex: 10,
+      text: "ZeroEngine 2D Studio", fontSize: 44, texture: "", r: 1, g: 1, b: 1, a: 1, collider: false, isTrigger: false, tag: "ui",
+      script: ""
+    }
+  ];
+}
+
+let nodes = defaultNodes();
+
+window.onload = () => {
+  if (window.ZeroBridge) {
+    const saved = window.ZeroBridge.loadSavedScene();
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed.nodes) && parsed.nodes.length > 0) {
+          nodes = parsed.nodes;
+          nodes.forEach(n => { if (n.texture) preloadLocalImage(n.texture); });
+        }
+      } catch (e) {}
+    }
+  }
+  refreshAll();
+};
+
+function resetDefaultProject() {
+  nodes = defaultNodes();
+  selectedIndex = 0;
+  autoSave();
+  refreshAll();
+}
+
+function preloadLocalImage(fileName) {
+  if (!window.ZeroBridge || imageCache[fileName]) return;
+  const dataUrl = window.ZeroBridge.getTextureBase64(fileName);
+  if (dataUrl) {
     const img = new Image();
-    img.onload = () => {
-      imageCache[file.name] = img;
-      nodes.push({ name: file.name.replace(/\.[^.]+$/, ''), x: 540, y: 960, width: img.width, height: img.height, rotation: 0, texture: file.name, r: 1, g: 1, b: 1, a: 1, collider: false, tag: "prop" });
-      selectedIndex = nodes.length - 1;
-      renderInspector();
-      draw();
-    };
-    img.src = ev.target.result;
+    img.onload = () => { imageCache[fileName] = img; draw(); };
+    img.src = dataUrl;
+  }
+}
+
+function pickNativeImage() { if (window.ZeroBridge) window.ZeroBridge.pickImage(); }
+
+function onNativeImagePicked(fileName, dataUrl, w, h) {
+  const img = new Image();
+  img.onload = () => {
+    imageCache[fileName] = img;
+    nodes.push({
+      name: fileName.replace(/\.[^.]+$/, ''), nodeType: "Sprite2D", parent: "",
+      x: 540, y: 960, width: w || img.width || 160, height: h || img.height || 160,
+      rotation: 0, scaleX: 1, scaleY: 1, zIndex: 0,
+      texture: fileName, r: 1, g: 1, b: 1, a: 1, collider: true, isTrigger: false, tag: "sprite", script: ""
+    });
+    selectedIndex = nodes.length - 1;
+    autoSave();
+    refreshAll();
   };
-  reader.readAsDataURL(file);
-  e.target.value = '';
+  img.src = dataUrl;
+}
+
+function autoSave() {
+  if (window.ZeroBridge) window.ZeroBridge.saveScene(JSON.stringify({ nodes }));
+}
+
+function playScene() {
+  autoSave();
+  if (window.ZeroBridge) window.ZeroBridge.runGame(JSON.stringify({ nodes }));
+}
+
+function addNode(type) {
+  const idx = nodes.length + 1;
+  nodes.push({
+    name: `${type}_${idx}`, nodeType: type, parent: "",
+    x: 540, y: 960, width: 140, height: 140, rotation: 0, scaleX: 1, scaleY: 1, zIndex: 0,
+    text: type === 'Label2D' ? 'Text' : '', fontSize: 44,
+    texture: "", r: 0.2, g: 0.85, b: 0.6, a: 1, collider: type === 'Sprite2D', isTrigger: false, tag: "default", script: ""
+  });
+  selectedIndex = nodes.length - 1;
+  autoSave();
+  refreshAll();
+}
+
+function duplicateSelected() {
+  if (selectedIndex < 0) return;
+  const copy = JSON.parse(JSON.stringify(nodes[selectedIndex]));
+  copy.name += "_copy";
+  copy.x += 50;
+  copy.y += 50;
+  nodes.push(copy);
+  selectedIndex = nodes.length - 1;
+  autoSave();
+  refreshAll();
 }
 
 function deleteSelected() {
   if (selectedIndex < 0) return;
+  const removedName = nodes[selectedIndex].name;
   nodes.splice(selectedIndex, 1);
+  nodes.forEach(n => { if (n.parent === removedName) n.parent = ""; });
   selectedIndex = nodes.length - 1;
-  renderInspector();
-  draw();
+  autoSave();
+  refreshAll();
+}
+
+// 计算节点的世界坐标（考虑父节点变换）
+function getGlobalTransform(n, visited = new Set()) {
+  if (!n.parent || visited.has(n.name)) {
+    return { gx: n.x, gy: n.y, gRot: n.rotation || 0, gSx: n.scaleX ?? 1, gSy: n.scaleY ?? 1 };
+  }
+  visited.add(n.name);
+  const p = nodes.find(item => item.name === n.parent);
+  if (!p) return { gx: n.x, gy: n.y, gRot: n.rotation || 0, gSx: n.scaleX ?? 1, gSy: n.scaleY ?? 1 };
+  const pt = getGlobalTransform(p, visited);
+  const rad = pt.gRot * Math.PI / 180;
+  const sx = n.x * pt.gSx;
+  const sy = n.y * pt.gSy;
+  return {
+    gx: pt.gx + (sx * Math.cos(rad) - sy * Math.sin(rad)),
+    gy: pt.gy + (sx * Math.sin(rad) + sy * Math.cos(rad)),
+    gRot: pt.gRot + (n.rotation || 0),
+    gSx: pt.gSx * (n.scaleX ?? 1),
+    gSy: pt.gSy * (n.scaleY ?? 1)
+  };
 }
 
 function getCanvasPos(clientX, clientY) {
@@ -132,82 +264,130 @@ function handleDown(clientX, clientY) {
   selectedIndex = -1;
   for (let i = nodes.length - 1; i >= 0; i--) {
     const n = nodes[i];
-    if (Math.abs(pos.x - n.x) <= n.width / 2 && Math.abs(pos.y - n.y) <= n.height / 2) {
+    const gt = getGlobalTransform(n);
+    const hw = (n.width * gt.gSx) / 2;
+    const hh = (n.height * gt.gSy) / 2;
+    if (Math.abs(pos.x - gt.gx) <= hw && Math.abs(pos.y - gt.gy) <= hh) {
       selectedIndex = i;
       dragging = true;
-      dragOffsetX = pos.x - n.x;
-      dragOffsetY = pos.y - n.y;
+      dragOffsetX = pos.x - gt.gx;
+      dragOffsetY = pos.y - gt.gy;
       break;
     }
   }
-  renderInspector();
-  draw();
+  refreshAll();
 }
 
 function handleMove(clientX, clientY) {
   if (!dragging || selectedIndex < 0) return;
   const pos = getCanvasPos(clientX, clientY);
-  nodes[selectedIndex].x = Math.round(pos.x - dragOffsetX);
-  nodes[selectedIndex].y = Math.round(pos.y - dragOffsetY);
-  renderInspector();
+  const n = nodes[selectedIndex];
+  const p = n.parent ? nodes.find(item => item.name === n.parent) : null;
+  if (p) {
+    const pt = getGlobalTransform(p);
+    n.x = Math.round(pos.x - dragOffsetX - pt.gx);
+    n.y = Math.round(pos.y - dragOffsetY - pt.gy);
+  } else {
+    n.x = Math.round(pos.x - dragOffsetX);
+    n.y = Math.round(pos.y - dragOffsetY);
+  }
+  if (activeTab === 'inspector') renderDock();
   draw();
 }
 
-canvas.addEventListener('mousedown', e => handleDown(e.clientX, e.clientY));
-window.addEventListener('mousemove', e => handleMove(e.clientX, e.clientY));
-window.addEventListener('mouseup', () => dragging = false);
+function handleUp() { if (dragging) { dragging = false; autoSave(); } }
 
 canvas.addEventListener('touchstart', e => { if (e.touches.length) handleDown(e.touches[0].clientX, e.touches[0].clientY); });
 canvas.addEventListener('touchmove', e => { e.preventDefault(); if (e.touches.length) handleMove(e.touches[0].clientX, e.touches[0].clientY); }, { passive: false });
-canvas.addEventListener('touchend', () => dragging = false);
+canvas.addEventListener('touchend', handleUp);
+canvas.addEventListener('mousedown', e => handleDown(e.clientX, e.clientY));
+window.addEventListener('mousemove', e => handleMove(e.clientX, e.clientY));
+window.addEventListener('mouseup', handleUp);
+
+function rgbToHex(r, g, b) {
+  const toHex = v => Math.round(Math.min(1, Math.max(0, v)) * 255).toString(16).padStart(2, '0');
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+function hexToRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return { r: +(((n >> 16) & 255) / 255).toFixed(2), g: +(((n >> 8) & 255) / 255).toFixed(2), b: +((n & 255) / 255).toFixed(2) };
+}
 
 function draw() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  // 绘制参考网格
-  ctx.strokeStyle = '#1e222d';
+  ctx.strokeStyle = '#1b202c';
   ctx.lineWidth = 2;
   for (let x = 0; x <= 1080; x += 180) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, 1920); ctx.stroke(); }
   for (let y = 0; y <= 1920; y += 180) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(1080, y); ctx.stroke(); }
 
   nodes.forEach((n, idx) => {
+    const gt = getGlobalTransform(n);
+    const w = n.width * gt.gSx;
+    const h = n.height * gt.gSy;
+
     ctx.save();
-    ctx.translate(n.x, n.y);
-    ctx.rotate((n.rotation || 0) * Math.PI / 180);
+    ctx.translate(gt.gx, gt.gy);
+    ctx.rotate(gt.gRot * Math.PI / 180);
     ctx.globalAlpha = n.a ?? 1;
 
-    if (n.texture && imageCache[n.texture]) {
-      ctx.drawImage(imageCache[n.texture], -n.width / 2, -n.height / 2, n.width, n.height);
+    if (n.nodeType === 'Label2D') {
+      ctx.fillStyle = '#ffffff';
+      ctx.font = `bold ${n.fontSize || 44}px sans-serif`;
+      ctx.fillText(n.text || 'Text', -w / 2, 10);
+    } else if (n.texture && imageCache[n.texture]) {
+      ctx.drawImage(imageCache[n.texture], -w / 2, -h / 2, w, h);
     } else {
       ctx.fillStyle = rgbToHex(n.r, n.g, n.b);
-      ctx.fillRect(-n.width / 2, -n.height / 2, n.width, n.height);
-      if (n.texture) {
-        ctx.fillStyle = '#fff';
-        ctx.font = '26px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillText(n.texture, 0, 8);
-      }
+      ctx.fillRect(-w / 2, -h / 2, w, h);
     }
 
     if (n.collider) {
-      ctx.strokeStyle = '#38bdf8';
+      ctx.strokeStyle = n.isTrigger ? '#a855f7' : '#38bdf8';
       ctx.lineWidth = 4;
       ctx.setLineDash([12, 8]);
-      ctx.strokeRect(-n.width / 2, -n.height / 2, n.width, n.height);
+      ctx.strokeRect(-w / 2, -h / 2, w, h);
       ctx.setLineDash([]);
     }
 
     if (idx === selectedIndex) {
       ctx.strokeStyle = '#fbbf24';
       ctx.lineWidth = 6;
-      ctx.strokeRect(-n.width / 2 - 4, -n.height / 2 - 4, n.width + 8, n.height + 8);
+      ctx.strokeRect(-w / 2 - 4, -h / 2 - 4, w + 8, h + 8);
     }
     ctx.restore();
   });
 }
 
+function renderTree() {
+  const list = document.getElementById('treeList');
+  list.innerHTML = nodes.map((n, i) => {
+    const indent = n.parent ? '└ ' : '';
+    const hasScript = n.script && n.script.trim() ? ' 📜' : '';
+    return `<div class="tree-item ${i === selectedIndex ? 'active' : ''}" onclick="selectNode(${i})">${indent}${n.name}${hasScript}</div>`;
+  }).join('');
+}
+
+function selectNode(i) {
+  selectedIndex = i;
+  refreshAll();
+}
+
+function switchTab(tab) {
+  activeTab = tab;
+  document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+  document.getElementById(`tab-${tab}`).classList.add('active');
+  renderDock();
+}
+
 function updateProp(key, val) {
   if (selectedIndex < 0) return;
+  if (key === 'name') {
+    const oldName = nodes[selectedIndex].name;
+    nodes.forEach(item => { if (item.parent === oldName) item.parent = val; });
+  }
   nodes[selectedIndex][key] = val;
+  autoSave();
+  renderTree();
   draw();
 }
 
@@ -217,64 +397,98 @@ function updateColor(hex) {
   nodes[selectedIndex].r = c.r;
   nodes[selectedIndex].g = c.g;
   nodes[selectedIndex].b = c.b;
+  autoSave();
   draw();
 }
 
-function renderInspector() {
-  const box = document.getElementById('inspector');
-  if (selectedIndex < 0 || !nodes[selectedIndex]) {
-    box.innerHTML = '<div style="color:#64748b;font-size:12px;text-align:center;margin-top:40px;">点击画布上的物体进行选中与拖拽编辑</div>';
+function insertSnippet(snip) {
+  const ta = document.getElementById('codeEditor');
+  if (!ta) return;
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  ta.value = ta.value.substring(0, start) + snip + ta.value.substring(end);
+  ta.selectionStart = ta.selectionEnd = start + snip.length;
+  ta.focus();
+  updateProp('script', ta.value);
+}
+
+function refreshConsoleFromNative() {
+  if (activeTab === 'console') renderDock();
+}
+
+function renderDock() {
+  const body = document.getElementById('dockBody');
+  if (activeTab === 'console') {
+    const logs = window.ZeroBridge ? window.ZeroBridge.getConsoleLogs() : 'Console ready.';
+    body.innerHTML = `
+      <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+        <span style="font-size:11px;color:#94a3b8;">引擎输出与脚本异常日志</span>
+        <button style="padding:2px 6px;font-size:10px;" onclick="if(window.ZeroBridge)window.ZeroBridge.clearConsoleLogs();renderDock();">清空</button>
+      </div>
+      <pre id="consoleOut">${logs || '(暂无输出)'}</pre>
+    `;
     return;
   }
+
+  if (selectedIndex < 0 || !nodes[selectedIndex]) {
+    body.innerHTML = '<div style="color:#64748b;font-size:12px;text-align:center;margin-top:40px;">请在左侧节点树或视口中选择一个节点</div>';
+    return;
+  }
+
   const n = nodes[selectedIndex];
-  box.innerHTML = `
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-      <strong style="font-size:13px;color:#fbbf24;">节点属性 (${selectedIndex + 1}/${nodes.length})</strong>
-      <button class="danger" onclick="deleteSelected()">删除节点</button>
+  if (activeTab === 'script') {
+    body.innerHTML = `
+      <div class="script-toolbar">
+        <button onclick="insertSnippet('function onReady() {\\n  \\n}\\n')">+onReady</button>
+        <button onclick="insertSnippet('function onProcess(dt) {\\n  \\n}\\n')">+onProcess</button>
+        <button onclick="insertSnippet('function onInput(ev) {\\n  \\n}\\n')">+onInput</button>
+        <button onclick="insertSnippet('self.')">self.</button>
+        <button onclick="insertSnippet('Engine.')">Engine.</button>
+        <button onclick="insertSnippet('Input.')">Input.</button>
+        <button onclick="insertSnippet('Engine.raycast(')">raycast</button>
+        <button onclick="insertSnippet('Engine.spawn({')">spawn</button>
+      </div>
+      <textarea id="codeEditor" spellcheck="false" oninput="updateProp('script', this.value)">${n.script || ''}</textarea>
+    `;
+    return;
+  }
+
+  const parentOptions = [`<option value="">(无 - 根节点)</option>`]
+    .concat(nodes.filter((_, idx) => idx !== selectedIndex).map(p => `<option value="${p.name}" ${n.parent === p.name ? 'selected' : ''}>${p.name}</option>`))
+    .join('');
+
+  body.innerHTML = `
+    <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;">
+      <input style="background:#0b0e14;border:1px solid #334155;color:#fbbf24;font-weight:700;padding:4px 6px;border-radius:4px;font-size:12px;flex:1;" value="${n.name}" onchange="updateProp('name', this.value)">
+      <button onclick="duplicateSelected()">复制</button>
+      <button class="danger" onclick="deleteSelected()">删除</button>
     </div>
     <div class="grid">
-      <div class="field"><label>节点名称</label><input type="text" value="${n.name}" oninput="updateProp('name', this.value)"></div>
-      <div class="field"><label>贴图文件名 (assets内)</label><input type="text" value="${n.texture || ''}" placeholder="如 hero.png" oninput="updateProp('texture', this.value)"></div>
-      <div class="field"><label>X 坐标</label><input type="number" value="${n.x}" oninput="updateProp('x', +this.value)"></div>
-      <div class="field"><label>Y 坐标</label><input type="number" value="${n.y}" oninput="updateProp('y', +this.value)"></div>
-      <div class="field"><label>宽度 (Width)</label><input type="number" value="${n.width}" oninput="updateProp('width', +this.value)"></div>
-      <div class="field"><label>高度 (Height)</label><input type="number" value="${n.height}" oninput="updateProp('height', +this.value)"></div>
+      <div class="field"><label>父节点 (Hierarchy)</label><select onchange="updateProp('parent', this.value)">${parentOptions}</select></div>
+      <div class="field"><label>标签 (Tag)</label><input value="${n.tag || 'default'}" oninput="updateProp('tag', this.value)"></div>
+      <div class="field"><label>局部 X</label><input type="number" value="${n.x}" oninput="updateProp('x', +this.value)"></div>
+      <div class="field"><label>局部 Y</label><input type="number" value="${n.y}" oninput="updateProp('y', +this.value)"></div>
+      <div class="field"><label>宽度</label><input type="number" value="${n.width}" oninput="updateProp('width', +this.value)"></div>
+      <div class="field"><label>高度</label><input type="number" value="${n.height}" oninput="updateProp('height', +this.value)"></div>
       <div class="field"><label>旋转角度</label><input type="number" value="${n.rotation || 0}" oninput="updateProp('rotation', +this.value)"></div>
-      <div class="field"><label>色块颜色</label><input type="color" value="${rgbToHex(n.r, n.g, n.b)}" oninput="updateColor(this.value)"></div>
-      <div class="field row"><input type="checkbox" ${n.collider ? 'checked' : ''} onchange="updateProp('collider', this.checked)"><label>开启碰撞体</label></div>
-      <div class="field"><label>碰撞标签 (Tag)</label><input type="text" value="${n.tag || 'wall'}" oninput="updateProp('tag', this.value)"></div>
+      <div class="field"><label>渲染层级 (Z-Index)</label><input type="number" value="${n.zIndex || 0}" oninput="updateProp('zIndex', +this.value)"></div>
+      ${n.nodeType === 'Label2D'
+        ? `<div class="field"><label>文本内容</label><input value="${n.text || ''}" oninput="updateProp('text', this.value)"></div>
+           <div class="field"><label>字号</label><input type="number" value="${n.fontSize || 44}" oninput="updateProp('fontSize', +this.value)"></div>`
+        : `<div class="field"><label>颜色</label><input type="color" value="${rgbToHex(n.r, n.g, n.b)}" oninput="updateColor(this.value)"></div>
+           <div class="field"><label>透明度 (0~1)</label><input type="number" step="0.1" value="${n.a ?? 1}" oninput="updateProp('a', +this.value)"></div>`
+      }
+      <div class="field row"><input type="checkbox" ${n.collider ? 'checked' : ''} onchange="updateProp('collider', this.checked)"><label>碰撞体 (Collider)</label></div>
+      <div class="field row"><input type="checkbox" ${n.isTrigger ? 'checked' : ''} onchange="updateProp('isTrigger', this.checked)"><label>仅触发器 (Area2D)</label></div>
     </div>
   `;
 }
 
-function openExport() {
-  document.getElementById('jsonOutput').value = JSON.stringify({ nodes }, null, 2);
-  document.getElementById('exportModal').classList.add('open');
+function refreshAll() {
+  renderTree();
+  renderDock();
+  draw();
 }
-function closeExport() { document.getElementById('exportModal').classList.remove('open'); }
-function copyJson() {
-  const el = document.getElementById('jsonOutput');
-  el.select();
-  document.execCommand('copy');
-  alert('已复制！直接粘贴覆盖 app/src/main/assets/main.scene.json 即可');
-}
-function importJsonPrompt() {
-  const raw = prompt('请粘贴原有的 main.scene.json 内容：');
-  if (!raw) return;
-  try {
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed.nodes)) {
-      nodes = parsed.nodes;
-      selectedIndex = nodes.length > 0 ? 0 : -1;
-      renderInspector();
-      draw();
-      closeExport();
-    }
-  } catch (e) { alert('JSON 格式有误'); }
-}
-
-renderInspector();
-draw();
 </script>
 </body>
 </html>
