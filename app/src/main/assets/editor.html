@@ -8,9 +8,10 @@
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, sans-serif; }
   body { background: #0b0e14; color: #e2e8f0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; user-select: none; }
   header { background: #131822; padding: 5px 8px; display: flex; flex-direction: column; gap: 5px; border-bottom: 1px solid #232c3d; }
-  .header-row { display: flex; gap: 5px; align-items: center; width: 100%; overflow-x: auto; }
-  select.proj-sel { background: #0b0e14; color: #38bdf8; border: 1px solid #334155; padding: 4px 6px; border-radius: 4px; font-size: 11px; font-weight: 700; max-width: 125px; }
-  button { background: #1e2636; color: #e2e8f0; border: 1px solid #334155; padding: 4px 7px; border-radius: 4px; font-size: 11px; font-weight: 600; white-space: nowrap; }
+  .header-row { display: flex; gap: 4px; align-items: center; width: 100%; overflow-x: auto; }
+  select.proj-sel { background: #0b0e14; color: #38bdf8; border: 1px solid #334155; padding: 4px 5px; border-radius: 4px; font-size: 11px; font-weight: 700; max-width: 118px; }
+  button { background: #1e2636; color: #e2e8f0; border: 1px solid #334155; padding: 4px 6px; border-radius: 4px; font-size: 11px; font-weight: 600; white-space: nowrap; }
+  button:disabled { opacity: 0.38; }
   button.active-toggle { background: #1d4ed8; border-color: #3b82f6; color: #fff; }
   button.export-btn { background: #7c3aed; border-color: #6d28d9; color: #fff; }
   button.play { background: #10b981; border-color: #059669; color: #042f2e; font-weight: 800; margin-left: auto; }
@@ -70,12 +71,14 @@
     <button onclick="openCreateProjectModal()">+工程</button>
     <select class="proj-sel" id="sceneSelect" onchange="switchScene(this.value)"></select>
     <button onclick="openCreateSceneModal()">+场景</button>
+    <button class="export-btn" onclick="exportBundle()">📦导出</button>
   </div>
   <div class="header-row">
-    <button id="modeBtn" class="active-toggle" onclick="toggleCamMode()">模式:2.5D</button>
-    <button id="snapBtn" class="active-toggle" onclick="toggleSnap()">吸附:开</button>
+    <button id="undoBtn" onclick="undo()" disabled>↩撤销</button>
+    <button id="redoBtn" onclick="redo()" disabled>↪重做</button>
+    <button id="modeBtn" class="active-toggle" onclick="toggleCamMode()">2.5D</button>
+    <button id="snapBtn" class="active-toggle" onclick="toggleSnap()">吸附</button>
     <button onclick="resetView()">居中</button>
-    <button class="export-btn" onclick="exportBundle()">📦导出</button>
     <button class="play" onclick="playScene()">▶ 运行</button>
   </div>
 </header>
@@ -143,12 +146,82 @@ let dragMode = null, dragStartWorld = { x: 0, y: 0 }, origNodeState = null;
 let lastPanScreen = { x: 0, y: 0 }, lastPinchDist = 0;
 let modalCallback = null;
 
+// Undo / Redo 历史栈
+const MAX_HISTORY = 40;
+let undoStack = [];
+let redoStack = [];
+let pendingSnapshot = null;
+let inputDebounceTimer = null;
+
+function createSnapshot() {
+  return JSON.stringify({ camera: cameraCfg, nodes, selectedIndex });
+}
+
+function updateUndoRedoButtons() {
+  const uBtn = document.getElementById('undoBtn');
+  const rBtn = document.getElementById('redoBtn');
+  if (uBtn) uBtn.disabled = undoStack.length === 0;
+  if (rBtn) rBtn.disabled = redoStack.length === 0;
+}
+
+function clearHistory() {
+  undoStack = [];
+  redoStack = [];
+  pendingSnapshot = null;
+  updateUndoRedoButtons();
+}
+
+function recordUndoPoint(snapStr = createSnapshot()) {
+  if (undoStack.length > 0 && undoStack[undoStack.length - 1] === snapStr) return;
+  undoStack.push(snapStr);
+  if (undoStack.length > MAX_HISTORY) undoStack.shift();
+  redoStack = [];
+  updateUndoRedoButtons();
+}
+
+function restoreSnapshot(snapStr) {
+  try {
+    const data = JSON.parse(snapStr);
+    if (data.camera) cameraCfg = data.camera;
+    nodes = Array.isArray(data.nodes) ? data.nodes : [];
+    nodes.forEach(n => {
+      if (!Array.isArray(n.clips)) n.clips = [];
+      if (!Array.isArray(n.tiles)) n.tiles = [];
+      if (n.texture) preloadLocalImage(n.texture);
+    });
+    selectedIndex = Math.min(nodes.length - 1, data.selectedIndex ?? (nodes.length > 0 ? 0 : -1));
+    if (selectedIndex < 0 || nodes[selectedIndex]?.nodeType !== 'TileMap') tileBrushMode = 'off';
+    document.getElementById('modeBtn').textContent = cameraCfg.mode;
+    autoSave();
+    refreshAll();
+    updateUndoRedoButtons();
+  } catch (e) {}
+}
+
+function undo() {
+  if (undoStack.length === 0) return;
+  const currentSnap = createSnapshot();
+  const prevSnap = undoStack.pop();
+  redoStack.push(currentSnap);
+  restoreSnapshot(prevSnap);
+  showToast(`已撤销 (剩余 ${undoStack.length} 步)`);
+}
+
+function redo() {
+  if (redoStack.length === 0) return;
+  const currentSnap = createSnapshot();
+  const nextSnap = redoStack.pop();
+  undoStack.push(currentSnap);
+  restoreSnapshot(nextSnap);
+  showToast(`已重做 (剩余 ${redoStack.length} 步)`);
+}
+
 function showToast(msg) {
   const bar = document.getElementById('toastBar');
   bar.textContent = msg;
   bar.style.display = 'block';
   clearTimeout(bar._timer);
-  bar._timer = setTimeout(() => { bar.style.display = 'none'; }, 2400);
+  bar._timer = setTimeout(() => { bar.style.display = 'none'; }, 2000);
 }
 
 function openInputModal(title, defaultVal, cb) {
@@ -302,6 +375,7 @@ window.onload = () => {
     loadCurrentSceneFromDisk();
   }
   refreshAll();
+  updateUndoRedoButtons();
 };
 
 function refreshAudioList() {
@@ -337,13 +411,15 @@ function loadCurrentSceneFromDisk() {
     nodes = currentScene === 'main.scene' ? defaultNodes() : [];
     autoSave();
   }
-  document.getElementById('modeBtn').textContent = `模式:${cameraCfg.mode}`;
+  document.getElementById('modeBtn').textContent = cameraCfg.mode;
   selectedIndex = nodes.length > 0 ? 0 : -1;
+  clearHistory();
 }
 
 function toggleCamMode() {
+  recordUndoPoint();
   cameraCfg.mode = cameraCfg.mode === '2.5D' ? '2D' : '2.5D';
-  document.getElementById('modeBtn').textContent = `模式:${cameraCfg.mode}`;
+  document.getElementById('modeBtn').textContent = cameraCfg.mode;
   autoSave(); draw();
 }
 
@@ -354,6 +430,7 @@ function openCreateProjectModal() {
     if (window.ZeroBridge) window.ZeroBridge.setProject(safeName);
     currentScene = 'main.scene';
     nodes = defaultNodes();
+    clearHistory();
     autoSave();
     refreshProjectAndSceneLists();
     refreshAudioList();
@@ -379,6 +456,7 @@ function openCreateSceneModal() {
     if (!safeName) { showToast("请输入英文或数字文件名"); return; }
     currentScene = safeName.endsWith('.scene') ? safeName : safeName + '.scene';
     nodes = [];
+    clearHistory();
     autoSave();
     refreshProjectAndSceneLists();
     refreshAll();
@@ -396,7 +474,7 @@ function switchScene(sceneName) {
 function toggleSnap() {
   snapGrid = !snapGrid;
   const btn = document.getElementById('snapBtn');
-  btn.textContent = snapGrid ? '吸附:开' : '吸附:关';
+  btn.textContent = snapGrid ? '吸附' : '自由';
   btn.classList.toggle('active-toggle', snapGrid);
 }
 
@@ -435,6 +513,7 @@ function onNativeAudioPicked(fileName) {
 function onNativeImagePicked(fileName, dataUrl, w, h) {
   const img = new Image();
   img.onload = () => {
+    recordUndoPoint();
     imageCache[fileName] = img;
     if (selectedIndex >= 0 && nodes[selectedIndex]?.nodeType === 'TileMap') {
       nodes[selectedIndex].texture = fileName;
@@ -464,6 +543,7 @@ function playScene() {
 }
 
 function addNode(type) {
+  recordUndoPoint();
   const idx = nodes.length + 1;
   const isEmitter = type === 'ParticleEmitter';
   const isLight = type === 'PointLight';
@@ -491,6 +571,7 @@ function addNode(type) {
 }
 
 function addUINode() {
+  recordUndoPoint();
   const idx = nodes.length + 1;
   nodes.push({
     name: `UI_Button_${idx}`, nodeType: "Sprite2D", layer: "UI", parent: "", tag: "ui",
@@ -505,6 +586,7 @@ function addUINode() {
 
 function duplicateSelected() {
   if (selectedIndex < 0) return;
+  recordUndoPoint();
   const copy = JSON.parse(JSON.stringify(nodes[selectedIndex]));
   copy.name += "_copy"; copy.x += 60; copy.y += 60;
   nodes.push(copy); selectedIndex = nodes.length - 1;
@@ -513,6 +595,7 @@ function duplicateSelected() {
 
 function deleteSelected() {
   if (selectedIndex < 0) return;
+  recordUndoPoint();
   const removedName = nodes[selectedIndex].name;
   nodes.splice(selectedIndex, 1);
   nodes.forEach(n => { if (n.parent === removedName) n.parent = ""; });
@@ -521,8 +604,18 @@ function deleteSelected() {
   autoSave(); refreshAll();
 }
 
+function clearAllTiles() {
+  if (selectedIndex < 0 || nodes[selectedIndex]?.nodeType !== 'TileMap') return;
+  if (!nodes[selectedIndex].tiles?.length) return;
+  recordUndoPoint();
+  nodes[selectedIndex].tiles = [];
+  autoSave(); refreshAll();
+  showToast("已清空当前瓦片层");
+}
+
 function addClip() {
   if (selectedIndex < 0) return;
+  recordUndoPoint();
   const n = nodes[selectedIndex];
   if (!Array.isArray(n.clips)) n.clips = [];
   const idx = n.clips.length + 1;
@@ -534,12 +627,14 @@ function updateClip(cIdx, key, val) {
   if (selectedIndex < 0) return;
   const n = nodes[selectedIndex];
   if (!n.clips || !n.clips[cIdx]) return;
+  recordUndoPoint();
   n.clips[cIdx][key] = val;
   autoSave();
 }
 
 function deleteClip(cIdx) {
   if (selectedIndex < 0) return;
+  recordUndoPoint();
   nodes[selectedIndex].clips.splice(cIdx, 1);
   autoSave(); renderDock();
 }
@@ -594,6 +689,7 @@ function applySnap(v) { return snapGrid ? Math.round(v / GRID_SIZE) * GRID_SIZE 
 canvas.addEventListener('touchstart', e => {
   if (e.touches.length === 2) {
     dragMode = 'pinch';
+    pendingSnapshot = null;
     lastPinchDist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
     lastPanScreen = { x: (e.touches[0].clientX + e.touches[1].clientX) / 2, y: (e.touches[0].clientY + e.touches[1].clientY) / 2 };
     return;
@@ -601,6 +697,7 @@ canvas.addEventListener('touchstart', e => {
   if (e.touches.length === 1) {
     const wp = screenToWorld(e.touches[0].clientX, e.touches[0].clientY);
     if (selectedIndex >= 0 && nodes[selectedIndex] && nodes[selectedIndex].nodeType === 'TileMap' && tileBrushMode !== 'off') {
+      pendingSnapshot = createSnapshot();
       dragMode = 'tile_brush';
       paintTileAtWorld(wp.x, wp.y);
       return;
@@ -608,9 +705,9 @@ canvas.addEventListener('touchstart', e => {
     const gizmoLen = 110 / camZoom, hitR = 32 / camZoom;
     if (selectedIndex >= 0 && nodes[selectedIndex] && nodes[selectedIndex].nodeType !== 'TileMap') {
       const sel = nodes[selectedIndex], gt = getGlobalTransform(sel);
-      if (Math.hypot(wp.x - (gt.gx + gizmoLen), wp.y - gt.gy) < hitR) { dragMode = 'move_x'; dragStartWorld = wp; origNodeState = { ...sel }; return; }
-      if (Math.hypot(wp.x - gt.gx, wp.y - (gt.gy + gizmoLen)) < hitR) { dragMode = 'move_y'; dragStartWorld = wp; origNodeState = { ...sel }; return; }
-      if (Math.hypot(wp.x - gt.gx, wp.y - (gt.gy - gizmoLen)) < hitR) { dragMode = 'rotate'; dragStartWorld = wp; origNodeState = { ...sel }; return; }
+      if (Math.hypot(wp.x - (gt.gx + gizmoLen), wp.y - gt.gy) < hitR) { pendingSnapshot = createSnapshot(); dragMode = 'move_x'; dragStartWorld = wp; origNodeState = { ...sel }; return; }
+      if (Math.hypot(wp.x - gt.gx, wp.y - (gt.gy + gizmoLen)) < hitR) { pendingSnapshot = createSnapshot(); dragMode = 'move_y'; dragStartWorld = wp; origNodeState = { ...sel }; return; }
+      if (Math.hypot(wp.x - gt.gx, wp.y - (gt.gy - gizmoLen)) < hitR) { pendingSnapshot = createSnapshot(); dragMode = 'rotate'; dragStartWorld = wp; origNodeState = { ...sel }; return; }
     }
     let hit = -1;
     for (let i = nodes.length - 1; i >= 0; i--) {
@@ -619,8 +716,15 @@ canvas.addEventListener('touchstart', e => {
       const gt = getGlobalTransform(n);
       if (Math.abs(wp.x - gt.gx) <= (n.width * gt.gSx) / 2 && Math.abs(wp.y - gt.gy) <= (n.height * gt.gSy) / 2) { hit = i; break; }
     }
-    if (hit >= 0) { selectedIndex = hit; dragMode = 'move_xy'; dragStartWorld = wp; origNodeState = { ...nodes[hit] }; refreshAll(); }
-    else { dragMode = 'pan'; lastPanScreen = { x: e.touches[0].clientX, y: e.touches[0].clientY }; }
+    if (hit >= 0) {
+      selectedIndex = hit;
+      pendingSnapshot = createSnapshot();
+      dragMode = 'move_xy'; dragStartWorld = wp; origNodeState = { ...nodes[hit] };
+      refreshAll();
+    } else {
+      pendingSnapshot = null;
+      dragMode = 'pan'; lastPanScreen = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    }
   }
 });
 
@@ -664,6 +768,10 @@ canvas.addEventListener('touchmove', e => {
 }, { passive: false });
 
 canvas.addEventListener('touchend', () => {
+  if (pendingSnapshot && createSnapshot() !== pendingSnapshot) {
+    recordUndoPoint(pendingSnapshot);
+  }
+  pendingSnapshot = null;
   if (dragMode === 'tile_brush') { autoSave(); if (activeTab === 'inspector') renderDock(); }
   else if (dragMode && dragMode !== 'pan' && dragMode !== 'pinch') autoSave();
   dragMode = null;
@@ -804,8 +912,15 @@ function switchTab(tab) {
   renderDock();
 }
 
-function updateProp(key, val) {
+function updateProp(key, val, isTyping = false) {
   if (selectedIndex < 0) return;
+  if (isTyping) {
+    if (!inputDebounceTimer) recordUndoPoint();
+    clearTimeout(inputDebounceTimer);
+    inputDebounceTimer = setTimeout(() => { inputDebounceTimer = null; }, 800);
+  } else {
+    recordUndoPoint();
+  }
   if (key === 'name') {
     const oldName = nodes[selectedIndex].name;
     nodes.forEach(item => { if (item.parent === oldName) item.parent = val; });
@@ -818,6 +933,9 @@ function updateProp(key, val) {
 
 function updateColor(hex) {
   if (selectedIndex < 0) return;
+  if (!inputDebounceTimer) recordUndoPoint();
+  clearTimeout(inputDebounceTimer);
+  inputDebounceTimer = setTimeout(() => { inputDebounceTimer = null; }, 600);
   const c = hexToRgb(hex);
   nodes[selectedIndex].r = c.r; nodes[selectedIndex].g = c.g; nodes[selectedIndex].b = c.b;
   autoSave(); draw();
@@ -826,11 +944,13 @@ function updateColor(hex) {
 function insertCode(id, snip) {
   const ta = document.getElementById(id);
   if (!ta) return;
+  recordUndoPoint();
   const s = ta.selectionStart, e = ta.selectionEnd;
   ta.value = ta.value.substring(0, s) + snip + ta.value.substring(e);
   ta.selectionStart = ta.selectionEnd = s + snip.length;
   ta.focus();
-  updateProp(id === 'shaderEditor' ? 'shader' : 'script', ta.value);
+  nodes[selectedIndex][id === 'shaderEditor' ? 'shader' : 'script'] = ta.value;
+  autoSave(); renderTree();
 }
 
 function refreshConsoleFromNative() { if (activeTab === 'console') renderDock(); }
@@ -866,10 +986,10 @@ function renderDock() {
     body.innerHTML = `<div class="doc-box">
 <b>ZeroEngine SDK v0.5-Release 商业旗舰手册</b><br>
 • <b>已导入音频</b>: ${audioStr}<br>
+• <b>撤销与重做</b>: 顶部栏支持最多 40 步 ↩撤销 / ↪重做（含瓦片涂刷与属性修改）<br>
 • <b>TileMap 瓦片刷</b>: 选中 +瓦 节点后点 +图 导入图集，设置行列数即可在调色板点选图块涂刷<br>
 • <b>一键发布包</b>: 点击顶部「📦导出」生成含 main.scene.json 与全套素材的 .zip 包<br>
-• <b>缓动/闪白/粒子</b>: Engine.tween(self, "scaleX", 1.3, 0.15, "easeOut") / self.flash(0.14) / self.emitBurst(30)<br>
-• <b>动画状态机与音频</b>: self.play("run") / Engine.playSFX("hit.wav") / Engine.playBGM("bgm.mp3")
+• <b>缓动/闪白/粒子</b>: Engine.tween(self, "scaleX", 1.3, 0.15, "easeOut") / self.flash(0.14) / self.emitBurst(30)
 </div>`;
     return;
   }
@@ -902,7 +1022,7 @@ function renderDock() {
         <button onclick="insertCode('scriptEditor','function onCollision(other) {\\n  \\n}\\n')">+onCollision</button>
         <button onclick="insertCode('scriptEditor','function onTriggerEnter(other) {\\n  \\n}\\n')">+onTrigger</button>
       </div>
-      <textarea id="scriptEditor" class="code-box" spellcheck="false" oninput="updateProp('script', this.value)">${n.script || ''}</textarea>`;
+      <textarea id="scriptEditor" class="code-box" spellcheck="false" oninput="updateProp('script', this.value, true)">${n.script || ''}</textarea>`;
     return;
   }
 
@@ -913,7 +1033,7 @@ function renderDock() {
         <button onclick="updateProp('shader', \`${template}\`);renderDock();">载入自定义GLSL模板</button>
         <button onclick="updateProp('shader', '');renderDock();">恢复默认实时光照Shader</button>
       </div>
-      <textarea id="shaderEditor" class="code-box" spellcheck="false" placeholder="留空则自动使用内置2.5D多光源Shader..." oninput="updateProp('shader', this.value)">${n.shader || ''}</textarea>`;
+      <textarea id="shaderEditor" class="code-box" spellcheck="false" placeholder="留空则自动使用内置2.5D多光源Shader..." oninput="updateProp('shader', this.value, true)">${n.shader || ''}</textarea>`;
     return;
   }
 
@@ -929,9 +1049,9 @@ function renderDock() {
   const clipsHtml = (n.clips || []).map((c, cIdx) => `
     <div class="clip-row">
       <input value="${c.name}" placeholder="名称" onchange="updateClip(${cIdx}, 'name', this.value)">
-      <input type="number" min="0" value="${c.start}" title="起始帧" oninput="updateClip(${cIdx}, 'start', +this.value)">
-      <input type="number" min="0" value="${c.end}" title="结束帧" oninput="updateClip(${cIdx}, 'end', +this.value)">
-      <input type="number" min="1" value="${c.fps}" title="帧率FPS" oninput="updateClip(${cIdx}, 'fps', +this.value)">
+      <input type="number" min="0" value="${c.start}" title="起始帧" onchange="updateClip(${cIdx}, 'start', +this.value)">
+      <input type="number" min="0" value="${c.end}" title="结束帧" onchange="updateClip(${cIdx}, 'end', +this.value)">
+      <input type="number" min="1" value="${c.fps}" title="帧率FPS" onchange="updateClip(${cIdx}, 'fps', +this.value)">
       <label style="display:flex;align-items:center;gap:2px;color:#94a3b8;"><input type="checkbox" ${c.loop ? 'checked' : ''} onchange="updateClip(${cIdx}, 'loop', this.checked)">循环</label>
       <button class="danger" style="padding:2px 5px;font-size:10px;" onclick="deleteClip(${cIdx})">×</button>
     </div>
@@ -941,41 +1061,42 @@ function renderDock() {
   if (n.nodeType === 'TileMap') {
     extraFields = `
       <div class="field"><label>图集贴图 (Tileset)</label><select onchange="updateProp('texture', this.value)">${texOptions}</select></div>
-      <div class="field"><label>瓦片尺寸 (TileSize)</label><input type="number" min="16" value="${n.tileSize || 90}" oninput="updateProp('tileSize', Math.max(16,+this.value))"></div>
-      <div class="field"><label>图集列数 (H-Frames)</label><input type="number" min="1" value="${n.hFrames || 1}" oninput="updateProp('hFrames', Math.max(1,+this.value))"></div>
-      <div class="field"><label>图集行数 (V-Frames)</label><input type="number" min="1" value="${n.vFrames || 1}" oninput="updateProp('vFrames', Math.max(1,+this.value))"></div>
+      <div class="field"><label>瓦片尺寸 (TileSize)</label><input type="number" min="16" value="${n.tileSize || 90}" oninput="updateProp('tileSize', Math.max(16,+this.value), true)"></div>
+      <div class="field"><label>图集列数 (H-Frames)</label><input type="number" min="1" value="${n.hFrames || 1}" onchange="updateProp('hFrames', Math.max(1,+this.value))"></div>
+      <div class="field"><label>图集行数 (V-Frames)</label><input type="number" min="1" value="${n.vFrames || 1}" onchange="updateProp('vFrames', Math.max(1,+this.value))"></div>
       <div class="field"><label>纯色模式颜色</label><input type="color" value="${rgbToHex(n.r, n.g, n.b)}" oninput="updateColor(this.value)"></div>
       <div class="field"><label>当前画笔图块帧号</label><input type="number" min="0" value="${brushFrame}" oninput="brushFrame = Math.max(0,+this.value);draw();"></div>`;
   } else if (n.nodeType === 'PointLight') {
     extraFields = `
-      <div class="field"><label>光照半径 (Radius)</label><input type="number" value="${n.lightRadius || 450}" oninput="updateProp('lightRadius', +this.value)"></div>
-      <div class="field"><label>光照强度 (Intensity)</label><input type="number" step="0.1" value="${n.lightIntensity || 1.4}" oninput="updateProp('lightIntensity', +this.value)"></div>
+      <div class="field"><label>光照半径 (Radius)</label><input type="number" value="${n.lightRadius || 450}" oninput="updateProp('lightRadius', +this.value, true)"></div>
+      <div class="field"><label>光照强度 (Intensity)</label><input type="number" step="0.1" value="${n.lightIntensity || 1.4}" oninput="updateProp('lightIntensity', +this.value, true)"></div>
       <div class="field"><label>灯光颜色</label><input type="color" value="${rgbToHex(n.r, n.g, n.b)}" oninput="updateColor(this.value)"></div>`;
   } else if (n.nodeType === 'ParticleEmitter') {
     extraFields = `
-      <div class="field"><label>发射速率 (/秒)</label><input type="number" value="${n.emitRate ?? 24}" oninput="updateProp('emitRate', +this.value)"></div>
-      <div class="field"><label>粒子寿命 (秒)</label><input type="number" step="0.1" value="${n.particleLife ?? 1.0}" oninput="updateProp('particleLife', +this.value)"></div>
-      <div class="field"><label>初速度</label><input type="number" value="${n.particleSpeed ?? 150}" oninput="updateProp('particleSpeed', +this.value)"></div>
-      <div class="field"><label>粒子大小</label><input type="number" value="${n.particleSize ?? 16}" oninput="updateProp('particleSize', +this.value)"></div>
-      <div class="field"><label>重力加速度</label><input type="number" value="${n.particleGravity ?? -60}" oninput="updateProp('particleGravity', +this.value)"></div>
+      <div class="field"><label>发射速率 (/秒)</label><input type="number" value="${n.emitRate ?? 24}" oninput="updateProp('emitRate', +this.value, true)"></div>
+      <div class="field"><label>粒子寿命 (秒)</label><input type="number" step="0.1" value="${n.particleLife ?? 1.0}" oninput="updateProp('particleLife', +this.value, true)"></div>
+      <div class="field"><label>初速度</label><input type="number" value="${n.particleSpeed ?? 150}" oninput="updateProp('particleSpeed', +this.value, true)"></div>
+      <div class="field"><label>粒子大小</label><input type="number" value="${n.particleSize ?? 16}" oninput="updateProp('particleSize', +this.value, true)"></div>
+      <div class="field"><label>重力加速度</label><input type="number" value="${n.particleGravity ?? -60}" oninput="updateProp('particleGravity', +this.value, true)"></div>
       <div class="field"><label>粒子颜色</label><input type="color" value="${rgbToHex(n.r, n.g, n.b)}" oninput="updateColor(this.value)"></div>`;
   } else {
     extraFields = `
       <div class="field"><label>贴图资源</label><select onchange="updateProp('texture', this.value)">${texOptions}</select></div>
       <div class="field"><label>混合颜色</label><input type="color" value="${rgbToHex(n.r, n.g, n.b)}" oninput="updateColor(this.value)"></div>
-      <div class="field"><label>透明度 (0~1)</label><input type="number" step="0.1" value="${n.a ?? 1}" oninput="updateProp('a', +this.value)"></div>
-      <div class="field"><label>序列帧列数 (H-Frames)</label><input type="number" min="1" value="${n.hFrames || 1}" oninput="updateProp('hFrames', Math.max(1,+this.value))"></div>
-      <div class="field"><label>序列帧行数 (V-Frames)</label><input type="number" min="1" value="${n.vFrames || 1}" oninput="updateProp('vFrames', Math.max(1,+this.value))"></div>`;
+      <div class="field"><label>透明度 (0~1)</label><input type="number" step="0.1" value="${n.a ?? 1}" oninput="updateProp('a', +this.value, true)"></div>
+      <div class="field"><label>序列帧列数 (H-Frames)</label><input type="number" min="1" value="${n.hFrames || 1}" onchange="updateProp('hFrames', Math.max(1,+this.value))"></div>
+      <div class="field"><label>序列帧行数 (V-Frames)</label><input type="number" min="1" value="${n.vFrames || 1}" onchange="updateProp('vFrames', Math.max(1,+this.value))"></div>`;
   }
 
   const tileBrushBar = n.nodeType === 'TileMap' ? `
     <div class="clip-box" style="margin-bottom:8px;margin-top:0;">
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:4px;">
-        <span style="font-size:11px;font-weight:700;color:#38bdf8;">🧱 瓦片画笔 (已铺 ${(n.tiles||[]).length} 格)</span>
-        <div style="display:flex;gap:4px;">
-          <button class="${tileBrushMode==='off'?'active-toggle':''}" style="padding:2px 6px;font-size:10px;" onclick="tileBrushMode='off';renderDock();draw();">拖动视口</button>
-          <button class="${tileBrushMode==='paint'?'active-toggle':''}" style="padding:2px 6px;font-size:10px;" onclick="tileBrushMode='paint';renderDock();draw();">🖌️刷瓦片</button>
-          <button class="${tileBrushMode==='erase'?'active-toggle':''}" style="padding:2px 6px;font-size:10px;" onclick="tileBrushMode='erase';renderDock();draw();">橡皮擦</button>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:4px;flex-wrap:wrap;">
+        <span style="font-size:11px;font-weight:700;color:#38bdf8;">🧱 瓦片画笔 (${(n.tiles||[]).length} 格)</span>
+        <div style="display:flex;gap:3px;">
+          <button class="${tileBrushMode==='off'?'active-toggle':''}" style="padding:2px 5px;font-size:10px;" onclick="tileBrushMode='off';renderDock();draw();">拖动</button>
+          <button class="${tileBrushMode==='paint'?'active-toggle':''}" style="padding:2px 5px;font-size:10px;" onclick="tileBrushMode='paint';renderDock();draw();">🖌️刷</button>
+          <button class="${tileBrushMode==='erase'?'active-toggle':''}" style="padding:2px 5px;font-size:10px;" onclick="tileBrushMode='erase';renderDock();draw();">擦除</button>
+          <button class="danger" style="padding:2px 5px;font-size:10px;" onclick="clearAllTiles()">清空</button>
         </div>
       </div>
       ${buildTilePaletteHtml(n)}
@@ -996,14 +1117,14 @@ function renderDock() {
         </select>
       </div>
       <div class="field"><label>父节点 (Hierarchy)</label><select onchange="updateProp('parent', this.value)">${parentOptions}</select></div>
-      <div class="field"><label>局部 X</label><input type="number" value="${n.x}" oninput="updateProp('x', +this.value)"></div>
-      <div class="field"><label>局部 Y</label><input type="number" value="${n.y}" oninput="updateProp('y', +this.value)"></div>
-      <div class="field"><label>空间高度 Z</label><input type="number" value="${n.z || 0}" oninput="updateProp('z', +this.value)"></div>
-      <div class="field"><label>节点标签 (Tag)</label><input value="${n.tag || 'default'}" oninput="updateProp('tag', this.value)"></div>
-      <div class="field"><label>宽度</label><input type="number" value="${n.width}" oninput="updateProp('width', +this.value)"></div>
-      <div class="field"><label>高度</label><input type="number" value="${n.height}" oninput="updateProp('height', +this.value)"></div>
-      <div class="field"><label>Z轴旋转</label><input type="number" value="${n.rotation || 0}" oninput="updateProp('rotation', +this.value)"></div>
-      <div class="field"><label>X轴倾角 (TiltX)</label><input type="number" value="${n.tiltX || 0}" oninput="updateProp('tiltX', +this.value)"></div>
+      <div class="field"><label>局部 X</label><input type="number" value="${n.x}" oninput="updateProp('x', +this.value, true)"></div>
+      <div class="field"><label>局部 Y</label><input type="number" value="${n.y}" oninput="updateProp('y', +this.value, true)"></div>
+      <div class="field"><label>空间高度 Z</label><input type="number" value="${n.z || 0}" oninput="updateProp('z', +this.value, true)"></div>
+      <div class="field"><label>节点标签 (Tag)</label><input value="${n.tag || 'default'}" onchange="updateProp('tag', this.value)"></div>
+      <div class="field"><label>宽度</label><input type="number" value="${n.width}" oninput="updateProp('width', +this.value, true)"></div>
+      <div class="field"><label>高度</label><input type="number" value="${n.height}" oninput="updateProp('height', +this.value, true)"></div>
+      <div class="field"><label>Z轴旋转</label><input type="number" value="${n.rotation || 0}" oninput="updateProp('rotation', +this.value, true)"></div>
+      <div class="field"><label>X轴倾角 (TiltX)</label><input type="number" value="${n.tiltX || 0}" oninput="updateProp('tiltX', +this.value, true)"></div>
       ${extraFields}
       <div class="field row"><input type="checkbox" ${n.billboard ? 'checked' : ''} onchange="updateProp('billboard', this.checked)"><label>HD-2D 立牌</label></div>
       <div class="field row"><input type="checkbox" ${n.shadowCaster ? 'checked' : ''} onchange="updateProp('shadowCaster', this.checked)"><label>投射阴影</label></div>
