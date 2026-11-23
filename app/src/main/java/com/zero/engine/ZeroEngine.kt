@@ -10,6 +10,7 @@ import android.opengl.GLSurfaceView
 import android.opengl.GLUtils
 import android.opengl.Matrix
 import org.json.JSONObject
+import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -99,7 +100,7 @@ open class Sprite2D(
     }
 }
 
-// ==================== 3. 序列帧动画节点（对标 Godot AnimatedSprite2D） ====================
+// ==================== 3. 序列帧动画节点 ====================
 class AnimatedSprite2D(
     name: String,
     width: Float = 100f,
@@ -113,32 +114,7 @@ class AnimatedSprite2D(
     var frame: Int = 0
     var playing: Boolean = true
     var loop: Boolean = true
-
     private var timer: Float = 0f
-    private val animations = mutableMapOf<String, List<Int>>()
-    private var currentAnimFrames: List<Int>? = null
-    private var currentAnimIndex: Int = 0
-
-    fun addAnimation(animName: String, frames: List<Int>) {
-        animations[animName] = frames
-    }
-
-    fun play(animName: String? = null, reset: Boolean = false) {
-        if (animName != null && animations.containsKey(animName)) {
-            val target = animations[animName]
-            if (currentAnimFrames !== target || reset) {
-                currentAnimFrames = target
-                currentAnimIndex = 0
-                frame = target?.firstOrNull() ?: 0
-                timer = 0f
-            }
-        }
-        playing = true
-    }
-
-    fun stop() {
-        playing = false
-    }
 
     override fun onProcess(delta: Float) {
         if (!playing || fps <= 0f) return
@@ -146,25 +122,10 @@ class AnimatedSprite2D(
         val frameDuration = 1f / fps
         if (timer >= frameDuration) {
             timer -= frameDuration
-            val custom = currentAnimFrames
-            if (custom != null && custom.isNotEmpty()) {
-                currentAnimIndex++
-                if (currentAnimIndex >= custom.size) {
-                    if (loop) currentAnimIndex = 0 else {
-                        currentAnimIndex = custom.size - 1
-                        playing = false
-                    }
-                }
-                frame = custom[currentAnimIndex]
-            } else {
-                val total = (hFrames * vFrames).coerceAtLeast(1)
-                frame++
-                if (frame >= total) {
-                    if (loop) frame = 0 else {
-                        frame = total - 1
-                        playing = false
-                    }
-                }
+            val total = (hFrames * vFrames).coerceAtLeast(1)
+            frame++
+            if (frame >= total) {
+                if (loop) frame = 0 else { frame = total - 1; playing = false }
             }
         }
     }
@@ -177,23 +138,11 @@ class AnimatedSprite2D(
         val row = (frame / cols) % rows
         val scaleU = 1f / cols
         val scaleV = 1f / rows
-        renderer.drawTexture(
-            assetPath = path,
-            x = globalX,
-            y = globalY,
-            width = width * scaleX,
-            height = height * scaleY,
-            rotationDeg = rotation,
-            alpha = a,
-            uvOffsetX = col * scaleU,
-            uvOffsetY = row * scaleV,
-            uvScaleX = scaleU,
-            uvScaleY = scaleV
-        )
+        renderer.drawTexture(path, globalX, globalY, width * scaleX, height * scaleY, rotation, a, col * scaleU, row * scaleV, scaleU, scaleV)
     }
 }
 
-// ==================== 4. 2D 相机与屏幕震动（对标 Godot Camera2D） ====================
+// ==================== 4. 2D 相机与屏幕震动 ====================
 class Camera2D(name: String = "Camera2D") : Node2D(name) {
     var enabled: Boolean = true
     var followTarget: Node2D? = null
@@ -226,7 +175,7 @@ class Camera2D(name: String = "Camera2D") : Node2D(name) {
     }
 }
 
-// ==================== 5. 碰撞体节点（对标 Godot CollisionShape2D） ====================
+// ==================== 5. 碰撞体节点 ====================
 class Collider2D(
     name: String,
     var width: Float,
@@ -243,7 +192,7 @@ class Collider2D(
     }
 }
 
-// ==================== 6. 双通道音频引擎（低延迟 SFX + 流式 BGM） ====================
+// ==================== 6. 双通道音频引擎 ====================
 object AudioEngine {
     private var soundPool: SoundPool? = null
     private val sfxMap = mutableMapOf<String, Int>()
@@ -255,19 +204,7 @@ object AudioEngine {
             .setUsage(AudioAttributes.USAGE_GAME)
             .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
             .build()
-        soundPool = SoundPool.Builder()
-            .setMaxStreams(12)
-            .setAudioAttributes(attrs)
-            .build()
-    }
-
-    fun loadSfx(context: Context, name: String, assetPath: String) {
-        init()
-        try {
-            val afd = context.assets.openFd(assetPath)
-            val id = soundPool?.load(afd, 1) ?: 0
-            if (id != 0) sfxMap[name] = id
-        } catch (_: Exception) {}
+        soundPool = SoundPool.Builder().setMaxStreams(12).setAudioAttributes(attrs).build()
     }
 
     fun playSfx(name: String, volume: Float = 1f, rate: Float = 1f) {
@@ -275,40 +212,23 @@ object AudioEngine {
         soundPool?.play(id, volume, volume, 1, 0, rate)
     }
 
-    fun playBgm(context: Context, assetPath: String, loop: Boolean = true, volume: Float = 0.7f) {
-        stopBgm()
-        try {
-            val afd = context.assets.openFd(assetPath)
-            bgmPlayer = MediaPlayer().apply {
-                setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
-                isLooping = loop
-                setVolume(volume, volume)
-                prepare()
-                start()
-            }
-        } catch (_: Exception) {}
-    }
-
-    fun stopBgm() {
-        try {
-            bgmPlayer?.stop()
-            bgmPlayer?.release()
-        } catch (_: Exception) {}
-        bgmPlayer = null
-    }
-
     fun release() {
-        stopBgm()
+        try { bgmPlayer?.stop(); bgmPlayer?.release() } catch (_: Exception) {}
+        bgmPlayer = null
         soundPool?.release()
         soundPool = null
         sfxMap.clear()
     }
 }
 
-// ==================== 7. JSON 数据驱动场景加载器（对标 .tscn） ====================
+// ==================== 7. JSON 场景加载器（支持文件与实时内存字符串） ====================
 object SceneLoader {
     fun loadFromAssets(context: Context, fileName: String, targetRoot: Node2D) {
         val jsonText = context.assets.open(fileName).bufferedReader().use { it.readText() }
+        loadFromString(jsonText, targetRoot)
+    }
+
+    fun loadFromString(jsonText: String, targetRoot: Node2D) {
         val rootObj = JSONObject(jsonText)
         val nodesArray = rootObj.getJSONArray("nodes")
 
@@ -322,15 +242,7 @@ object SceneLoader {
             val vFrames = item.optInt("vFrames", 1)
 
             val node: Sprite2D = if (tex.isNotEmpty() && (hFrames > 1 || vFrames > 1)) {
-                AnimatedSprite2D(
-                    name = name,
-                    width = w,
-                    height = h,
-                    texturePath = tex,
-                    hFrames = hFrames,
-                    vFrames = vFrames,
-                    fps = item.optDouble("fps", 10.0).toFloat()
-                )
+                AnimatedSprite2D(name, w, h, tex, hFrames, vFrames, item.optDouble("fps", 10.0).toFloat())
             } else {
                 Sprite2D(
                     name = name,
@@ -358,7 +270,7 @@ object SceneLoader {
     }
 }
 
-// ==================== 8. OpenGL ES 2.0 双管线硬件渲染器（支持 UV 切片与相机偏移） ====================
+// ==================== 8. OpenGL ES 2.0 双管线渲染器（优先读取手机本地导入的贴图） ====================
 class GLRenderer(private val context: Context, private val rootNode: Node2D) : GLSurfaceView.Renderer {
 
     private var colorProgram = 0
@@ -419,7 +331,6 @@ class GLRenderer(private val context: Context, private val rootNode: Node2D) : G
 
         rootNode.updateTree(delta)
 
-        // 计算相机视图矩阵（支持屏幕震动与跟随）
         Matrix.setIdentityM(viewMatrix, 0)
         val activeCam = rootNode.findNodesByType<Camera2D>().firstOrNull { it.enabled }
         if (activeCam != null) {
@@ -451,16 +362,8 @@ class GLRenderer(private val context: Context, private val rootNode: Node2D) : G
 
     fun drawTexture(
         assetPath: String,
-        x: Float,
-        y: Float,
-        width: Float,
-        height: Float,
-        rotationDeg: Float,
-        alpha: Float = 1f,
-        uvOffsetX: Float = 0f,
-        uvOffsetY: Float = 0f,
-        uvScaleX: Float = 1f,
-        uvScaleY: Float = 1f
+        x: Float, y: Float, width: Float, height: Float, rotationDeg: Float,
+        alpha: Float = 1f, uvOffsetX: Float = 0f, uvOffsetY: Float = 0f, uvScaleX: Float = 1f, uvScaleY: Float = 1f
     ) {
         val texId = getOrLoadTexture(assetPath)
         if (texId == 0) {
@@ -501,10 +404,17 @@ class GLRenderer(private val context: Context, private val rootNode: Node2D) : G
         Matrix.multiplyMM(mvpMatrix, 0, vpMatrix, 0, modelMatrix, 0)
     }
 
-    private fun getOrLoadTexture(assetPath: String): Int {
-        textureCache[assetPath]?.let { return it }
+    private fun getOrLoadTexture(path: String): Int {
+        textureCache[path]?.let { return it }
         return try {
-            val bitmap = context.assets.open(assetPath).use { BitmapFactory.decodeStream(it) } ?: return 0
+            // 优先从手机本地导入目录加载，找不到再从内置 assets 加载
+            val localFile = File(context.filesDir, "textures/$path")
+            val bitmap = if (localFile.exists()) {
+                BitmapFactory.decodeFile(localFile.absolutePath)
+            } else {
+                context.assets.open(path).use { BitmapFactory.decodeStream(it) }
+            } ?: return 0
+
             val texIds = IntArray(1)
             GLES20.glGenTextures(1, texIds, 0)
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texIds[0])
@@ -512,7 +422,7 @@ class GLRenderer(private val context: Context, private val rootNode: Node2D) : G
             GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
             GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0)
             bitmap.recycle()
-            textureCache[assetPath] = texIds[0]
+            textureCache[path] = texIds[0]
             texIds[0]
         } catch (e: Exception) {
             0
