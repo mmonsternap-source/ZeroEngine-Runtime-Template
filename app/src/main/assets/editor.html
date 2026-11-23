@@ -136,7 +136,7 @@
 <div class="modal-mask" id="inputModal">
   <div class="modal-card">
     <div class="modal-title" id="modalTitle">新建</div>
-    <input class="modal-input" id="modalInput" type="text" placeholder="请输入英文或数字名称...">
+    <input class="modal-input" id="modalInput" type="text" placeholder="请输入名称 (支持中文/英文/数字)...">
     <div class="modal-actions">
       <button onclick="closeInputModal()">取消</button>
       <button class="play" style="margin-left:0;" onclick="confirmInputModal()">确定创建</button>
@@ -144,7 +144,7 @@
   </div>
 </div>
 
-<!-- 存档文件夹位置弹窗（启动时与点击📂位置时共用的选择界面） -->
+<!-- 存档文件夹位置弹窗 -->
 <div class="modal-mask" id="pathModal">
   <div class="modal-card">
     <div class="modal-title" id="pathModalTitle">📂 选择 Save Project 文件夹位置</div>
@@ -517,9 +517,9 @@ function toggleCamMode() {
 }
 
 function openCreateProjectModal(withTemplate) {
-  openInputModal(withTemplate ? "新建模板工程 (英文/数字)" : "新建空白工程 (英文/数字)", "MyGame_" + (Date.now() % 1000), (name) => {
-    const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '');
-    if (!safeName) { showToast("请输入英文或数字名称"); return; }
+  openInputModal(withTemplate ? "新建模板工程 (支持中文/英文/数字)" : "新建空白工程 (支持中文/英文/数字)", "MyGame_" + (Date.now() % 1000), (name) => {
+    const safeName = name.replace(/[^\u4e00-\u9fa5a-zA-Z0-9_-]/g, '');
+    if (!safeName) { showToast("请输入有效的工程名称"); return; }
     if (window.ZeroBridge) {
       if (window.ZeroBridge.createNewProject) window.ZeroBridge.createNewProject(safeName, withTemplate);
       else window.ZeroBridge.setProject(safeName);
@@ -548,9 +548,9 @@ function switchProject(name) {
 }
 
 function openCreateSceneModal() {
-  openInputModal("新建场景文件 (英文/数字)", "level_" + (Date.now() % 100), (name) => {
-    const safeName = name.replace(/[^a-zA-Z0-9._-]/g, '');
-    if (!safeName) { showToast("请输入英文或数字文件名"); return; }
+  openInputModal("新建场景文件 (支持中文/英文/数字)", "level_" + (Date.now() % 100), (name) => {
+    const safeName = name.replace(/[^\u4e00-\u9fa5a-zA-Z0-9._-]/g, '');
+    if (!safeName) { showToast("请输入有效的场景文件名"); return; }
     currentScene = safeName.endsWith('.scene') ? safeName : safeName + '.scene';
     nodes = [];
     selectedIndex = -1;
