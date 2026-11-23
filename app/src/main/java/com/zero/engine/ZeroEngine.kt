@@ -43,14 +43,17 @@ open class Node2D(val name: String) {
 
     inline fun <reified T : Node2D> findNodesByType(): List<T> {
         val result = mutableListOf<T>()
-        collectNodes(result)
+        collectNodes(T::class.java, result)
         return result
     }
 
-    @PublishedApi
-    internal inline fun <reified T : Node2D> collectNodes(out: MutableList<T>) {
-        if (this is T) out.add(this)
-        for (i in children.indices) children[i].collectNodes(out)
+    fun <T : Node2D> collectNodes(clazz: Class<T>, out: MutableList<T>) {
+        if (clazz.isInstance(this)) {
+            clazz.cast(this)?.let { out.add(it) }
+        }
+        for (i in children.indices) {
+            children[i].collectNodes(clazz, out)
+        }
     }
 
     open fun onReady() {}
@@ -170,7 +173,6 @@ class GLRenderer(private val context: Context, private val rootNode: Node2D) : G
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES20.glClearColor(0.08f, 0.09f, 0.12f, 1.0f)
-        // 开启 PNG 透明通道混合
         GLES20.glEnable(GLES20.GL_BLEND)
         GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
 
