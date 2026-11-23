@@ -17,13 +17,13 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import java.io.File
 import kotlin.math.sin
 
 class MainActivity : Activity() {
 
     companion object {
-        // 【开发开关】true = 打开手机可视化编辑器；false = 打包成正式游戏直接运行
         const val EDITOR_MODE = true
     }
 
@@ -31,7 +31,6 @@ class MainActivity : Activity() {
     private var editorWebView: WebView? = null
     private var glView: GLSurfaceView? = null
     private var isPlaying = false
-
     private val PICK_IMAGE_CODE = 1001
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -61,14 +60,10 @@ class MainActivity : Activity() {
 
     inner class EngineBridge {
         @JavascriptInterface
-        fun runGame(sceneJson: String) {
-            runOnUiThread { startPlayMode(sceneJson) }
-        }
+        fun runGame(sceneJson: String) { runOnUiThread { startPlayMode(sceneJson) } }
 
         @JavascriptInterface
-        fun saveScene(sceneJson: String) {
-            File(filesDir, "saved_scene.json").writeText(sceneJson)
-        }
+        fun saveScene(sceneJson: String) { File(filesDir, "saved_scene.json").writeText(sceneJson) }
 
         @JavascriptInterface
         fun loadSavedScene(): String {
@@ -91,8 +86,7 @@ class MainActivity : Activity() {
         fun getTextureBase64(fileName: String): String {
             val file = File(filesDir, "textures/$fileName")
             if (!file.exists()) return ""
-            val bytes = file.readBytes()
-            val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+            val b64 = Base64.encodeToString(file.readBytes(), Base64.NO_WRAP)
             return "data:image/png;base64,$b64"
         }
     }
@@ -111,8 +105,7 @@ class MainActivity : Activity() {
 
             val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(destFile.absolutePath, opts)
-            val bytes = destFile.readBytes()
-            val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+            val b64 = Base64.encodeToString(destFile.readBytes(), Base64.NO_WRAP)
             val dataUrl = "data:image/png;base64,$b64"
 
             editorWebView?.evaluateJavascript(
@@ -122,7 +115,6 @@ class MainActivity : Activity() {
         }
     }
 
-    // ==================== 病毒感染核心玩法运行时 ====================
     @SuppressLint("ClickableViewAccessibility")
     private fun startPlayMode(sceneJson: String) {
         if (isPlaying) return
@@ -132,63 +124,157 @@ class MainActivity : Activity() {
         val camera = Camera2D("MainCamera").apply { x = 540f; y = 960f }
         rootNode.addChild(camera)
 
-        // 1. 加载编辑器里摆放的所有节点作为“细胞”
         SceneLoader.loadFromString(sceneJson, rootNode)
-        val cells = rootNode.findNodesByType<Sprite2D>()
-        val infectedSet = mutableSetOf<Sprite2D>()
-        var spreadTimer = 0f
+        val allSprites = rootNode.findNodesByType<Sprite2D>()
+
+        var score = 0
+        var moveLeft = false
+        var moveRight = false
+        var jumpRequested = false
+        var shootTimer = 0f
+        var virusTimer = 0f
         var pulseTime = 0f
+        val bullets = mutableListOf<Sprite2D>()
 
-        // 2. 顶部状态文字（实时显示感染百分比）
-        val statusLabel = Label2D("StatusLabel", "点击任意细胞投放病毒！", 48f, Color.parseColor("#34D399")).apply {
-            x = 260f
-            y = 120f
+        val hudLabel = Label2D("HUD", "得分: 0", 48f, Color.parseColor("#34D399")).apply {
+            x = 220f
+            y = 110f
         }
-        rootNode.addChild(statusLabel)
+        rootNode.addChild(hudLabel)
 
-        // 3. 病毒传播与呼吸动画控制器
-        val virusManager = object : Node2D("VirusManager") {
+        // 通用多类型游戏逻辑驱动器
+        val gameLoop = object : Node2D("UniversalGameLoop") {
             override fun onProcess(delta: Float) {
                 pulseTime += delta * 6f
-                // 已感染细胞产生红色呼吸脉冲效果
-                infectedSet.forEach { cell ->
-                    cell.r = 0.95f; cell.g = 0.2f; cell.b = 0.25f
-                    val s = 1f + 0.08f * sin(pulseTime)
-                    cell.scaleX = s
-                    cell.scaleY = s
+                val colliders = rootNode.findNodesByType<Collider2D>()
+                val virusCells = allSprites.filter { it.behavior == "virus" }
+
+                // 1. 更新所有实体行为
+                for (obj in allSprites) {
+                    if (!obj.visible) continue
+                    when (obj.behavior) {
+                        "patrol" -> {
+                            obj.x += obj.vx * delta
+                            if (obj.x > 960f) { obj.x = 960f; obj.vx = -240f }
+                            if (obj.x < 120f) { obj.x = 120f; obj.vx = 240f }
+                        }
+                        "platformer" -> {
+                            obj.vx = when {
+                                moveLeft -> -420f
+                                moveRight -> 420f
+                                else -> 0f
+                            }
+                            if (jumpRequested && obj.stateFlag) {
+                                obj.vy = -1050f
+                                obj.stateFlag = false
+                                jumpRequested = false
+                            }
+                            obj.vy += 2200f * delta // 重力加速度
+                            obj.x = (obj.x + obj.vx * delta).coerceIn(60f, 1020f)
+                            obj.y += obj.vy * delta
+
+                            // 地面与平台碰撞落地检测
+                            val myCol = obj.findNodesByType<Collider2D>().firstOrNull()
+                            if (myCol != null) {
+                                for (other in colliders) {
+                                    val parentSprite = other.parent as? Sprite2D ?: continue
+                                    if (parentSprite === obj || !parentSprite.visible) continue
+                                    if (myCol.intersects(other)) {
+                                        when (parentSprite.behavior) {
+                                            "coin" -> {
+                                                parentSprite.visible = false
+                                                score += 10
+                                                camera.shake(12f, 0.12f)
+                                            }
+                                            "patrol" -> {
+                                                // 碰到巡逻敌人，震屏重置回起点
+                                                camera.shake(28f, 0.25f)
+                                                obj.x = 260f; obj.y = 800f; obj.vy = 0f
+                                            }
+                                            else -> {
+                                                if (obj.vy > 0f) {
+                                                    obj.y = parentSprite.y - parentSprite.height / 2f - obj.height / 2f
+                                                    obj.vy = 0f
+                                                    obj.stateFlag = true
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if (obj.y > 1950f) { obj.x = 260f; obj.y = 800f; obj.vy = 0f }
+                        }
+                        "shooter" -> {
+                            shootTimer += delta
+                            if (shootTimer >= 0.45f) {
+                                shootTimer = 0f
+                                val b = Sprite2D("Bullet", 24f, 48f, r = 0.98f, g: 0.9f, b = 0.2f).apply {
+                                    x = obj.x; y = obj.y - obj.height / 2f - 20f
+                                    addChild(Collider2D("BCol", 24f, 48f, "bullet"))
+                                }
+                                bullets.add(b)
+                                rootNode.addChild(b)
+                            }
+                        }
+                        "virus" -> {
+                            if (obj.stateFlag) {
+                                obj.r = 0.95f; obj.g = 0.2f; obj.b = 0.25f
+                                val s = 1f + 0.08f * sin(pulseTime)
+                                obj.scaleX = s; obj.scaleY = s
+                            }
+                        }
+                    }
                 }
 
-                // 每隔 0.8 秒，已感染细胞向周围 420 像素内的健康细胞扩散病毒！
-                if (infectedSet.isNotEmpty() && infectedSet.size < cells.size) {
-                    spreadTimer += delta
-                    if (spreadTimer >= 0.8f) {
-                        spreadTimer = 0f
-                        val newlyInfected = mutableListOf<Sprite2D>()
-                        for (src in infectedSet) {
-                            for (target in cells) {
-                                if (target !in infectedSet && src.distanceTo(target) <= 420f) {
-                                    newlyInfected.add(target)
+                // 2. 子弹飞行与击中敌人检测
+                val bulletIter = bullets.iterator()
+                while (bulletIter.hasNext()) {
+                    val b = bulletIter.next()
+                    b.y -= 1100f * delta
+                    var hitEnemy = false
+                    val bCol = b.findNodesByType<Collider2D>().firstOrNull()
+                    if (bCol != null) {
+                        for (target in allSprites) {
+                            if (target.visible && target.behavior == "patrol") {
+                                val tCol = target.findNodesByType<Collider2D>().firstOrNull()
+                                if (tCol != null && bCol.intersects(tCol)) {
+                                    target.visible = false
+                                    hitEnemy = true
+                                    score += 50
+                                    camera.shake(22f, 0.2f)
+                                    break
                                 }
                             }
                         }
-                        if (newlyInfected.isNotEmpty()) {
-                            infectedSet.addAll(newlyInfected)
-                            camera.shake(14f, 0.15f)
-                        }
+                    }
+                    if (hitEnemy || b.y < -50f) {
+                        rootNode.removeChild(b)
+                        bulletIter.remove()
                     }
                 }
 
-                if (cells.isNotEmpty()) {
-                    val percent = (infectedSet.size * 100) / cells.size
-                    statusLabel.text = if (percent >= 100) {
-                        "全图感染完成！100%"
-                    } else {
-                        "感染进度: $percent% (${infectedSet.size}/${cells.size})"
+                // 3. 病毒传染扩散逻辑
+                if (virusCells.isNotEmpty()) {
+                    val infected = virusCells.filter { it.stateFlag }
+                    if (infected.isNotEmpty() && infected.size < virusCells.size) {
+                        virusTimer += delta
+                        if (virusTimer >= 0.8f) {
+                            virusTimer = 0f
+                            val nextWave = virusCells.filter { !it.stateFlag && infected.any { src -> src.distanceTo(it) <= 450f } }
+                            if (nextWave.isNotEmpty()) {
+                                nextWave.forEach { it.stateFlag = true }
+                                camera.shake(14f, 0.15f)
+                            }
+                        }
                     }
+                    val pct = (infected.size * 100) / virusCells.size
+                    hudLabel.text = if (infected.isEmpty()) "点击细胞投放病毒！" else "感染进度: $pct%"
+                } else {
+                    hudLabel.text = "得分: $score"
                 }
             }
         }
-        rootNode.addChild(virusManager)
+        rootNode.addChild(gameLoop)
 
         val surface = GLSurfaceView(this).apply {
             setEGLContextClientVersion(2)
@@ -196,11 +282,15 @@ class MainActivity : Activity() {
             renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
             setOnTouchListener { _, event ->
                 if (event.action == MotionEvent.ACTION_DOWN) {
-                    // 点击任意未感染细胞，投放初始病毒！
-                    val hitCell = cells.firstOrNull { it !in infectedSet && it.containsPoint(event.x, event.y) }
-                    if (hitCell != null) {
-                        infectedSet.add(hitCell)
-                        camera.shake(24f, 0.2f)
+                    // 点击触发病毒细胞感染
+                    allSprites.firstOrNull { it.behavior == "virus" && !it.stateFlag && it.containsPoint(event.x, event.y) }
+                        ?.let { it.stateFlag = true; camera.shake(22f, 0.2f) }
+                }
+                if (event.action == MotionEvent.ACTION_DOWN || event.action == MotionEvent.ACTION_MOVE) {
+                    // 拖动控制 drag / shooter 节点
+                    allSprites.filter { it.behavior == "drag" || it.behavior == "shooter" }.forEach {
+                        it.x = event.x
+                        it.y = event.y
                     }
                 }
                 true
@@ -211,6 +301,38 @@ class MainActivity : Activity() {
         container.removeAllViews()
         container.addView(surface)
 
+        // 如果场景里有横版跳跃主角，自动在屏幕底部生成虚拟方向键与跳跃键
+        if (allSprites.any { it.behavior == "platformer" }) {
+            val controls = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(40, 20, 40, 60)
+            }
+            fun makePadBtn(label: String, onState: (Boolean) -> Unit): Button {
+                return Button(this).apply {
+                    text = label
+                    textSize = 20f
+                    setBackgroundColor(Color.parseColor("#882B3142"))
+                    setTextColor(Color.WHITE)
+                    setOnTouchListener { _, ev ->
+                        if (ev.action == MotionEvent.ACTION_DOWN) onState(true)
+                        if (ev.action == MotionEvent.ACTION_UP || ev.action == MotionEvent.ACTION_CANCEL) onState(false)
+                        true
+                    }
+                }
+            }
+            controls.addView(makePadBtn("◀ 左") { moveLeft = it }, LinearLayout.LayoutParams(220, 150).apply { rightMargin = 24 })
+            controls.addView(makePadBtn("右 ▶") { moveRight = it }, LinearLayout.LayoutParams(220, 150))
+            val spacer = android.view.View(this)
+            controls.addView(spacer, LinearLayout.LayoutParams(0, 1, 1f))
+            controls.addView(makePadBtn("▲ 跳跃") { if (it) jumpRequested = true }, LinearLayout.LayoutParams(240, 150))
+
+            container.addView(controls, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM
+            ))
+        }
+
         if (EDITOR_MODE) {
             val stopBtn = Button(this).apply {
                 text = "■ 返回编辑"
@@ -218,15 +340,11 @@ class MainActivity : Activity() {
                 setTextColor(Color.WHITE)
                 setOnClickListener { stopPlayMode() }
             }
-            val btnParams = FrameLayout.LayoutParams(
+            container.addView(stopBtn, FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply {
-                gravity = Gravity.TOP or Gravity.END
-                topMargin = 48
-                rightMargin = 36
-            }
-            container.addView(stopBtn, btnParams)
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.END
+            ).apply { topMargin = 48; rightMargin = 36 })
         }
     }
 
@@ -244,18 +362,7 @@ class MainActivity : Activity() {
         if (EDITOR_MODE && isPlaying) stopPlayMode() else super.onBackPressed()
     }
 
-    override fun onResume() {
-        super.onResume()
-        glView?.onResume()
-    }
-
-    override fun onPause() {
-        super.onPause()
-        glView?.onPause()
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        AudioEngine.release()
-    }
+    override fun onResume() { super.onResume(); glView?.onResume() }
+    override fun onPause() { super.onPause(); glView?.onPause() }
+    override fun onDestroy() { super.onDestroy(); AudioEngine.release() }
 }
