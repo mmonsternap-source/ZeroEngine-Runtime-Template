@@ -7,7 +7,8 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.media.AudioAttributes
-import android.media.MediaPlayer
+import android.media.AudioFormat
+import android.media.AudioTrack
 import android.media.SoundPool
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
@@ -29,25 +30,23 @@ import javax.microedition.khronos.opengles.GL10
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.hypot
-import kotlin.math.max
-import kotlin.math.min
 import kotlin.math.sin
 import kotlin.random.Random
 
 // ==================== 1. 引擎调试控制台 ====================
 object EngineConsole {
     private val logs = mutableListOf<String>()
-    private const val MAX_LOGS = 80
+    private const val MAX_LOGS = 100
 
     @Synchronized
     fun log(msg: String) {
-        logs.add("[LOG] $msg")
+        logs.add("[INFO] $msg")
         if (logs.size > MAX_LOGS) logs.removeAt(0)
     }
 
     @Synchronized
     fun error(msg: String) {
-        logs.add("[ERR] $msg")
+        logs.add("[ERROR] $msg")
         if (logs.size > MAX_LOGS) logs.removeAt(0)
     }
 
@@ -72,7 +71,7 @@ object InputState {
     }
 }
 
-// ==================== 3. 层级节点树（支持父子变换继承） ====================
+// ==================== 3. 层级节点基类 ====================
 open class Node2D(@JvmField var name: String) {
     @JvmField var x: Float = 0f
     @JvmField var y: Float = 0f
@@ -91,14 +90,9 @@ open class Node2D(@JvmField var name: String) {
     internal var fnProcess: JsFunction? = null
     internal var fnInput: JsFunction? = null
 
-    val globalRotation: Float
-        get() = (parent?.globalRotation ?: 0f) + rotation
-
-    val globalScaleX: Float
-        get() = (parent?.globalScaleX ?: 1f) * scaleX
-
-    val globalScaleY: Float
-        get() = (parent?.globalScaleY ?: 1f) * scaleY
+    val globalRotation: Float get() = (parent?.globalRotation ?: 0f) + rotation
+    val globalScaleX: Float get() = (parent?.globalScaleX ?: 1f) * scaleX
+    val globalScaleY: Float get() = (parent?.globalScaleY ?: 1f) * scaleY
 
     val globalX: Float
         get() {
@@ -181,10 +175,11 @@ open class Node2D(@JvmField var name: String) {
         for (i in snapshot.indices) snapshot[i].collectNodes(clazz, out)
     }
 
+    open fun updateNode(delta: Float) {}
     open fun onDraw(renderer: GLRenderer) {}
 }
 
-// ==================== 4. 精灵节点 ====================
+// ==================== 4. 精灵节点（支持 SpriteSheet 帧动画 + 自定义 GLSL Shader） ====================
 open class Sprite2D(
     name: String,
     @JvmField var width: Float = 100f,
@@ -196,21 +191,83 @@ open class Sprite2D(
     @JvmField var a: Float = 1f
 ) : Node2D(name) {
 
-    fun containsPoint(px: Float, py: Float, padding: Float = 0f): Boolean {
-        val halfW = (width * globalScaleX) / 2f + padding
-        val halfH = (height * globalScaleY) / 2f + padding
-        return abs(px - globalX) <= halfW && abs(py - globalY) <= halfH
+    // SpriteSheet 序列帧参数
+    @JvmField var hFrames: Int = 1
+    @JvmField var vFrames: Int = 1
+    @JvmField var currentFrame: Int = 0
+    @JvmField var animStart: Int = 0
+    @JvmField var animEnd: Int = 0
+    @JvmField var animFps: Float = 12f
+    @JvmField var animPlaying: Boolean = false
+    @JvmField var animLoop: Boolean = true
+    private var animTimer: Float = 0f
+
+    // 自定义 GLSL Fragment Shader 代码
+    var fragmentShader: String = ""
+
+    fun playAnim(start: Int, end: Int, fps: Float = 12f, loop: Boolean = true) {
+        animStart = start
+        animEnd = end
+        animFps = fps
+        animLoop = loop
+        if (!animPlaying || currentFrame < start || currentFrame > end) {
+            currentFrame = start
+            animTimer = 0f
+        }
+        animPlaying = true
+    }
+
+    fun stopAnim() {
+        animPlaying = false
+    }
+
+    override fun updateNode(delta: Float) {
+        if (!animPlaying || animFps <= 0f) return
+        animTimer += delta
+        val step = 1f / animFps
+        if (animTimer >= step) {
+            animTimer -= step
+            currentFrame++
+            if (currentFrame > animEnd) {
+                if (animLoop) {
+                    currentFrame = animStart
+                } else {
+                    currentFrame = animEnd
+                    animPlaying = false
+                }
+            }
+        }
     }
 
     override fun onDraw(renderer: GLRenderer) {
         val w = width * globalScaleX
         val h = height * globalScaleY
-        val path = texturePath
-        if (!path.isNullOrEmpty()) {
-            renderer.drawTexture(path, globalX, globalY, w, h, globalRotation, a)
-        } else {
-            renderer.drawRect(globalX, globalY, w, h, globalRotation, r, g, b, a)
-        }
+        val hf = hFrames.coerceAtLeast(1)
+        val vf = vFrames.coerceAtLeast(1)
+        val total = hf * vf
+        val frameIdx = currentFrame.coerceIn(0, total - 1)
+        val col = frameIdx % hf
+        val row = frameIdx / hf
+        val uvScaleX = 1f / hf
+        val uvScaleY = 1f / vf
+        val uvOffsetX = col * uvScaleX
+        val uvOffsetY = row * uvScaleY
+
+        renderer.drawSprite(
+            assetPath = texturePath,
+            x = globalX,
+            y = globalY,
+            width = w,
+            height = h,
+            rotationDeg = globalRotation,
+            r = r, g = g, b = b, a = a,
+            uvOffsetX = uvOffsetX,
+            uvOffsetY = uvOffsetY,
+            uvScaleX = uvScaleX,
+            uvScaleY = uvScaleY,
+            customFragShader = fragmentShader,
+            nodeKey = name
+        )
     }
 }
 
@@ -229,6 +286,7 @@ class Label2D(
 // ==================== 6. 2D 相机 ====================
 class Camera2D(name: String = "Camera2D") : Node2D(name) {
     @JvmField var enabled: Boolean = true
+    @JvmField var zoom: Float = 1f
     @JvmField var followTarget: Node2D? = null
     @JvmField var followLerp: Float = 8f
 
@@ -259,7 +317,7 @@ class Camera2D(name: String = "Camera2D") : Node2D(name) {
     }
 }
 
-// ==================== 7. 碰撞体与触发器（Area2D / PhysicsBody） ====================
+// ==================== 7. 碰撞体与触发器 ====================
 class Collider2D(
     name: String,
     @JvmField var width: Float,
@@ -277,15 +335,78 @@ class Collider2D(
     }
 }
 
-// ==================== 8. 原生脚本虚拟机（Rhino Runtime） ====================
-class ScriptRuntime(private val rootNode: Node2D, private val camera: Camera2D) {
+// ==================== 8. 音频合成与音效总线 ====================
+object AudioEngine {
+    private var soundPool: SoundPool? = null
+    private val soundCache = mutableMapOf<String, Int>()
 
+    fun init() {
+        if (soundPool != null) return
+        val attrs = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_GAME)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
+        soundPool = SoundPool.Builder().setMaxStreams(12).setAudioAttributes(attrs).build()
+    }
+
+    fun playSfx(projectDir: File, fileName: String, volume: Float = 1f) {
+        val pool = soundPool ?: return
+        val file = File(projectDir, "audio/$fileName")
+        if (!file.exists()) return
+        val id = soundCache.getOrPut(file.absolutePath) { pool.load(file.absolutePath, 1) }
+        pool.play(id, volume, volume, 1, 0, 1f)
+    }
+
+    // 内置零资源依赖程序化合成音效（方便开发者直接测试打击/跳跃/警报音效）
+    fun playTone(freqHz: Float, durationMs: Int) {
+        Thread {
+            try {
+                val sampleRate = 22050
+                val numSamples = (durationMs * sampleRate) / 1000
+                val buffer = ShortArray(numSamples)
+                for (i in 0 until numSamples) {
+                    val env = 1f - (i.toFloat() / numSamples)
+                    val angle = 2.0 * Math.PI * i * freqHz / sampleRate
+                    buffer[i] = (sin(angle) * 16000.0 * env).toInt().toShort()
+                }
+                val track = AudioTrack.Builder()
+                    .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_GAME).build())
+                    .setAudioFormat(AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build())
+                    .setBufferSizeInBytes(buffer.size * 2)
+                    .setTransferMode(AudioTrack.MODE_STATIC)
+                    .build()
+                track.write(buffer, 0, buffer.size)
+                track.play()
+                Thread.sleep(durationMs.toLong() + 30L)
+                track.release()
+            } catch (_: Exception) {}
+        }.start()
+    }
+
+    fun release() {
+        soundPool?.release()
+        soundPool = null
+        soundCache.clear()
+    }
+}
+
+// ==================== 9. 原生脚本虚拟机（Rhino Runtime + 场景实例化） ====================
+class ScriptRuntime(
+    private val projectDir: File,
+    private val rootNode: Node2D,
+    private val camera: Camera2D
+) {
     private var jsContext: JsContext? = null
     private lateinit var baseScope: Scriptable
     private val signalListeners = mutableMapOf<String, MutableList<Pair<Scriptable, JsFunction>>>()
 
     inner class EngineBridgeAPI {
         fun log(msg: Any?) = EngineConsole.log(msg.toString())
+        fun getCamera(): Camera2D = camera
 
         fun getNode(name: String): Node2D? =
             rootNode.findNodesByType<Node2D>().firstOrNull { it.name == name }
@@ -294,8 +415,10 @@ class ScriptRuntime(private val rootNode: Node2D, private val camera: Camera2D) 
             rootNode.findNodesByType<Node2D>().filter { it.tag == tag }.toTypedArray()
 
         fun shake(intensity: Float, duration: Float) = camera.shake(intensity, duration)
-
         fun setCameraTarget(node: Node2D?) { camera.followTarget = node }
+
+        fun playSfx(fileName: String, volume: Float) = AudioEngine.playSfx(projectDir, fileName, volume)
+        fun playTone(freqHz: Float, durationMs: Int) = AudioEngine.playTone(freqHz, durationMs)
 
         fun moveAndSlide(node: Node2D, delta: Float): String =
             node.moveAndSlide(delta, rootNode.findNodesByType())
@@ -313,14 +436,11 @@ class ScriptRuntime(private val rootNode: Node2D, private val camera: Camera2D) 
             for (other in allCols) {
                 if (other === myCol) continue
                 val p = other.parent ?: continue
-                if ((filterTag.isEmpty() || p.tag == filterTag) && myCol.intersects(other)) {
-                    hits.add(p)
-                }
+                if ((filterTag.isEmpty() || p.tag == filterTag) && myCol.intersects(other)) hits.add(p)
             }
             return hits.toTypedArray()
         }
 
-        // 2D 射线检测（返回命中节点或 null）
         fun raycast(x1: Float, y1: Float, x2: Float, y2: Float, ignoreTag: String): Node2D? {
             val allCols = rootNode.findNodesByType<Collider2D>()
             var closestNode: Node2D? = null
@@ -339,16 +459,33 @@ class ScriptRuntime(private val rootNode: Node2D, private val camera: Camera2D) 
             return closestNode
         }
 
-        // 动态实例化节点（Prefab Spawn）
+        // 从项目工程加载子场景预制体（Prefab）
+        fun instantiate(sceneFileName: String, x: Float, y: Float): Node2D? {
+            val file = File(projectDir, "scenes/$sceneFileName")
+            if (!file.exists()) {
+                EngineConsole.error("找不到场景预制体: scenes/$sceneFileName")
+                return null
+            }
+            val container = Node2D("Prefab_${System.nanoTime() % 100000}").apply {
+                this.x = x
+                this.y = y
+            }
+            SceneLoader.loadFromString(file.readText(), container)
+            rootNode.addChild(container)
+            val spawnedNodes = container.findNodesByType<Node2D>()
+            for (n in spawnedNodes) compileNodeScript(n)
+            for (n in spawnedNodes) callLifecycle(n, n.fnReady, emptyArray())
+            return container
+        }
+
+        // 代码动态创建节点
         fun spawn(config: NativeObject, parentName: String): Node2D {
             val name = config.get("name", config)?.toString() ?: "Spawned_${System.nanoTime() % 10000}"
             val w = (config.get("width", config) as? Number)?.toFloat() ?: 60f
             val h = (config.get("height", config) as? Number)?.toFloat() ?: 60f
             val tex = (config.get("texture", config) as? String) ?: ""
             val sprite = Sprite2D(
-                name = name,
-                width = w,
-                height = h,
+                name = name, width = w, height = h,
                 texturePath = tex.ifEmpty { null },
                 r = (config.get("r", config) as? Number)?.toFloat() ?: 1f,
                 g = (config.get("g", config) as? Number)?.toFloat() ?: 1f,
@@ -360,9 +497,9 @@ class ScriptRuntime(private val rootNode: Node2D, private val camera: Camera2D) 
             sprite.rotation = (config.get("rotation", config) as? Number)?.toFloat() ?: 0f
             sprite.tag = (config.get("tag", config) as? String) ?: "spawned"
             sprite.script = (config.get("script", config) as? String) ?: ""
+            sprite.fragmentShader = (config.get("shader", config) as? String) ?: ""
 
-            val hasCollider = (config.get("collider", config) as? Boolean) ?: false
-            if (hasCollider) {
+            if ((config.get("collider", config) as? Boolean) == true) {
                 val isTrig = (config.get("isTrigger", config) as? Boolean) ?: false
                 sprite.addChild(Collider2D("${name}_Col", w, h, sprite.tag, isTrig))
             }
@@ -378,10 +515,8 @@ class ScriptRuntime(private val rootNode: Node2D, private val camera: Camera2D) 
             node?.parent?.removeChild(node)
         }
 
-        // Godot 风格信号系统
         fun on(signal: String, callback: JsFunction) {
-            val list = signalListeners.getOrPut(signal) { mutableListOf() }
-            list.add(baseScope to callback)
+            signalListeners.getOrPut(signal) { mutableListOf() }.add(baseScope to callback)
         }
 
         fun emit(signal: String, payload: Any?) {
@@ -399,7 +534,7 @@ class ScriptRuntime(private val rootNode: Node2D, private val camera: Camera2D) 
 
     fun init() {
         val cx = JsContext.enter()
-        cx.optimizationLevel = -1 // Android ART/Dalvik 必须禁用字节码生成
+        cx.optimizationLevel = -1
         jsContext = cx
         baseScope = cx.initStandardObjects()
 
@@ -426,16 +561,15 @@ class ScriptRuntime(private val rootNode: Node2D, private val camera: Camera2D) 
             node.fnProcess = scope.get("onProcess", scope) as? JsFunction
             node.fnInput = scope.get("onInput", scope) as? JsFunction
         } catch (e: Throwable) {
-            EngineConsole.error("[${node.name}] 编译失败: ${e.message}")
+            EngineConsole.error("[${node.name}] 脚本语法错误: ${e.message}")
         }
     }
 
     fun stepProcess(delta: Float) {
         val snapshot = rootNode.findNodesByType<Node2D>()
         for (node in snapshot) {
-            if (node.fnProcess != null) {
-                callLifecycle(node, node.fnProcess, arrayOf(delta))
-            }
+            node.updateNode(delta)
+            if (node.fnProcess != null) callLifecycle(node, node.fnProcess, arrayOf(delta))
         }
     }
 
@@ -480,19 +614,13 @@ class ScriptRuntime(private val rootNode: Node2D, private val camera: Camera2D) 
             floatArrayOf(dy, maxY - y1)
         )
         for (c in checks) {
-            val p = c[0]
-            val q = c[1]
+            val p = c[0]; val q = c[1]
             if (abs(p) < 1e-6f) {
                 if (q < 0f) return null
             } else {
                 val t = q / p
-                if (p < 0f) {
-                    if (t > t1) return null
-                    if (t > t0) t0 = t
-                } else {
-                    if (t < t0) return null
-                    if (t < t1) t1 = t
-                }
+                if (p < 0f) { if (t > t1) return null; if (t > t0) t0 = t }
+                else { if (t < t0) return null; if (t < t1) t1 = t }
             }
         }
         return if (t0 <= t1) t0 else null
@@ -507,29 +635,7 @@ class ScriptRuntime(private val rootNode: Node2D, private val camera: Camera2D) 
     }
 }
 
-// ==================== 9. 音频引擎 ====================
-object AudioEngine {
-    private var soundPool: SoundPool? = null
-    private var bgmPlayer: MediaPlayer? = null
-
-    fun init() {
-        if (soundPool != null) return
-        val attrs = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_GAME)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-            .build()
-        soundPool = SoundPool.Builder().setMaxStreams(12).setAudioAttributes(attrs).build()
-    }
-
-    fun release() {
-        try { bgmPlayer?.stop(); bgmPlayer?.release() } catch (_: Exception) {}
-        bgmPlayer = null
-        soundPool?.release()
-        soundPool = null
-    }
-}
-
-// ==================== 10. 层级场景序列化加载器 ====================
+// ==================== 10. 场景序列化加载器 ====================
 object SceneLoader {
     fun loadFromString(jsonText: String, targetRoot: Node2D) {
         val rootObj = JSONObject(jsonText)
@@ -554,15 +660,23 @@ object SceneLoader {
                 )
             } else {
                 Sprite2D(
-                    name = name,
-                    width = w,
-                    height = h,
+                    name = name, width = w, height = h,
                     texturePath = tex.ifEmpty { null },
                     r = item.optDouble("r", 1.0).toFloat(),
                     g = item.optDouble("g", 1.0).toFloat(),
                     b = item.optDouble("b", 1.0).toFloat(),
                     a = item.optDouble("a", 1.0).toFloat()
-                )
+                ).apply {
+                    hFrames = item.optInt("hFrames", 1).coerceAtLeast(1)
+                    vFrames = item.optInt("vFrames", 1).coerceAtLeast(1)
+                    currentFrame = item.optInt("currentFrame", 0)
+                    animStart = item.optInt("animStart", 0)
+                    animEnd = item.optInt("animEnd", 0)
+                    animFps = item.optDouble("animFps", 12.0).toFloat()
+                    animPlaying = item.optBoolean("animPlaying", false)
+                    animLoop = item.optBoolean("animLoop", true)
+                    fragmentShader = item.optString("shader", "")
+                }
             }
 
             node.x = item.optDouble("x", 0.0).toFloat()
@@ -580,38 +694,36 @@ object SceneLoader {
             }
 
             nodeMap[name] = node
-            val parentName = item.optString("parent", "")
-            parentLinks.add(node to parentName)
+            parentLinks.add(node to item.optString("parent", ""))
         }
 
-        // 重建父子层级关系
         for ((node, parentName) in parentLinks) {
             val parentNode = if (parentName.isNotEmpty()) nodeMap[parentName] else null
-            if (parentNode != null && parentNode !== node) {
-                parentNode.addChild(node)
-            } else {
-                targetRoot.addChild(node)
-            }
+            if (parentNode != null && parentNode !== node) parentNode.addChild(node)
+            else targetRoot.addChild(node)
         }
     }
 }
 
-// ==================== 11. OpenGL ES 2.0 硬件渲染管线 ====================
+// ==================== 11. OpenGL ES 2.0 硬件渲染管线（支持自定义 GLSL Shader） ====================
 class GLRenderer(
     private val context: Context,
+    private val projectDir: File,
     private val rootNode: Node2D,
     private val camera: Camera2D,
     private val scriptRuntime: ScriptRuntime
 ) : GLSurfaceView.Renderer {
 
-    private var colorProgram = 0
-    private var texProgram = 0
+    private var defaultProgram = 0
+    private var whiteTexId = 0
     private var lastFrameTime = System.nanoTime()
+    private var elapsedTime = 0f
     private var screenW = 1080f
     private var screenH = 1920f
 
     @Volatile var currentFps: Int = 60
     @Volatile var nodeCount: Int = 0
+    @Volatile var drawCalls: Int = 0
     private var fpsTimer = 0f
     private var fpsFrames = 0
 
@@ -622,6 +734,31 @@ class GLRenderer(
     private val modelMatrix = FloatArray(16)
     private val textureCache = mutableMapOf<String, Int>()
     private val textTextureCache = mutableMapOf<String, Triple<Int, Float, Float>>()
+    private val customShaderPrograms = mutableMapOf<String, Int>()
+
+    private val vertexShaderCode = """
+        uniform mat4 uMVPMatrix;
+        uniform vec2 uUVOffset;
+        uniform vec2 uUVScale;
+        attribute vec4 aPosition;
+        attribute vec2 aTexCoord;
+        varying vec2 vTexCoord;
+        void main() {
+            gl_Position = uMVPMatrix * aPosition;
+            vTexCoord = uUVOffset + aTexCoord * uUVScale;
+        }
+    """.trimIndent()
+
+    private val defaultFragmentShaderCode = """
+        precision mediump float;
+        uniform sampler2D uTexture;
+        uniform vec4 uColor;
+        uniform float uTime;
+        varying vec2 vTexCoord;
+        void main() {
+            gl_FragColor = texture2D(uTexture, vTexCoord) * uColor;
+        }
+    """.trimIndent()
 
     private val quadData = floatArrayOf(
         -0.5f, -0.5f, 0f, 0f,
@@ -632,7 +769,7 @@ class GLRenderer(
     private lateinit var vertexBuffer: FloatBuffer
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
-        GLES20.glClearColor(0.06f, 0.07f, 0.10f, 1.0f)
+        GLES20.glClearColor(0.05f, 0.07f, 0.10f, 1.0f)
         GLES20.glEnable(GLES20.GL_BLEND)
         GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
 
@@ -642,15 +779,18 @@ class GLRenderer(
             .put(quadData)
         vertexBuffer.position(0)
 
-        colorProgram = buildProgram(
-            "uniform mat4 uMVPMatrix; attribute vec4 aPosition; void main() { gl_Position = uMVPMatrix * aPosition; }",
-            "precision mediump float; uniform vec4 uColor; void main() { gl_FragColor = uColor; }"
-        )
+        // 生成 1x1 纯白默认纹理，使纯色矩形与贴图统一走同一个 Shader 管线
+        val ids = IntArray(1)
+        GLES20.glGenTextures(1, ids, 0)
+        whiteTexId = ids[0]
+        val whiteBmp = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.WHITE) }
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, whiteTexId)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_NEAREST)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_NEAREST)
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, whiteBmp, 0)
+        whiteBmp.recycle()
 
-        texProgram = buildProgram(
-            "uniform mat4 uMVPMatrix; uniform vec2 uUVOffset; uniform vec2 uUVScale; attribute vec4 aPosition; attribute vec2 aTexCoord; varying vec2 vTexCoord; void main() { gl_Position = uMVPMatrix * aPosition; vTexCoord = uUVOffset + aTexCoord * uUVScale; }",
-            "precision mediump float; uniform sampler2D uTexture; uniform float uAlpha; varying vec2 vTexCoord; void main() { vec4 c = texture2D(uTexture, vTexCoord); gl_FragColor = vec4(c.rgb, c.a * uAlpha); }"
-        )
+        defaultProgram = buildProgram(vertexShaderCode, defaultFragmentShaderCode, "DefaultShader")
         scriptRuntime.init()
         lastFrameTime = System.nanoTime()
     }
@@ -666,6 +806,7 @@ class GLRenderer(
         val now = System.nanoTime()
         val delta = ((now - lastFrameTime) / 1_000_000_000.0).toFloat().coerceIn(0.0001f, 0.05f)
         lastFrameTime = now
+        elapsedTime += delta
 
         fpsTimer += delta
         fpsFrames++
@@ -675,44 +816,44 @@ class GLRenderer(
             fpsFrames = 0
         }
 
-        // 1. 执行所有节点脚本的 onProcess(delta)
         scriptRuntime.stepProcess(delta)
         camera.updateCamera(delta)
         InputState.endFrame()
 
-        // 2. 更新相机矩阵
         Matrix.setIdentityM(viewMatrix, 0)
         if (camera.enabled) {
-            val offsetX = -(camera.globalX + camera.shakeOffsetX) + screenW / 2f
-            val offsetY = -(camera.globalY + camera.shakeOffsetY) + screenH / 2f
-            Matrix.translateM(viewMatrix, 0, offsetX, offsetY, 0f)
+            val z = camera.zoom.coerceIn(0.1f, 10f)
+            Matrix.translateM(viewMatrix, 0, screenW / 2f, screenH / 2f, 0f)
+            Matrix.scaleM(viewMatrix, 0, z, z, 1f)
+            Matrix.translateM(viewMatrix, 0, -(camera.globalX + camera.shakeOffsetX), -(camera.globalY + camera.shakeOffsetY), 0f)
         }
         Matrix.multiplyMM(vpMatrix, 0, projectionMatrix, 0, viewMatrix, 0)
 
-        // 3. 按 Z-Index 排序渲染可见节点
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        drawCalls = 0
         val allNodes = rootNode.findNodesByType<Node2D>()
         nodeCount = allNodes.size
         val renderList = allNodes.filter { it.visible }.sortedBy { it.zIndex }
-        for (i in renderList.indices) {
-            renderList[i].onDraw(this)
-        }
+        for (i in renderList.indices) renderList[i].onDraw(this)
     }
 
-    fun drawRect(x: Float, y: Float, width: Float, height: Float, rotationDeg: Float, r: Float, g: Float, b: Float, a: Float = 1f) {
-        GLES20.glUseProgram(colorProgram)
-        computeMVP(x, y, width, height, rotationDeg)
-
-        vertexBuffer.position(0)
-        val posHandle = GLES20.glGetAttribLocation(colorProgram, "aPosition")
-        GLES20.glEnableVertexAttribArray(posHandle)
-        GLES20.glVertexAttribPointer(posHandle, 2, GLES20.GL_FLOAT, false, 16, vertexBuffer)
-
-        GLES20.glUniform4f(GLES20.glGetUniformLocation(colorProgram, "uColor"), r, g, b, a)
-        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(colorProgram, "uMVPMatrix"), 1, false, mvpMatrix, 0)
-
-        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-        GLES20.glDisableVertexAttribArray(posHandle)
+    fun drawSprite(
+        assetPath: String?,
+        x: Float, y: Float, width: Float, height: Float, rotationDeg: Float,
+        r: Float, g: Float, b: Float, a: Float,
+        uvOffsetX: Float, uvOffsetY: Float, uvScaleX: Float, uvScaleY: Float,
+        customFragShader: String, nodeKey: String
+    ) {
+        val texId = if (!assetPath.isNullOrEmpty()) getOrLoadTexture(assetPath) else whiteTexId
+        val prog = if (customFragShader.isNotBlank()) {
+            customShaderPrograms.getOrPut(customFragShader) {
+                val p = buildProgram(vertexShaderCode, customFragShader, nodeKey)
+                if (p != 0) p else defaultProgram
+            }
+        } else {
+            defaultProgram
+        }
+        drawQuad(prog, texId, x, y, width, height, rotationDeg, r, g, b, a, uvOffsetX, uvOffsetY, uvScaleX, uvScaleY)
     }
 
     fun drawText(text: String, x: Float, y: Float, fontSize: Float, color: Int) {
@@ -726,8 +867,7 @@ class GLRenderer(
             val tw = (paint.measureText(text) + 24f).toInt().coerceAtLeast(32)
             val th = (fontSize * 1.5f).toInt().coerceAtLeast(32)
             val bmp = Bitmap.createBitmap(tw, th, Bitmap.Config.ARGB_8888)
-            val canvas = Canvas(bmp)
-            canvas.drawText(text, 12f, fontSize * 1.1f, paint)
+            Canvas(bmp).drawText(text, 12f, fontSize * 1.1f, paint)
 
             val ids = IntArray(1)
             GLES20.glGenTextures(1, ids, 0)
@@ -738,87 +878,92 @@ class GLRenderer(
             bmp.recycle()
             Triple(ids[0], tw.toFloat(), th.toFloat())
         }
-        drawRawTexture(texId, x, y, w, h, 0f, 1f, 0f, 0f, 1f, 1f)
+        drawQuad(defaultProgram, texId, x, y, w, h, 0f, 1f, 1f, 1f, 1f, 0f, 0f, 1f, 1f)
     }
 
-    fun drawTexture(
-        assetPath: String,
-        x: Float, y: Float, width: Float, height: Float, rotationDeg: Float,
-        alpha: Float = 1f, uvOffsetX: Float = 0f, uvOffsetY: Float = 0f, uvScaleX: Float = 1f, uvScaleY: Float = 1f
+    private fun drawQuad(
+        program: Int, texId: Int, x: Float, y: Float, width: Float, height: Float, rotationDeg: Float,
+        r: Float, g: Float, b: Float, a: Float,
+        uvOffsetX: Float, uvOffsetY: Float, uvScaleX: Float, uvScaleY: Float
     ) {
-        val texId = getOrLoadTexture(assetPath)
-        if (texId == 0) {
-            drawRect(x, y, width, height, rotationDeg, 1f, 0f, 1f, alpha)
-            return
-        }
-        drawRawTexture(texId, x, y, width, height, rotationDeg, alpha, uvOffsetX, uvOffsetY, uvScaleX, uvScaleY)
-    }
-
-    private fun drawRawTexture(
-        texId: Int, x: Float, y: Float, width: Float, height: Float, rotationDeg: Float,
-        alpha: Float, uvOffsetX: Float, uvOffsetY: Float, uvScaleX: Float, uvScaleY: Float
-    ) {
-        GLES20.glUseProgram(texProgram)
-        computeMVP(x, y, width, height, rotationDeg)
+        GLES20.glUseProgram(program)
+        Matrix.setIdentityM(modelMatrix, 0)
+        Matrix.translateM(modelMatrix, 0, x, y, 0f)
+        if (rotationDeg != 0f) Matrix.rotateM(modelMatrix, 0, rotationDeg, 0f, 0f, 1f)
+        Matrix.scaleM(modelMatrix, 0, width, height, 1f)
+        Matrix.multiplyMM(mvpMatrix, 0, vpMatrix, 0, modelMatrix, 0)
 
         vertexBuffer.position(0)
-        val posHandle = GLES20.glGetAttribLocation(texProgram, "aPosition")
-        GLES20.glEnableVertexAttribArray(posHandle)
-        GLES20.glVertexAttribPointer(posHandle, 2, GLES20.GL_FLOAT, false, 16, vertexBuffer)
+        val posHandle = GLES20.glGetAttribLocation(program, "aPosition")
+        if (posHandle >= 0) {
+            GLES20.glEnableVertexAttribArray(posHandle)
+            GLES20.glVertexAttribPointer(posHandle, 2, GLES20.GL_FLOAT, false, 16, vertexBuffer)
+        }
 
         vertexBuffer.position(2)
-        val texHandle = GLES20.glGetAttribLocation(texProgram, "aTexCoord")
-        GLES20.glEnableVertexAttribArray(texHandle)
-        GLES20.glVertexAttribPointer(texHandle, 2, GLES20.GL_FLOAT, false, 16, vertexBuffer)
+        val texHandle = GLES20.glGetAttribLocation(program, "aTexCoord")
+        if (texHandle >= 0) {
+            GLES20.glEnableVertexAttribArray(texHandle)
+            GLES20.glVertexAttribPointer(texHandle, 2, GLES20.GL_FLOAT, false, 16, vertexBuffer)
+        }
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId)
-        GLES20.glUniform1i(GLES20.glGetUniformLocation(texProgram, "uTexture"), 0)
-        GLES20.glUniform1f(GLES20.glGetUniformLocation(texProgram, "uAlpha"), alpha)
-        GLES20.glUniform2f(GLES20.glGetUniformLocation(texProgram, "uUVOffset"), uvOffsetX, uvOffsetY)
-        GLES20.glUniform2f(GLES20.glGetUniformLocation(texProgram, "uUVScale"), uvScaleX, uvScaleY)
-        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(texProgram, "uMVPMatrix"), 1, false, mvpMatrix, 0)
+
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(program, "uTexture"), 0)
+        GLES20.glUniform4f(GLES20.glGetUniformLocation(program, "uColor"), r, g, b, a)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "uTime"), elapsedTime)
+        GLES20.glUniform2f(GLES20.glGetUniformLocation(program, "uUVOffset"), uvOffsetX, uvOffsetY)
+        GLES20.glUniform2f(GLES20.glGetUniformLocation(program, "uUVScale"), uvScaleX, uvScaleY)
+        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(program, "uMVPMatrix"), 1, false, mvpMatrix, 0)
 
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-        GLES20.glDisableVertexAttribArray(posHandle)
-        GLES20.glDisableVertexAttribArray(texHandle)
-    }
+        drawCalls++
 
-    private fun computeMVP(x: Float, y: Float, w: Float, h: Float, rot: Float) {
-        Matrix.setIdentityM(modelMatrix, 0)
-        Matrix.translateM(modelMatrix, 0, x, y, 0f)
-        if (rot != 0f) Matrix.rotateM(modelMatrix, 0, rot, 0f, 0f, 1f)
-        Matrix.scaleM(modelMatrix, 0, w, h, 1f)
-        Matrix.multiplyMM(mvpMatrix, 0, vpMatrix, 0, modelMatrix, 0)
+        if (posHandle >= 0) GLES20.glDisableVertexAttribArray(posHandle)
+        if (texHandle >= 0) GLES20.glDisableVertexAttribArray(texHandle)
     }
 
     private fun getOrLoadTexture(path: String): Int {
         textureCache[path]?.let { return it }
         return try {
-            val localFile = File(context.filesDir, "textures/$path")
+            val localFile = File(projectDir, "textures/$path")
             val bitmap = if (localFile.exists()) {
                 BitmapFactory.decodeFile(localFile.absolutePath)
             } else {
                 context.assets.open(path).use { BitmapFactory.decodeStream(it) }
-            } ?: return 0
+            } ?: return whiteTexId
 
             val texIds = IntArray(1)
             GLES20.glGenTextures(1, texIds, 0)
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texIds[0])
-            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
-            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_NEAREST)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_NEAREST)
             GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0)
             bitmap.recycle()
             textureCache[path] = texIds[0]
             texIds[0]
-        } catch (e: Exception) {
-            0
+        } catch (_: Exception) {
+            whiteTexId
         }
     }
 
-    private fun buildProgram(vCode: String, fCode: String): Int {
-        val v = GLES20.glCreateShader(GLES20.GL_VERTEX_SHADER).also { GLES20.glShaderSource(it, vCode); GLES20.glCompileShader(it) }
-        val f = GLES20.glCreateShader(GLES20.GL_FRAGMENT_SHADER).also { GLES20.glShaderSource(it, fCode); GLES20.glCompileShader(it) }
+    private fun buildProgram(vCode: String, fCode: String, label: String): Int {
+        val v = GLES20.glCreateShader(GLES20.GL_VERTEX_SHADER).also {
+            GLES20.glShaderSource(it, vCode)
+            GLES20.glCompileShader(it)
+        }
+        val f = GLES20.glCreateShader(GLES20.GL_FRAGMENT_SHADER).also {
+            GLES20.glShaderSource(it, fCode)
+            GLES20.glCompileShader(it)
+        }
+        val status = IntArray(1)
+        GLES20.glGetShaderiv(f, GLES20.GL_COMPILE_STATUS, status, 0)
+        if (status[0] == 0) {
+            val err = GLES20.glGetShaderInfoLog(f)
+            EngineConsole.error("[$label] GLSL Shader 编译错误:\n$err")
+            return 0
+        }
         return GLES20.glCreateProgram().also {
             GLES20.glAttachShader(it, v)
             GLES20.glAttachShader(it, f)

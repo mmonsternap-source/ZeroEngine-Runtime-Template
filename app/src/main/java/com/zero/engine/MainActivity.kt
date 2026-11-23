@@ -22,12 +22,12 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import org.json.JSONArray
 import java.io.File
 
 class MainActivity : Activity() {
 
     companion object {
-        // true = 启动完整移动端 IDE 编辑器；false = 打包为纯粹的正式发行版游戏
         const val EDITOR_MODE = true
     }
 
@@ -40,10 +40,22 @@ class MainActivity : Activity() {
     private val uiHandler = Handler(Looper.getMainLooper())
     private var profilerTask: Runnable? = null
 
+    private var currentProject: String = "DefaultProject"
+
+    private fun getProjectDir(projName: String = currentProject): File {
+        return File(filesDir, "projects/$projName").apply {
+            File(this, "scenes").mkdirs()
+            File(this, "textures").mkdirs()
+            File(this, "audio").mkdirs()
+        }
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        AudioEngine.init()
+        getProjectDir()
 
         container = FrameLayout(this)
         setContentView(container)
@@ -67,16 +79,44 @@ class MainActivity : Activity() {
 
     inner class EngineBridge {
         @JavascriptInterface
-        fun runGame(sceneJson: String) { runOnUiThread { startPlayMode(sceneJson) } }
+        fun listProjects(): String {
+            val root = File(filesDir, "projects").apply { mkdirs() }
+            val names = root.listFiles()?.filter { it.isDirectory }?.map { it.name } ?: listOf("DefaultProject")
+            return JSONArray(names.ifEmpty { listOf("DefaultProject") }).toString()
+        }
 
         @JavascriptInterface
-        fun saveScene(sceneJson: String) { File(filesDir, "saved_scene.json").writeText(sceneJson) }
+        fun setProject(projName: String) {
+            val safe = projName.replace(Regex("[^a-zA-Z0-9_-]"), "").ifEmpty { "DefaultProject" }
+            currentProject = safe
+            getProjectDir(safe)
+        }
 
         @JavascriptInterface
-        fun loadSavedScene(): String {
-            val f = File(filesDir, "saved_scene.json")
+        fun getCurrentProject(): String = currentProject
+
+        @JavascriptInterface
+        fun listScenes(): String {
+            val dir = File(getProjectDir(), "scenes")
+            val list = dir.listFiles()?.filter { it.name.endsWith(".scene") }?.map { it.name } ?: emptyList()
+            return JSONArray(if (list.isEmpty()) listOf("main.scene") else list).toString()
+        }
+
+        @JavascriptInterface
+        fun saveSceneFile(sceneFileName: String, sceneJson: String) {
+            val safeName = if (sceneFileName.endsWith(".scene")) sceneFileName else "$sceneFileName.scene"
+            File(getProjectDir(), "scenes/$safeName").writeText(sceneJson)
+        }
+
+        @JavascriptInterface
+        fun loadSceneFile(sceneFileName: String): String {
+            val safeName = if (sceneFileName.endsWith(".scene")) sceneFileName else "$sceneFileName.scene"
+            val f = File(getProjectDir(), "scenes/$safeName")
             return if (f.exists()) f.readText() else ""
         }
+
+        @JavascriptInterface
+        fun runGame(sceneJson: String) { runOnUiThread { startPlayMode(sceneJson) } }
 
         @JavascriptInterface
         fun getConsoleLogs(): String = EngineConsole.dump()
@@ -97,7 +137,7 @@ class MainActivity : Activity() {
 
         @JavascriptInterface
         fun getTextureBase64(fileName: String): String {
-            val file = File(filesDir, "textures/$fileName")
+            val file = File(getProjectDir(), "textures/$fileName")
             if (!file.exists()) return ""
             val b64 = Base64.encodeToString(file.readBytes(), Base64.NO_WRAP)
             return "data:image/png;base64,$b64"
@@ -108,8 +148,8 @@ class MainActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == PICK_IMAGE_CODE && resultCode == RESULT_OK) {
             val uri: Uri = data?.data ?: return
-            val texDir = File(filesDir, "textures").apply { mkdirs() }
-            val fileName = "tex_${System.currentTimeMillis()}.png"
+            val texDir = File(getProjectDir(), "textures").apply { mkdirs() }
+            val fileName = "tex_${System.currentTimeMillis() % 100000}.png"
             val destFile = File(texDir, fileName)
 
             contentResolver.openInputStream(uri)?.use { input ->
@@ -133,17 +173,18 @@ class MainActivity : Activity() {
         if (isPlaying) return
         isPlaying = true
         EngineConsole.clear()
-        EngineConsole.log("Runtime initialized.")
+        EngineConsole.log("Project [$currentProject] Runtime started.")
 
+        val projDir = getProjectDir()
         val rootNode = Node2D("Root")
         val camera = Camera2D("MainCamera").apply { x = 540f; y = 960f }
         rootNode.addChild(camera)
 
         SceneLoader.loadFromString(sceneJson, rootNode)
 
-        val runtime = ScriptRuntime(rootNode, camera)
+        val runtime = ScriptRuntime(projDir, rootNode, camera)
         scriptRuntime = runtime
-        val renderer = GLRenderer(this, rootNode, camera, runtime)
+        val renderer = GLRenderer(this, projDir, rootNode, camera, runtime)
 
         val surface = GLSurfaceView(this).apply {
             setEGLContextClientVersion(2)
@@ -182,7 +223,6 @@ class MainActivity : Activity() {
         container.addView(surface)
 
         if (EDITOR_MODE) {
-            // 顶部开发者调试栏（FPS / 节点数 / 控制台预览 / 停止按钮）
             val hudOverlay = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 setPadding(24, 48, 24, 12)
@@ -194,7 +234,7 @@ class MainActivity : Activity() {
             }
 
             val profilerText = TextView(this).apply {
-                text = "FPS: 60 | Nodes: 0"
+                text = "FPS: 60 | Nodes: 0 | DC: 0"
                 textSize = 12f
                 typeface = Typeface.MONOSPACE
                 setTextColor(Color.parseColor("#34D399"))
@@ -203,7 +243,7 @@ class MainActivity : Activity() {
             }
 
             val stopBtn = Button(this).apply {
-                text = "■ 停止运行"
+                text = "■ 停止"
                 textSize = 12f
                 setBackgroundColor(Color.parseColor("#CCEF4444"))
                 setTextColor(Color.WHITE)
@@ -235,9 +275,8 @@ class MainActivity : Activity() {
             profilerTask = object : Runnable {
                 override fun run() {
                     if (!isPlaying) return
-                    profilerText.text = "FPS: ${renderer.currentFps} | Nodes: ${renderer.nodeCount}"
-                    val logs = EngineConsole.dump().lines().takeLast(3).joinToString("\n")
-                    liveConsole.text = logs
+                    profilerText.text = "FPS: ${renderer.currentFps} | Nodes: ${renderer.nodeCount} | DC: ${renderer.drawCalls}"
+                    liveConsole.text = EngineConsole.dump().lines().takeLast(3).joinToString("\n")
                     uiHandler.postDelayed(this, 300)
                 }
             }
