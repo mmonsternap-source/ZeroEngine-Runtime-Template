@@ -242,7 +242,7 @@ class MainActivity : Activity() {
         if (isPlaying) return
         isPlaying = true
         consoleLogs.clear()
-        appendConsoleLog("[SYSTEM] Project [$currentProject] v0.4 Runtime started.")
+        appendConsoleLog("[SYSTEM] Project [$currentProject] v0.5-Alpha Runtime started.")
 
         val projDir = getProjectDir()
         val surface = ZeroEngineView(
@@ -274,8 +274,8 @@ class MainActivity : Activity() {
             }
 
             val statusText = TextView(this).apply {
-                text = "ZeroEngine v0.4 | 2.5D + Anim + Audio"
-                textSize = 12f
+                text = "ZeroEngine v0.5-Alpha | GPU Particles + Shadows + Tween"
+                textSize = 11f
                 typeface = Typeface.MONOSPACE
                 setTextColor(Color.parseColor("#34D399"))
                 setBackgroundColor(Color.parseColor("#AA0F172A"))

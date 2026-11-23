@@ -46,9 +46,31 @@ class ZeroEngineView(
         val loop: Boolean
     )
 
+    data class Particle(
+        var active: Boolean = false,
+        var x: Float = 0f,
+        var y: Float = 0f,
+        var vx: Float = 0f,
+        var vy: Float = 0f,
+        var size: Float = 12f,
+        var life: Float = 0f,
+        var maxLife: Float = 1f,
+        var alpha: Float = 1f
+    )
+
+    data class TweenTask(
+        val node: GameNode,
+        val prop: String,
+        val startVal: Float,
+        val targetVal: Float,
+        val duration: Float,
+        val ease: String,
+        var elapsed: Float = 0f
+    )
+
     data class GameNode(
         var name: String,
-        var nodeType: String = "Sprite2D", // Sprite2D | Label2D | PointLight
+        var nodeType: String = "Sprite2D", // Sprite2D | Label2D | PointLight | ParticleEmitter
         var layer: String = "World",       // World | UI
         var parent: String = "",
         var tag: String = "default",
@@ -58,8 +80,8 @@ class ZeroEngineView(
         var width: Float = 120f,
         var height: Float = 120f,
         var rotation: Float = 0f,
-        var tiltX: Float = 0f,             // -90f = 平铺地面, 0f = 垂直立牌
-        var billboard: Boolean = false,    // 2.5D模式下自动面向摄像机
+        var tiltX: Float = 0f,
+        var billboard: Boolean = false,
         var scaleX: Float = 1f,
         var scaleY: Float = 1f,
         var zIndex: Int = 0,
@@ -71,8 +93,11 @@ class ZeroEngineView(
         var g: Float = 1f,
         var b: Float = 1f,
         var a: Float = 1f,
+        var flashTimer: Float = 0f,
         var lightRadius: Float = 450f,
         var lightIntensity: Float = 1.4f,
+        var shadowCaster: Boolean = false,
+        var shadowLength: Float = 260f,
         var collider: Boolean = false,
         var isTrigger: Boolean = false,
         var hFrames: Int = 1,
@@ -86,6 +111,14 @@ class ZeroEngineView(
         var animTimer: Float = 0f,
         var currentClipName: String = "",
         val clips: MutableMap<String, AnimClip> = mutableMapOf(),
+        // 原生 GPU 粒子池参数
+        var emitRate: Float = 24f,
+        var particleLife: Float = 1.1f,
+        var particleSpeed: Float = 160f,
+        var particleSize: Float = 16f,
+        var particleGravity: Float = -60f,
+        var emitAccum: Float = 0f,
+        val particles: Array<Particle> = Array(240) { Particle() },
         var vx: Float = 0f,
         var vy: Float = 0f,
         var vz: Float = 0f,
@@ -98,6 +131,7 @@ class ZeroEngineView(
     private val nodes = mutableListOf<GameNode>()
     private val pendingAdd = mutableListOf<GameNode>()
     private val pendingRemove = mutableSetOf<GameNode>()
+    private val activeTweens = mutableListOf<TweenTask>()
     private val textureCache = ConcurrentHashMap<String, Int>()
     private val textTextureCache = ConcurrentHashMap<String, Int>()
     private val eventListeners = mutableMapOf<String, MutableList<Function>>()
@@ -127,8 +161,8 @@ class ZeroEngineView(
     private var shakeTimer = 0f
 
     // 环境光
-    private var ambientR = 0.55f
-    private var ambientG = 0.58f
+    private var ambientR = 0.52f
+    private var ambientG = 0.56f
     private var ambientB = 0.68f
 
     // 触控输入状态
@@ -216,6 +250,7 @@ class ZeroEngineView(
 
         updateCameraMatrices(dt)
         updateWorldTouchFromScreen()
+        updateTweens(dt)
 
         flushTouchEvents()
         if (pendingAdd.isNotEmpty()) {
@@ -227,7 +262,11 @@ class ZeroEngineView(
 
         nodes.toList().forEach { n ->
             if (!pendingRemove.contains(n)) {
+                if (n.flashTimer > 0f) n.flashTimer = max(0f, n.flashTimer - dt)
                 updateSpriteAnimation(n, dt)
+                if (n.nodeType == "ParticleEmitter") {
+                    updateParticleEmitter(n, dt)
+                }
                 callLifecycle(n, "onProcess", dt)
             }
         }
@@ -237,7 +276,6 @@ class ZeroEngineView(
             pendingRemove.clear()
         }
 
-        // 收集最多 8 盏动态点光源
         val lights = nodes.filter { it.visible && it.nodeType == "PointLight" }.take(8)
         val lightPosArr = FloatArray(8 * 4)
         val lightColArr = FloatArray(8 * 4)
@@ -254,16 +292,217 @@ class ZeroEngineView(
         }
 
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
+
+        // 1. 先渲染实时动态 2D 阴影（基于灯光位置与 shadowCaster 节点）
+        val casters = nodes.filter { it.visible && it.layer != "UI" && it.shadowCaster && it.nodeType != "PointLight" }
+        if (lights.isNotEmpty() && casters.isNotEmpty()) {
+            for (caster in casters) {
+                renderDynamicShadow(caster, lights, vpMatrix)
+            }
+        }
+
+        // 2. 渲染世界空间节点与 GPU 粒子
         val worldNodes = nodes.filter { it.visible && it.layer != "UI" && it.nodeType != "PointLight" }
             .sortedWith(compareBy({ it.zIndex }, { it.tiltX >= -45f }, { getGlobalTransform(it).gy }))
 
         for (n in worldNodes) {
-            renderNode(n, vpMatrix, isWorld = true, lights.size, lightPosArr, lightColArr)
+            if (n.nodeType == "ParticleEmitter") {
+                renderParticles(n, vpMatrix, isWorld = true)
+            } else {
+                renderNode(n, vpMatrix, isWorld = true, lights.size, lightPosArr, lightColArr)
+            }
         }
 
+        // 3. 渲染固定屏幕 UI 层
         val uiNodes = nodes.filter { it.visible && it.layer == "UI" }.sortedBy { it.zIndex }
         for (n in uiNodes) {
-            renderNode(n, uiVpMatrix, isWorld = false, 0, lightPosArr, lightColArr)
+            if (n.nodeType == "ParticleEmitter") {
+                renderParticles(n, uiVpMatrix, isWorld = false)
+            } else {
+                renderNode(n, uiVpMatrix, isWorld = false, 0, lightPosArr, lightColArr)
+            }
+        }
+    }
+
+    private fun renderDynamicShadow(caster: GameNode, lights: List<GameNode>, activeVp: FloatArray) {
+        val cg = getGlobalTransform(caster)
+        val cw = caster.width * abs(cg.gSx)
+        val ch = caster.height * abs(cg.gSy)
+        val prog = defaultLitProgram
+        GLES20.glUseProgram(prog)
+
+        val posLoc = GLES20.glGetAttribLocation(prog, "aPosition")
+        val uvLoc = GLES20.glGetAttribLocation(prog, "aTexCoord")
+        quadBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(posLoc)
+        GLES20.glVertexAttribPointer(posLoc, 3, GLES20.GL_FLOAT, false, 20, quadBuffer)
+        quadBuffer.position(3)
+        GLES20.glEnableVertexAttribArray(uvLoc)
+        GLES20.glVertexAttribPointer(uvLoc, 2, GLES20.GL_FLOAT, false, 20, quadBuffer)
+
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uEnableLight"), 0)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uFlash"), 0f)
+        GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uUvRect"), 0f, 0f, 1f, 1f)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, whiteTexId)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uTexture"), 0)
+
+        for (light in lights) {
+            val lg = getGlobalTransform(light)
+            val dx = cg.gx - lg.gx
+            val dy = cg.gy - lg.gy
+            val dist = hypot(dx, dy)
+            if (dist < 1f || dist > light.lightRadius) continue
+            val nx = dx / dist
+            val ny = dy / dist
+            val atten = (1f - dist / light.lightRadius).coerceIn(0f, 1f)
+            val sLen = max(cw, ch) * 1.15f * atten
+            val sx = cg.gx + nx * (sLen * 0.5f + cw * 0.35f)
+            val sy = cg.gy + ny * (sLen * 0.5f + ch * 0.35f)
+            val angleDeg = Math.toDegrees(atan2(ny.toDouble(), nx.toDouble())).toFloat() - 90f
+
+            Matrix.setIdentityM(modelMatrix, 0)
+            Matrix.translateM(modelMatrix, 0, sx, sy, cg.gz - 0.5f)
+            Matrix.rotateM(modelMatrix, 0, angleDeg, 0f, 0f, 1f)
+            Matrix.scaleM(modelMatrix, 0, cw * 0.9f, sLen, 1f)
+            Matrix.multiplyMM(mvpMatrix, 0, activeVp, 0, modelMatrix, 0)
+
+            GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uMVP"), 1, false, mvpMatrix, 0)
+            GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uModel"), 1, false, modelMatrix, 0)
+            GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uColor"), 0.02f, 0.03f, 0.06f, 0.52f * atten)
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        }
+
+        GLES20.glDisableVertexAttribArray(posLoc)
+        GLES20.glDisableVertexAttribArray(uvLoc)
+    }
+
+    private fun spawnSingleParticle(n: GameNode, gx: Float, gy: Float) {
+        val slot = n.particles.firstOrNull { !it.active } ?: n.particles.first()
+        val angle = Math.random() * Math.PI * 2.0
+        val spd = n.particleSpeed * (0.35 + Math.random() * 0.85).toFloat()
+        slot.active = true
+        slot.x = gx + ((Math.random() - 0.5) * n.width * 0.4).toFloat()
+        slot.y = gy + ((Math.random() - 0.5) * n.height * 0.4).toFloat()
+        slot.vx = (cos(angle) * spd).toFloat()
+        slot.vy = (sin(angle) * spd).toFloat()
+        slot.size = n.particleSize * (0.6 + Math.random() * 0.8).toFloat()
+        slot.maxLife = max(0.15f, n.particleLife * (0.7 + Math.random() * 0.6).toFloat())
+        slot.life = slot.maxLife
+        slot.alpha = n.a
+    }
+
+    private fun updateParticleEmitter(n: GameNode, dt: Float) {
+        val gt = getGlobalTransform(n)
+        if (n.emitRate > 0f) {
+            n.emitAccum += dt * n.emitRate
+            while (n.emitAccum >= 1f) {
+                n.emitAccum -= 1f
+                spawnSingleParticle(n, gt.gx, gt.gy)
+            }
+        }
+        for (p in n.particles) {
+            if (!p.active) continue
+            p.life -= dt
+            if (p.life <= 0f) {
+                p.active = false
+                continue
+            }
+            p.vy += n.particleGravity * dt
+            p.x += p.vx * dt
+            p.y += p.vy * dt
+        }
+    }
+
+    private fun renderParticles(n: GameNode, activeVp: FloatArray, isWorld: Boolean) {
+        val gt = getGlobalTransform(n)
+        val prog = defaultLitProgram
+        GLES20.glUseProgram(prog)
+        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE)
+
+        val posLoc = GLES20.glGetAttribLocation(prog, "aPosition")
+        val uvLoc = GLES20.glGetAttribLocation(prog, "aTexCoord")
+        quadBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(posLoc)
+        GLES20.glVertexAttribPointer(posLoc, 3, GLES20.GL_FLOAT, false, 20, quadBuffer)
+        quadBuffer.position(3)
+        GLES20.glEnableVertexAttribArray(uvLoc)
+        GLES20.glVertexAttribPointer(uvLoc, 2, GLES20.GL_FLOAT, false, 20, quadBuffer)
+
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uEnableLight"), 0)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uFlash"), 0f)
+        GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uUvRect"), 0f, 0f, 1f, 1f)
+
+        val texId = if (n.texture.isNotEmpty()) getImageTexture(n.texture) else whiteTexId
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uTexture"), 0)
+
+        for (p in n.particles) {
+            if (!p.active) continue
+            val ratio = (p.life / p.maxLife).coerceIn(0f, 1f)
+            val curSize = p.size * (0.25f + 0.75f * ratio)
+            Matrix.setIdentityM(modelMatrix, 0)
+            Matrix.translateM(modelMatrix, 0, p.x, p.y, gt.gz + 4f)
+            if (isWorld && camMode == "2.5D") {
+                Matrix.rotateM(modelMatrix, 0, -90f + camPitch * 0.65f, 1f, 0f, 0f)
+            }
+            Matrix.scaleM(modelMatrix, 0, curSize, curSize, 1f)
+            Matrix.multiplyMM(mvpMatrix, 0, activeVp, 0, modelMatrix, 0)
+
+            GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uMVP"), 1, false, mvpMatrix, 0)
+            GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uModel"), 1, false, modelMatrix, 0)
+            GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uColor"), n.r, n.g, n.b, p.alpha * ratio)
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        }
+
+        GLES20.glDisableVertexAttribArray(posLoc)
+        GLES20.glDisableVertexAttribArray(uvLoc)
+        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+    }
+
+    private fun updateTweens(dt: Float) {
+        if (activeTweens.isEmpty()) return
+        val iter = activeTweens.iterator()
+        while (iter.hasNext()) {
+            val t = iter.next()
+            t.elapsed += dt
+            val rawP = (t.elapsed / max(0.01f, t.duration)).coerceIn(0f, 1f)
+            val easedP = when (t.ease) {
+                "easeOut" -> 1f - (1f - rawP).pow(2)
+                "easeInOut" -> if (rawP < 0.5f) 2f * rawP * rawP else 1f - (-2f * rawP + 2f).pow(2) / 2f
+                else -> rawP
+            }
+            val curVal = t.startVal + (t.targetVal - t.startVal) * easedP
+            applyTweenProperty(t.node, t.prop, curVal)
+            if (rawP >= 1f) iter.remove()
+        }
+    }
+
+    private fun applyTweenProperty(n: GameNode, prop: String, v: Float) {
+        when (prop) {
+            "x" -> n.x = v
+            "y" -> n.y = v
+            "z" -> n.z = v
+            "scaleX" -> n.scaleX = v
+            "scaleY" -> n.scaleY = v
+            "rotation" -> n.rotation = v
+            "a" -> n.a = v.coerceIn(0f, 1f)
+            "lightIntensity" -> n.lightIntensity = v
+        }
+    }
+
+    private fun readTweenProperty(n: GameNode, prop: String): Float {
+        return when (prop) {
+            "x" -> n.x
+            "y" -> n.y
+            "z" -> n.z
+            "scaleX" -> n.scaleX
+            "scaleY" -> n.scaleY
+            "rotation" -> n.rotation
+            "a" -> n.a
+            "lightIntensity" -> n.lightIntensity
+            else -> 0f
         }
     }
 
@@ -376,6 +615,8 @@ class ZeroEngineView(
         GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uModel"), 1, false, modelMatrix, 0)
         GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uColor"), n.r, n.g, n.b, n.a)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uTime"), engineTime)
+        val flashVal = if (n.flashTimer > 0f) (n.flashTimer * 8f).coerceIn(0f, 1f) else 0f
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uFlash"), flashVal)
 
         val hf = max(1, n.hFrames)
         val vf = max(1, n.vFrames)
@@ -532,14 +773,28 @@ class ZeroEngineView(
             obj
         })
         ScriptableObject.putProperty(engineApi, "setAmbientLight", jsFunc { args ->
-            ambientR = (args.getOrNull(0) as? Number)?.toFloat() ?: 0.55f
-            ambientG = (args.getOrNull(1) as? Number)?.toFloat() ?: 0.58f
+            ambientR = (args.getOrNull(0) as? Number)?.toFloat() ?: 0.52f
+            ambientG = (args.getOrNull(1) as? Number)?.toFloat() ?: 0.56f
             ambientB = (args.getOrNull(2) as? Number)?.toFloat() ?: 0.68f
             null
         })
         ScriptableObject.putProperty(engineApi, "shake", jsFunc { args ->
             shakeIntensity = (args.getOrNull(0) as? Number)?.toFloat() ?: 12f
             shakeTimer = (args.getOrNull(1) as? Number)?.toFloat() ?: 0.15f
+            null
+        })
+        // 缓动补间：Engine.tween(target, prop, toVal, duration, ease)
+        ScriptableObject.putProperty(engineApi, "tween", jsFunc { args ->
+            val targetObj = args.getOrNull(0) as? Scriptable ?: return@jsFunc null
+            val prop = RhinoContext.toString(args.getOrNull(1) ?: "")
+            val toVal = (args.getOrNull(2) as? Number)?.toFloat() ?: return@jsFunc null
+            val dur = (args.getOrNull(3) as? Number)?.toFloat() ?: 0.25f
+            val ease = RhinoContext.toString(args.getOrNull(4) ?: "easeOut")
+            val n = nodes.find { it.jsObj === targetObj } ?: return@jsFunc null
+            syncFromJs(n)
+            val startVal = readTweenProperty(n, prop)
+            activeTweens.removeAll { it.node === n && it.prop == prop }
+            activeTweens.add(TweenTask(n, prop, startVal, toVal, dur, ease))
             null
         })
         ScriptableObject.putProperty(engineApi, "playTone", jsFunc { args ->
@@ -596,6 +851,7 @@ class ZeroEngineView(
                 a = getJsFloat(cfg, "a", 1f),
                 collider = getJsBool(cfg, "collider", false),
                 isTrigger = getJsBool(cfg, "isTrigger", false),
+                shadowCaster = getJsBool(cfg, "shadowCaster", false),
                 lightRadius = getJsFloat(cfg, "lightRadius", 400f),
                 lightIntensity = getJsFloat(cfg, "lightIntensity", 1.5f),
                 script = getJsStr(cfg, "script", "")
@@ -671,7 +927,6 @@ class ZeroEngineView(
         n.jsObj = selfObj
         syncToJs(n)
 
-        // 命名动画状态机播放：self.play("run")
         ScriptableObject.putProperty(selfObj, "play", jsFunc { args ->
             val clipName = RhinoContext.toString(args.getOrNull(0) ?: "")
             val forceRestart = (args.getOrNull(1) as? Boolean) ?: false
@@ -693,7 +948,6 @@ class ZeroEngineView(
             }
             null
         })
-        // 兼容旧版帧号播放：self.playAnim(start, end, fps, loop)
         ScriptableObject.putProperty(selfObj, "playAnim", jsFunc { args ->
             n.currentClipName = ""
             n.animStart = (args.getOrNull(0) as? Number)?.toInt() ?: 0
@@ -708,6 +962,18 @@ class ZeroEngineView(
         ScriptableObject.putProperty(selfObj, "stopAnim", jsFunc {
             n.animPlaying = false
             n.currentClipName = ""
+            null
+        })
+        // 受击闪白：self.flash(duration)
+        ScriptableObject.putProperty(selfObj, "flash", jsFunc { args ->
+            n.flashTimer = (args.getOrNull(0) as? Number)?.toFloat() ?: 0.12f
+            null
+        })
+        // 粒子爆发：self.emitBurst(count)
+        ScriptableObject.putProperty(selfObj, "emitBurst", jsFunc { args ->
+            val count = ((args.getOrNull(0) as? Number)?.toInt() ?: 24).coerceIn(1, 120)
+            val gt = getGlobalTransform(n)
+            repeat(count) { spawnSingleParticle(n, gt.gx, gt.gy) }
             null
         })
         ScriptableObject.putProperty(nodeScope, "self", selfObj)
@@ -815,7 +1081,6 @@ class ZeroEngineView(
 
         n.z += n.vz * dt
 
-        // 触发实体碰撞回调 onCollision(other)
         for (other in collidedSolids) {
             if (!pendingRemove.contains(n) && !pendingRemove.contains(other)) {
                 callLifecycle(n, "onCollision", other.jsObj)
@@ -823,7 +1088,6 @@ class ZeroEngineView(
             }
         }
 
-        // 检测触发器重叠并触发回调 onTriggerEnter(other)
         if (n.collider) {
             for (other in nodes.toList()) {
                 if (other !== n && other.visible && other.collider && other.layer == n.layer) {
@@ -964,6 +1228,7 @@ class ZeroEngineView(
                     a = o.optDouble("a", 1.0).toFloat(),
                     lightRadius = o.optDouble("lightRadius", 450.0).toFloat(),
                     lightIntensity = o.optDouble("lightIntensity", 1.4).toFloat(),
+                    shadowCaster = o.optBoolean("shadowCaster", false),
                     collider = o.optBoolean("collider", false),
                     isTrigger = o.optBoolean("isTrigger", false),
                     hFrames = o.optInt("hFrames", 1),
@@ -971,6 +1236,11 @@ class ZeroEngineView(
                     currentFrame = o.optInt("currentFrame", 0),
                     animFps = o.optDouble("animFps", 12.0).toFloat(),
                     clips = clipMap,
+                    emitRate = o.optDouble("emitRate", 24.0).toFloat(),
+                    particleLife = o.optDouble("particleLife", 1.1).toFloat(),
+                    particleSpeed = o.optDouble("particleSpeed", 160.0).toFloat(),
+                    particleSize = o.optDouble("particleSize", 16.0).toFloat(),
+                    particleGravity = o.optDouble("particleGravity", -60.0).toFloat(),
                     shader = o.optString("shader", ""),
                     script = o.optString("script", "")
                 )
@@ -991,7 +1261,6 @@ class ZeroEngineView(
         }
     }
 
-    // ==================== OpenGL 纹理与着色器编译 ====================
     private fun getImageTexture(fileName: String): Int {
         textureCache[fileName]?.let { return it }
         val file = File(File(projectDir, "textures"), fileName)
@@ -1123,6 +1392,7 @@ class ZeroEngineView(
             precision mediump float;
             uniform sampler2D uTexture;
             uniform vec4 uColor;
+            uniform float uFlash;
             uniform int uEnableLight;
             uniform vec3 uAmbient;
             uniform int uLightCount;
@@ -1133,20 +1403,21 @@ class ZeroEngineView(
             void main() {
                 vec4 base = texture2D(uTexture, vTexCoord) * uColor;
                 if (base.a < 0.01) discard;
-                if (uEnableLight == 0) {
-                    gl_FragColor = base;
-                    return;
+                vec3 litRgb = base.rgb;
+                if (uEnableLight != 0) {
+                    vec3 totalLight = uAmbient;
+                    for (int i = 0; i < 8; i++) {
+                        if (i >= uLightCount) break;
+                        float dist = distance(vWorldPos.xy, uLightPos[i].xy);
+                        float radius = max(1.0, uLightPos[i].w);
+                        float atten = clamp(1.0 - (dist / radius), 0.0, 1.0);
+                        atten = atten * atten;
+                        totalLight += uLightColor[i].rgb * atten;
+                    }
+                    litRgb = base.rgb * totalLight;
                 }
-                vec3 totalLight = uAmbient;
-                for (int i = 0; i < 8; i++) {
-                    if (i >= uLightCount) break;
-                    float dist = distance(vWorldPos.xy, uLightPos[i].xy);
-                    float radius = max(1.0, uLightPos[i].w);
-                    float atten = clamp(1.0 - (dist / radius), 0.0, 1.0);
-                    atten = atten * atten;
-                    totalLight += uLightColor[i].rgb * atten;
-                }
-                gl_FragColor = vec4(base.rgb * totalLight, base.a);
+                vec3 finalRgb = mix(litRgb, vec3(1.0, 1.0, 1.0), clamp(uFlash, 0.0, 1.0));
+                gl_FragColor = vec4(finalRgb, base.a);
             }
         """
     }
