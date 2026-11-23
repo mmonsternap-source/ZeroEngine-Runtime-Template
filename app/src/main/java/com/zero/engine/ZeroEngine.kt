@@ -144,9 +144,16 @@ class ZeroEngineView(
         var animTimer: Float = 0f,
         var currentClipName: String = "",
         val clips: MutableMap<String, AnimClip> = mutableMapOf(),
-        // TileMap 稀疏瓦片数据
+        // TileMap 稀疏瓦片数据 + P0 静态 VBO 缓存
         var tileSize: Float = 90f,
         val tiles: MutableList<TileCell> = mutableListOf(),
+        var tileVboId: Int = 0,
+        var tileVertexCount: Int = 0,
+        var tileDirty: Boolean = true,
+        var tileMinX: Float = 0f,
+        var tileMaxX: Float = 0f,
+        var tileMinY: Float = 0f,
+        var tileMaxY: Float = 0f,
         // 原生 GPU 粒子池参数
         var emitRate: Float = 24f,
         var particleLife: Float = 1.1f,
@@ -164,13 +171,117 @@ class ZeroEngineView(
         var customProgram: Int = 0
     )
 
+    // ==================== P0：零拷贝 JS 属性代理（彻底消灭 syncToJs/syncFromJs） ====================
+    private inner class GameNodeJsProxy(val n: GameNode) : ScriptableObject() {
+        override fun getClassName() = "GameNode"
+
+        override fun has(name: String?, start: Scriptable?): Boolean {
+            if (name != null && name in BRIDGED_PROPS) return true
+            return super.has(name, start)
+        }
+
+        override fun get(name: String?, start: Scriptable?): Any? {
+            return when (name) {
+                "name" -> n.name
+                "tag" -> n.tag
+                "x" -> n.x.toDouble()
+                "y" -> n.y.toDouble()
+                "z" -> n.z.toDouble()
+                "vx" -> n.vx.toDouble()
+                "vy" -> n.vy.toDouble()
+                "vz" -> n.vz.toDouble()
+                "width" -> n.width.toDouble()
+                "height" -> n.height.toDouble()
+                "rotation" -> n.rotation.toDouble()
+                "tiltX" -> n.tiltX.toDouble()
+                "scaleX" -> n.scaleX.toDouble()
+                "scaleY" -> n.scaleY.toDouble()
+                "parallaxX" -> n.parallaxX.toDouble()
+                "parallaxY" -> n.parallaxY.toDouble()
+                "slopeType" -> n.slopeType
+                "bodyMode" -> n.bodyMode
+                "gravity" -> n.gravity.toDouble()
+                "fallMultiplier" -> n.fallMultiplier.toDouble()
+                "maxJumps" -> n.maxJumps
+                "isGrounded" -> n.isGrounded
+                "isHitbox" -> n.isHitbox
+                "isHurtbox" -> n.isHurtbox
+                "damage" -> n.damage.toDouble()
+                "invulnTimer" -> n.invulnTimer.toDouble()
+                "r" -> n.r.toDouble()
+                "g" -> n.g.toDouble()
+                "b" -> n.b.toDouble()
+                "a" -> n.a.toDouble()
+                "visible" -> n.visible
+                "text" -> n.text
+                "currentClip" -> n.currentClipName
+                "lightRadius" -> n.lightRadius.toDouble()
+                "lightIntensity" -> n.lightIntensity.toDouble()
+                else -> super.get(name, start)
+            }
+        }
+
+        override fun put(name: String?, start: Scriptable?, value: Any?) {
+            when (name) {
+                "tag" -> n.tag = toJsStr(value, n.tag)
+                "x" -> n.x = toJsFloat(value, n.x)
+                "y" -> n.y = toJsFloat(value, n.y)
+                "z" -> n.z = toJsFloat(value, n.z)
+                "vx" -> n.vx = toJsFloat(value, n.vx)
+                "vy" -> n.vy = toJsFloat(value, n.vy)
+                "vz" -> n.vz = toJsFloat(value, n.vz)
+                "width" -> n.width = toJsFloat(value, n.width)
+                "height" -> n.height = toJsFloat(value, n.height)
+                "rotation" -> n.rotation = toJsFloat(value, n.rotation)
+                "tiltX" -> n.tiltX = toJsFloat(value, n.tiltX)
+                "scaleX" -> n.scaleX = toJsFloat(value, n.scaleX)
+                "scaleY" -> n.scaleY = toJsFloat(value, n.scaleY)
+                "parallaxX" -> n.parallaxX = toJsFloat(value, n.parallaxX)
+                "parallaxY" -> n.parallaxY = toJsFloat(value, n.parallaxY)
+                "slopeType" -> n.slopeType = toJsStr(value, n.slopeType)
+                "bodyMode" -> n.bodyMode = toJsStr(value, n.bodyMode)
+                "gravity" -> n.gravity = toJsFloat(value, n.gravity)
+                "fallMultiplier" -> n.fallMultiplier = toJsFloat(value, n.fallMultiplier)
+                "maxJumps" -> n.maxJumps = toJsInt(value, n.maxJumps)
+                "isHitbox" -> n.isHitbox = toJsBool(value, n.isHitbox)
+                "isHurtbox" -> n.isHurtbox = toJsBool(value, n.isHurtbox)
+                "damage" -> n.damage = toJsFloat(value, n.damage)
+                "invulnTimer" -> n.invulnTimer = toJsFloat(value, n.invulnTimer)
+                "r" -> n.r = toJsFloat(value, n.r)
+                "g" -> n.g = toJsFloat(value, n.g)
+                "b" -> n.b = toJsFloat(value, n.b)
+                "a" -> n.a = toJsFloat(value, n.a)
+                "visible" -> n.visible = toJsBool(value, n.visible)
+                "text" -> n.text = toJsStr(value, n.text)
+                "lightRadius" -> n.lightRadius = toJsFloat(value, n.lightRadius)
+                "lightIntensity" -> n.lightIntensity = toJsFloat(value, n.lightIntensity)
+                "name", "isGrounded", "currentClip" -> Unit // 引擎只读属性
+                else -> super.put(name, start, value)
+            }
+        }
+    }
+
     private val nodes = mutableListOf<GameNode>()
     private val pendingAdd = mutableListOf<GameNode>()
     private val pendingRemove = mutableSetOf<GameNode>()
     private val activeTweens = mutableListOf<TweenTask>()
     private val textureCache = ConcurrentHashMap<String, Int>()
-    private val textTextureCache = ConcurrentHashMap<String, Int>()
     private val eventListeners = mutableMapOf<String, MutableList<Function>>()
+
+    // P0：有界 LRU 文字纹理缓存（超出上限自动释放 GPU 显存，杜绝内存泄漏）
+    private val maxTextTextures = 64
+    private val textTextureCache = object : LinkedHashMap<String, Int>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Int>?): Boolean {
+            if (size > maxTextTextures && eldest != null) {
+                val texId = eldest.value
+                if (texId != 0 && texId != whiteTexId) {
+                    GLES20.glDeleteTextures(1, intArrayOf(texId), 0)
+                }
+                return true
+            }
+            return false
+        }
+    }
 
     // 跨关卡内存数据与异步场景切换
     private val globalDataStore = ConcurrentHashMap<String, Any?>()
@@ -189,7 +300,7 @@ class ZeroEngineView(
         .build()
     private val sfxCache = ConcurrentHashMap<String, Int>()
 
-    // 2D / 2.5D 摄像机状态
+    // 2D / 2.5D 摄像机状态与 P0 视锥边界
     private var camMode = "2.5D"
     private var camX = 540f
     private var camY = 960f
@@ -209,6 +320,18 @@ class ZeroEngineView(
     private var camMaxY = 99999f
     private var shakeIntensity = 0f
     private var shakeTimer = 0f
+
+    private var viewMinX = -99999f
+    private var viewMaxX = 99999f
+    private var viewMinY = -99999f
+    private var viewMaxY = 99999f
+
+    // P0：实时性能统计（供 Engine.getStats() 查询）
+    private var smoothedFps = 60f
+    private var frameDrawCalls = 0
+    private var lastFrameDrawCalls = 0
+    private var frameCulled = 0
+    private var lastFrameCulled = 0
 
     // 全局顿帧与时间缩放
     private var hitstopTimer = 0f
@@ -287,6 +410,19 @@ class ZeroEngineView(
     }
 
     fun releaseResources() {
+        queueEvent {
+            releaseSceneGpuResources()
+            if (textureCache.isNotEmpty()) {
+                val ids = textureCache.values.filter { it != 0 && it != whiteTexId }.toIntArray()
+                if (ids.isNotEmpty()) GLES20.glDeleteTextures(ids.size, ids, 0)
+                textureCache.clear()
+            }
+            if (textTextureCache.isNotEmpty()) {
+                val ids = textTextureCache.values.filter { it != 0 && it != whiteTexId }.toIntArray()
+                if (ids.isNotEmpty()) GLES20.glDeleteTextures(ids.size, ids, 0)
+                textTextureCache.clear()
+            }
+        }
         try {
             bgmPlayer?.stop()
             bgmPlayer?.release()
@@ -295,6 +431,20 @@ class ZeroEngineView(
         try {
             soundPool.release()
         } catch (_: Exception) {}
+    }
+
+    private fun releaseSceneGpuResources() {
+        for (n in nodes) {
+            if (n.tileVboId != 0) {
+                GLES20.glDeleteBuffers(1, intArrayOf(n.tileVboId), 0)
+                n.tileVboId = 0
+                n.tileVertexCount = 0
+            }
+            if (n.customProgram != 0 && n.customProgram != defaultLitProgram) {
+                GLES20.glDeleteProgram(n.customProgram)
+                n.customProgram = 0
+            }
+        }
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
@@ -311,6 +461,7 @@ class ZeroEngineView(
     }
 
     private fun loadSceneContent(rawJson: String) {
+        releaseSceneGpuResources()
         nodes.clear()
         pendingAdd.clear()
         pendingRemove.clear()
@@ -333,6 +484,8 @@ class ZeroEngineView(
         val now = System.nanoTime()
         val rawDt = ((now - lastFrameNs) / 1_000_000_000.0).toFloat().coerceIn(0.001f, 0.05f)
         lastFrameNs = now
+        val instFps = 1f / rawDt
+        smoothedFps = smoothedFps * 0.9f + instFps * 0.1f
 
         pendingSceneLoad?.let { nextSceneFile ->
             pendingSceneLoad = null
@@ -391,6 +544,16 @@ class ZeroEngineView(
         processCombatOverlaps()
 
         if (pendingRemove.isNotEmpty()) {
+            for (rem in pendingRemove) {
+                if (rem.tileVboId != 0) {
+                    GLES20.glDeleteBuffers(1, intArrayOf(rem.tileVboId), 0)
+                    rem.tileVboId = 0
+                }
+                if (rem.customProgram != 0 && rem.customProgram != defaultLitProgram) {
+                    GLES20.glDeleteProgram(rem.customProgram)
+                    rem.customProgram = 0
+                }
+            }
             nodes.removeAll(pendingRemove)
             pendingRemove.clear()
         }
@@ -398,7 +561,14 @@ class ZeroEngineView(
         renderSceneFrame()
     }
 
+    private fun isBoxInView(minX: Float, maxX: Float, minY: Float, maxY: Float): Boolean {
+        return maxX >= viewMinX && minX <= viewMaxX && maxY >= viewMinY && minY <= viewMaxY
+    }
+
     private fun renderSceneFrame() {
+        frameDrawCalls = 0
+        frameCulled = 0
+
         val lights = nodes.filter { it.visible && it.nodeType == "PointLight" }.take(8)
         val lightPosArr = FloatArray(8 * 4)
         val lightColArr = FloatArray(8 * 4)
@@ -419,7 +589,11 @@ class ZeroEngineView(
         val casters = nodes.filter { it.visible && it.layer != "UI" && it.shadowCaster && it.nodeType != "PointLight" }
         if (lights.isNotEmpty() && casters.isNotEmpty()) {
             for (caster in casters) {
-                renderDynamicShadow(caster, lights, vpMatrix)
+                val cg = getGlobalTransform(caster)
+                val pad = max(caster.width * abs(cg.gSx), caster.height * abs(cg.gSy)) * 1.6f
+                if (isBoxInView(cg.gx - pad, cg.gx + pad, cg.gy - pad, cg.gy + pad)) {
+                    renderDynamicShadow(caster, lights, vpMatrix)
+                }
             }
         }
 
@@ -442,6 +616,9 @@ class ZeroEngineView(
                 renderNode(n, uiVpMatrix, isWorld = false, 0, lightPosArr, lightColArr)
             }
         }
+
+        lastFrameDrawCalls = frameDrawCalls
+        lastFrameCulled = frameCulled
     }
 
     private fun processCombatOverlaps() {
@@ -456,15 +633,12 @@ class ZeroEngineView(
                 if (hb.hitCooldownMap.containsKey(hurt.name)) continue
                 if (checkOverlap(hb, hurt)) {
                     hb.hitCooldownMap[hurt.name] = 0.25f
-                    syncToJs(hb)
-                    syncToJs(hurt)
                     callLifecycle(hb, "onHit", hurt.jsObj)
                     val scope = hurt.jsObj?.prototype
                     val fn = if (scope != null) ScriptableObject.getProperty(scope, "onHurt") as? Function else null
                     if (fn != null && scope != null) {
                         try {
                             fn.call(rhino, scope, hurt.jsObj, arrayOf(hb.jsObj, hb.damage.toDouble()))
-                            syncFromJs(hurt)
                         } catch (e: Exception) {
                             onConsoleLog("[JS 运行错误 @ ${hurt.name}.onHurt] ${e.message}")
                         }
@@ -472,6 +646,78 @@ class ZeroEngineView(
                 }
             }
         }
+    }
+
+    // ==================== P0：TileMap 静态 VBO 合批（整张地图仅 1 次 DrawCall） ====================
+    private fun buildTileMapVbo(n: GameNode) {
+        if (n.tileVboId != 0) {
+            GLES20.glDeleteBuffers(1, intArrayOf(n.tileVboId), 0)
+            n.tileVboId = 0
+        }
+        n.tileDirty = false
+        if (n.tiles.isEmpty()) {
+            n.tileVertexCount = 0
+            return
+        }
+
+        val ts = max(8f, n.tileSize)
+        val hf = max(1, n.hFrames)
+        val vf = max(1, n.vFrames)
+        val uScale = 1f / hf
+        val vScale = 1f / vf
+
+        val floatsPerTile = 6 * 5
+        val data = FloatArray(n.tiles.size * floatsPerTile)
+        var offset = 0
+        var minX = Float.POSITIVE_INFINITY
+        var maxX = Float.NEGATIVE_INFINITY
+        var minY = Float.POSITIVE_INFINITY
+        var maxY = Float.NEGATIVE_INFINITY
+
+        for (cell in n.tiles) {
+            val x0 = cell.gx * ts
+            val x1 = x0 + ts
+            val y0 = cell.gy * ts
+            val y1 = y0 + ts
+            if (x0 < minX) minX = x0
+            if (x1 > maxX) maxX = x1
+            if (y0 < minY) minY = y0
+            if (y1 > maxY) maxY = y1
+
+            val fi = cell.frame.coerceIn(0, hf * vf - 1)
+            val u0 = (fi % hf) * uScale
+            val v0 = (fi / hf) * vScale
+            val u1 = u0 + uScale
+            val v1 = v0 + vScale
+
+            // Triangle 1: TL, TR, BL
+            data[offset++] = x0; data[offset++] = y0; data[offset++] = 0f; data[offset++] = u0; data[offset++] = v0
+            data[offset++] = x1; data[offset++] = y0; data[offset++] = 0f; data[offset++] = u1; data[offset++] = v0
+            data[offset++] = x0; data[offset++] = y1; data[offset++] = 0f; data[offset++] = u0; data[offset++] = v1
+            // Triangle 2: TR, BR, BL
+            data[offset++] = x1; data[offset++] = y0; data[offset++] = 0f; data[offset++] = u1; data[offset++] = v0
+            data[offset++] = x1; data[offset++] = y1; data[offset++] = 0f; data[offset++] = u1; data[offset++] = v1
+            data[offset++] = x0; data[offset++] = y1; data[offset++] = 0f; data[offset++] = u0; data[offset++] = v1
+        }
+
+        n.tileMinX = minX
+        n.tileMaxX = maxX
+        n.tileMinY = minY
+        n.tileMaxY = maxY
+        n.tileVertexCount = n.tiles.size * 6
+
+        val buf = ByteBuffer.allocateDirect(data.size * 4)
+            .order(ByteOrder.nativeOrder())
+            .asFloatBuffer()
+        buf.put(data)
+        buf.position(0)
+
+        val ids = IntArray(1)
+        GLES20.glGenBuffers(1, ids, 0)
+        n.tileVboId = ids[0]
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, n.tileVboId)
+        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, data.size * 4, buf, GLES20.GL_STATIC_DRAW)
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
     }
 
     private fun renderTileMap(
@@ -483,20 +729,37 @@ class ZeroEngineView(
         lightCol: FloatArray
     ) {
         if (n.tiles.isEmpty()) return
+        if (n.tileDirty || n.tileVboId == 0) {
+            buildTileMapVbo(n)
+        }
+        if (n.tileVboId == 0 || n.tileVertexCount == 0) return
+
         val gt = getGlobalTransform(n)
-        val ts = max(8f, n.tileSize)
+        if (isWorld && !isBoxInView(gt.gx + n.tileMinX, gt.gx + n.tileMaxX, gt.gy + n.tileMinY, gt.gy + n.tileMaxY)) {
+            frameCulled++
+            return
+        }
+
         val prog = getProgramForNode(n)
         GLES20.glUseProgram(prog)
 
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, n.tileVboId)
         val posLoc = GLES20.glGetAttribLocation(prog, "aPosition")
         val uvLoc = GLES20.glGetAttribLocation(prog, "aTexCoord")
-        quadBuffer.position(0)
         GLES20.glEnableVertexAttribArray(posLoc)
-        GLES20.glVertexAttribPointer(posLoc, 3, GLES20.GL_FLOAT, false, 20, quadBuffer)
-        quadBuffer.position(3)
+        GLES20.glVertexAttribPointer(posLoc, 3, GLES20.GL_FLOAT, false, 20, 0)
         GLES20.glEnableVertexAttribArray(uvLoc)
-        GLES20.glVertexAttribPointer(uvLoc, 2, GLES20.GL_FLOAT, false, 20, quadBuffer)
+        GLES20.glVertexAttribPointer(uvLoc, 2, GLES20.GL_FLOAT, false, 20, 12)
 
+        Matrix.setIdentityM(modelMatrix, 0)
+        Matrix.translateM(modelMatrix, 0, gt.gx, gt.gy, gt.gz)
+        if (gt.gRot != 0f) Matrix.rotateM(modelMatrix, 0, gt.gRot, 0f, 0f, 1f)
+        if (gt.gSx != 1f || gt.gSy != 1f) Matrix.scaleM(modelMatrix, 0, gt.gSx, gt.gSy, 1f)
+        Matrix.multiplyMM(mvpMatrix, 0, activeVp, 0, modelMatrix, 0)
+
+        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uMVP"), 1, false, mvpMatrix, 0)
+        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uModel"), 1, false, modelMatrix, 0)
+        GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uUvRect"), 0f, 0f, 1f, 1f)
         GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uColor"), n.r, n.g, n.b, n.a)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uTime"), engineTime)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uFlash"), 0f)
@@ -513,29 +776,12 @@ class ZeroEngineView(
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uTexture"), 0)
 
-        val hf = max(1, n.hFrames)
-        val vf = max(1, n.vFrames)
-        val uScale = 1f / hf
-        val vScale = 1f / vf
-
-        for (cell in n.tiles) {
-            val wx = gt.gx + (cell.gx + 0.5f) * ts
-            val wy = gt.gy + (cell.gy + 0.5f) * ts
-            val fi = cell.frame.coerceIn(0, hf * vf - 1)
-            GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uUvRect"), (fi % hf) * uScale, (fi / hf) * vScale, uScale, vScale)
-
-            Matrix.setIdentityM(modelMatrix, 0)
-            Matrix.translateM(modelMatrix, 0, wx, wy, gt.gz)
-            Matrix.scaleM(modelMatrix, 0, ts, ts, 1f)
-            Matrix.multiplyMM(mvpMatrix, 0, activeVp, 0, modelMatrix, 0)
-
-            GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uMVP"), 1, false, mvpMatrix, 0)
-            GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uModel"), 1, false, modelMatrix, 0)
-            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-        }
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, n.tileVertexCount)
+        frameDrawCalls++
 
         GLES20.glDisableVertexAttribArray(posLoc)
         GLES20.glDisableVertexAttribArray(uvLoc)
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
     }
 
     private fun renderDynamicShadow(caster: GameNode, lights: List<GameNode>, activeVp: FloatArray) {
@@ -585,6 +831,7 @@ class ZeroEngineView(
             GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uModel"), 1, false, modelMatrix, 0)
             GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uColor"), 0.02f, 0.03f, 0.06f, 0.52f * atten)
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+            frameDrawCalls++
         }
 
         GLES20.glDisableVertexAttribArray(posLoc)
@@ -654,6 +901,10 @@ class ZeroEngineView(
 
         for (p in n.particles) {
             if (!p.active) continue
+            if (isWorld && !isBoxInView(p.x - p.size, p.x + p.size, p.y - p.size, p.y + p.size)) {
+                frameCulled++
+                continue
+            }
             val ratio = (p.life / p.maxLife).coerceIn(0f, 1f)
             val curSize = p.size * (0.25f + 0.75f * ratio)
             Matrix.setIdentityM(modelMatrix, 0)
@@ -668,6 +919,7 @@ class ZeroEngineView(
             GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uModel"), 1, false, modelMatrix, 0)
             GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uColor"), n.r, n.g, n.b, p.alpha * ratio)
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+            frameDrawCalls++
         }
 
         GLES20.glDisableVertexAttribArray(posLoc)
@@ -720,6 +972,26 @@ class ZeroEngineView(
         }
     }
 
+    private fun unprojectCornerZ0(ndcX: Float, ndcY: Float, outXY: FloatArray): Boolean {
+        val nearPt = floatArrayOf(ndcX, ndcY, -1f, 1f)
+        val farPt = floatArrayOf(ndcX, ndcY, 1f, 1f)
+        val nearW = FloatArray(4)
+        val farW = FloatArray(4)
+        Matrix.multiplyMV(nearW, 0, invVpMatrix, 0, nearPt, 0)
+        Matrix.multiplyMV(farW, 0, invVpMatrix, 0, farPt, 0)
+        if (abs(nearW[3]) < 1e-5f || abs(farW[3]) < 1e-5f) return false
+        for (i in 0..2) {
+            nearW[i] /= nearW[3]
+            farW[i] /= farW[3]
+        }
+        val dz = farW[2] - nearW[2]
+        if (abs(dz) < 1e-5f) return false
+        val t = -nearW[2] / dz
+        outXY[0] = nearW[0] + t * (farW[0] - nearW[0])
+        outXY[1] = nearW[1] + t * (farW[1] - nearW[1])
+        return true
+    }
+
     private fun updateCameraMatrices(dt: Float) {
         camTarget?.let { target ->
             val gt = getGlobalTransform(target)
@@ -764,6 +1036,34 @@ class ZeroEngineView(
                 camX + sx, camY + sy, 0f,
                 0f, -1f, 0f
             )
+            Matrix.multiplyMM(vpMatrix, 0, projMatrix, 0, viewMatrix, 0)
+            Matrix.invertM(invVpMatrix, 0, vpMatrix, 0)
+
+            // P0：通过四角射线反投影计算 2.5D 视锥地面覆盖范围（加 400px 安全冗余防立绘边缘闪烁）
+            var minX = Float.POSITIVE_INFINITY
+            var maxX = Float.NEGATIVE_INFINITY
+            var minY = Float.POSITIVE_INFINITY
+            var maxY = Float.NEGATIVE_INFINITY
+            val pt = FloatArray(2)
+            val corners = arrayOf(-1f to -1f, 1f to -1f, -1f to 1f, 1f to 1f)
+            var valid = 0
+            for ((cx, cy) in corners) {
+                if (unprojectCornerZ0(cx, cy, pt)) {
+                    if (pt[0] < minX) minX = pt[0]
+                    if (pt[0] > maxX) maxX = pt[0]
+                    if (pt[1] < minY) minY = pt[1]
+                    if (pt[1] > maxY) maxY = pt[1]
+                    valid++
+                }
+            }
+            if (valid == 4) {
+                viewMinX = minX - 400f
+                viewMaxX = maxX + 400f
+                viewMinY = minY - 400f
+                viewMaxY = maxY + 400f
+            } else {
+                viewMinX = -999999f; viewMaxX = 999999f; viewMinY = -999999f; viewMaxY = 999999f
+            }
         } else {
             val halfH = 960f
             val halfW = halfH * aspect
@@ -774,32 +1074,23 @@ class ZeroEngineView(
                 camX + sx, camY + sy, 0f,
                 0f, 1f, 0f
             )
+            Matrix.multiplyMM(vpMatrix, 0, projMatrix, 0, viewMatrix, 0)
+            Matrix.invertM(invVpMatrix, 0, vpMatrix, 0)
+
+            viewMinX = camX + sx - halfW - 250f
+            viewMaxX = camX + sx + halfW + 250f
+            viewMinY = camY + sy - halfH - 250f
+            viewMaxY = camY + sy + halfH + 250f
         }
-        Matrix.multiplyMM(vpMatrix, 0, projMatrix, 0, viewMatrix, 0)
-        Matrix.invertM(invVpMatrix, 0, vpMatrix, 0)
     }
 
     private fun updateWorldTouchFromScreen() {
         val ndcX = (touchScreenX / 1080f) * 2f - 1f
         val ndcY = 1f - (touchScreenY / 1920f) * 2f
-        val nearPt = floatArrayOf(ndcX, ndcY, -1f, 1f)
-        val farPt = floatArrayOf(ndcX, ndcY, 1f, 1f)
-        val nearWorld = FloatArray(4)
-        val farWorld = FloatArray(4)
-
-        Matrix.multiplyMV(nearWorld, 0, invVpMatrix, 0, nearPt, 0)
-        Matrix.multiplyMV(farWorld, 0, invVpMatrix, 0, farPt, 0)
-        if (abs(nearWorld[3]) > 1e-5f) {
-            for (i in 0..2) nearWorld[i] /= nearWorld[3]
-        }
-        if (abs(farWorld[3]) > 1e-5f) {
-            for (i in 0..2) farWorld[i] /= farWorld[3]
-        }
-        val dz = farWorld[2] - nearWorld[2]
-        if (abs(dz) > 1e-5f) {
-            val t = -nearWorld[2] / dz
-            touchWorldX = nearWorld[0] + t * (farWorld[0] - nearWorld[0])
-            touchWorldY = nearWorld[1] + t * (farWorld[1] - nearWorld[1])
+        val pt = FloatArray(2)
+        if (unprojectCornerZ0(ndcX, ndcY, pt)) {
+            touchWorldX = pt[0]
+            touchWorldY = pt[1]
         }
     }
 
@@ -814,6 +1105,14 @@ class ZeroEngineView(
         val gt = getGlobalTransform(n)
         val w = n.width * gt.gSx
         val h = n.height * gt.gSy
+
+        if (isWorld) {
+            val boundHalf = max(abs(w), abs(h)) * 0.75f + abs(gt.gz)
+            if (!isBoxInView(gt.gx - boundHalf, gt.gx + boundHalf, gt.gy - boundHalf, gt.gy + boundHalf)) {
+                frameCulled++
+                return
+            }
+        }
 
         Matrix.setIdentityM(modelMatrix, 0)
         Matrix.translateM(modelMatrix, 0, gt.gx, gt.gy, gt.gz)
@@ -885,6 +1184,8 @@ class ZeroEngineView(
         GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uTexture"), 0)
 
         GLES20.glDrawArrays(drawMode, 0, vertCount)
+        frameDrawCalls++
+
         GLES20.glDisableVertexAttribArray(posLoc)
         GLES20.glDisableVertexAttribArray(uvLoc)
     }
@@ -987,7 +1288,7 @@ class ZeroEngineView(
         }
     }
 
-    // ==================== 拼图 2：通用射线检测 (支持实体包围盒与 TileMap) ====================
+    // ==================== 通用射线检测 (支持实体包围盒与 TileMap) ====================
     private fun performRaycast(x1: Float, y1: Float, x2: Float, y2: Float, ignoreTag: String): Scriptable {
         var closestT = 1.0f
         var hitNode: GameNode? = null
@@ -1069,7 +1370,7 @@ class ZeroEngineView(
         return if (t0 <= t1) t0 else null
     }
 
-    // ==================== 拼图 3：本地磁盘永久存档 (长椅/多槽位存档) ====================
+    // ==================== 本地磁盘永久存档 (长椅/多槽位存档) ====================
     private fun saveDiskSlot(slotName: String, dataObj: Any?): Boolean {
         return try {
             val safeName = slotName.replace(Regex("[^a-zA-Z0-9_\\-\\u4e00-\\u9fa5]"), "_")
@@ -1130,6 +1431,16 @@ class ZeroEngineView(
             onConsoleLog("[LOG] $msg")
             null
         })
+        ScriptableObject.putProperty(engineApi, "getStats", jsFunc {
+            val obj = rhino.newObject(globalScope)
+            ScriptableObject.putProperty(obj, "fps", smoothedFps.toDouble())
+            ScriptableObject.putProperty(obj, "drawCalls", lastFrameDrawCalls)
+            ScriptableObject.putProperty(obj, "culled", lastFrameCulled)
+            ScriptableObject.putProperty(obj, "nodes", nodes.size)
+            ScriptableObject.putProperty(obj, "textures", textureCache.size)
+            ScriptableObject.putProperty(obj, "textTextures", textTextureCache.size)
+            obj
+        })
         ScriptableObject.putProperty(engineApi, "loadScene", jsFunc { args ->
             val sName = RhinoContext.toString(args.getOrNull(0) ?: "")
             if (sName.isNotEmpty()) {
@@ -1187,7 +1498,7 @@ class ZeroEngineView(
         })
         ScriptableObject.putProperty(engineApi, "setCameraTarget", jsFunc { args ->
             val targetObj = args.getOrNull(0) as? Scriptable
-            camTarget = nodes.find { it.jsObj === targetObj }
+            camTarget = (targetObj as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === targetObj }
             null
         })
         ScriptableObject.putProperty(engineApi, "setCameraDeadzone", jsFunc { args ->
@@ -1237,8 +1548,7 @@ class ZeroEngineView(
             val toVal = (args.getOrNull(2) as? Number)?.toFloat() ?: return@jsFunc null
             val dur = (args.getOrNull(3) as? Number)?.toFloat() ?: 0.25f
             val ease = RhinoContext.toString(args.getOrNull(4) ?: "easeOut")
-            val n = nodes.find { it.jsObj === targetObj } ?: return@jsFunc null
-            syncFromJs(n)
+            val n = (targetObj as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === targetObj } ?: return@jsFunc null
             val startVal = readTweenProperty(n, prop)
             activeTweens.removeAll { it.node === n && it.prop == prop }
             activeTweens.add(TweenTask(n, prop, startVal, toVal, dur, ease))
@@ -1270,15 +1580,15 @@ class ZeroEngineView(
         ScriptableObject.putProperty(engineApi, "moveAndSlide", jsFunc { args ->
             val selfObj = args.getOrNull(0) as? Scriptable ?: return@jsFunc null
             val dt = (args.getOrNull(1) as? Number)?.toFloat() ?: 0.016f
-            val n = nodes.find { it.jsObj === selfObj } ?: return@jsFunc null
-            syncFromJs(n)
+            val n = (selfObj as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === selfObj } ?: return@jsFunc null
             moveAndSlideNode(n, dt)
-            syncToJs(n)
             null
         })
         ScriptableObject.putProperty(engineApi, "distance", jsFunc { args ->
-            val a = nodes.find { it.jsObj === (args.getOrNull(0) as? Scriptable) }
-            val b = nodes.find { it.jsObj === (args.getOrNull(1) as? Scriptable) }
+            val a = (args.getOrNull(0) as? GameNodeJsProxy)?.n
+                ?: nodes.find { it.jsObj === (args.getOrNull(0) as? Scriptable) }
+            val b = (args.getOrNull(1) as? GameNodeJsProxy)?.n
+                ?: nodes.find { it.jsObj === (args.getOrNull(1) as? Scriptable) }
             if (a != null && b != null) {
                 val ga = getGlobalTransform(a)
                 val gb = getGlobalTransform(b)
@@ -1286,8 +1596,10 @@ class ZeroEngineView(
             } else 999999.0
         })
         ScriptableObject.putProperty(engineApi, "angleTo", jsFunc { args ->
-            val a = nodes.find { it.jsObj === (args.getOrNull(0) as? Scriptable) }
-            val b = nodes.find { it.jsObj === (args.getOrNull(1) as? Scriptable) }
+            val a = (args.getOrNull(0) as? GameNodeJsProxy)?.n
+                ?: nodes.find { it.jsObj === (args.getOrNull(0) as? Scriptable) }
+            val b = (args.getOrNull(1) as? GameNodeJsProxy)?.n
+                ?: nodes.find { it.jsObj === (args.getOrNull(1) as? Scriptable) }
             if (a != null && b != null) {
                 val ga = getGlobalTransform(a)
                 val gb = getGlobalTransform(b)
@@ -1350,7 +1662,8 @@ class ZeroEngineView(
         })
         ScriptableObject.putProperty(engineApi, "destroy", jsFunc { args ->
             val targetObj = args.getOrNull(0) as? Scriptable
-            nodes.find { it.jsObj === targetObj }?.let { pendingRemove.add(it) }
+            val target = (targetObj as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === targetObj }
+            target?.let { pendingRemove.add(it) }
             null
         })
         ScriptableObject.putProperty(engineApi, "findNode", jsFunc { args ->
@@ -1399,24 +1712,23 @@ class ZeroEngineView(
     private fun bindNodeScript(n: GameNode) {
         val nodeScope = rhino.newObject(globalScope)
         nodeScope.prototype = globalScope
-        val selfObj = rhino.newObject(nodeScope)
+        val selfObj = GameNodeJsProxy(n).apply {
+            parentScope = nodeScope
+            prototype = nodeScope
+        }
         n.jsObj = selfObj
-        syncToJs(n)
 
         ScriptableObject.putProperty(selfObj, "jump", jsFunc { args ->
             val jumpForce = (args.getOrNull(0) as? Number)?.toFloat() ?: 920f
-            syncFromJs(n)
             if (n.isGrounded || n.coyoteTimer > 0f) {
                 n.vy = -abs(jumpForce)
                 n.isGrounded = false
                 n.coyoteTimer = 0f
                 n.jumpCount = 1
-                syncToJs(n)
                 return@jsFunc true
             } else if (n.jumpCount < n.maxJumps) {
                 n.vy = -abs(jumpForce) * 0.9f
                 n.jumpCount++
-                syncToJs(n)
                 return@jsFunc true
             }
             false
@@ -1430,12 +1742,10 @@ class ZeroEngineView(
         ScriptableObject.putProperty(selfObj, "bounce", jsFunc { args ->
             val bvx = (args.getOrNull(0) as? Number)?.toFloat()
             val bvy = (args.getOrNull(1) as? Number)?.toFloat() ?: -760f
-            syncFromJs(n)
             if (bvx != null) n.vx = bvx
             n.vy = bvy
             n.isGrounded = false
             n.jumpCount = 1
-            syncToJs(n)
             null
         })
         ScriptableObject.putProperty(selfObj, "play", jsFunc { args ->
@@ -1494,97 +1804,20 @@ class ZeroEngineView(
                 onConsoleLog("[JS 编译错误 @ ${n.name}] ${e.message}")
             }
         }
-        n.jsObj?.prototype = nodeScope
     }
 
     private fun callLifecycle(n: GameNode, fnName: String, arg: Any? = null) {
         val scope = n.jsObj?.prototype ?: return
         val fn = ScriptableObject.getProperty(scope, fnName) as? Function ?: return
-        syncToJs(n)
         try {
             val args = if (arg != null) arrayOf(arg) else emptyArray()
             fn.call(rhino, scope, n.jsObj, args)
-            syncFromJs(n)
         } catch (e: Exception) {
             onConsoleLog("[JS 运行错误 @ ${n.name}.$fnName] ${e.message}")
         }
     }
 
-    private fun syncToJs(n: GameNode) {
-        val o = n.jsObj ?: return
-        ScriptableObject.putProperty(o, "name", n.name)
-        ScriptableObject.putProperty(o, "tag", n.tag)
-        ScriptableObject.putProperty(o, "x", n.x.toDouble())
-        ScriptableObject.putProperty(o, "y", n.y.toDouble())
-        ScriptableObject.putProperty(o, "z", n.z.toDouble())
-        ScriptableObject.putProperty(o, "vx", n.vx.toDouble())
-        ScriptableObject.putProperty(o, "vy", n.vy.toDouble())
-        ScriptableObject.putProperty(o, "vz", n.vz.toDouble())
-        ScriptableObject.putProperty(o, "width", n.width.toDouble())
-        ScriptableObject.putProperty(o, "height", n.height.toDouble())
-        ScriptableObject.putProperty(o, "rotation", n.rotation.toDouble())
-        ScriptableObject.putProperty(o, "tiltX", n.tiltX.toDouble())
-        ScriptableObject.putProperty(o, "scaleX", n.scaleX.toDouble())
-        ScriptableObject.putProperty(o, "scaleY", n.scaleY.toDouble())
-        ScriptableObject.putProperty(o, "parallaxX", n.parallaxX.toDouble())
-        ScriptableObject.putProperty(o, "parallaxY", n.parallaxY.toDouble())
-        ScriptableObject.putProperty(o, "slopeType", n.slopeType)
-        ScriptableObject.putProperty(o, "bodyMode", n.bodyMode)
-        ScriptableObject.putProperty(o, "gravity", n.gravity.toDouble())
-        ScriptableObject.putProperty(o, "fallMultiplier", n.fallMultiplier.toDouble())
-        ScriptableObject.putProperty(o, "maxJumps", n.maxJumps)
-        ScriptableObject.putProperty(o, "isGrounded", n.isGrounded)
-        ScriptableObject.putProperty(o, "isHitbox", n.isHitbox)
-        ScriptableObject.putProperty(o, "isHurtbox", n.isHurtbox)
-        ScriptableObject.putProperty(o, "damage", n.damage.toDouble())
-        ScriptableObject.putProperty(o, "invulnTimer", n.invulnTimer.toDouble())
-        ScriptableObject.putProperty(o, "r", n.r.toDouble())
-        ScriptableObject.putProperty(o, "g", n.g.toDouble())
-        ScriptableObject.putProperty(o, "b", n.b.toDouble())
-        ScriptableObject.putProperty(o, "a", n.a.toDouble())
-        ScriptableObject.putProperty(o, "visible", n.visible)
-        ScriptableObject.putProperty(o, "text", n.text)
-        ScriptableObject.putProperty(o, "currentClip", n.currentClipName)
-        ScriptableObject.putProperty(o, "lightRadius", n.lightRadius.toDouble())
-        ScriptableObject.putProperty(o, "lightIntensity", n.lightIntensity.toDouble())
-    }
-
-    private fun syncFromJs(n: GameNode) {
-        val o = n.jsObj ?: return
-        n.x = getJsFloat(o, "x", n.x)
-        n.y = getJsFloat(o, "y", n.y)
-        n.z = getJsFloat(o, "z", n.z)
-        n.vx = getJsFloat(o, "vx", n.vx)
-        n.vy = getJsFloat(o, "vy", n.vy)
-        n.vz = getJsFloat(o, "vz", n.vz)
-        n.width = getJsFloat(o, "width", n.width)
-        n.height = getJsFloat(o, "height", n.height)
-        n.rotation = getJsFloat(o, "rotation", n.rotation)
-        n.tiltX = getJsFloat(o, "tiltX", n.tiltX)
-        n.scaleX = getJsFloat(o, "scaleX", n.scaleX)
-        n.scaleY = getJsFloat(o, "scaleY", n.scaleY)
-        n.parallaxX = getJsFloat(o, "parallaxX", n.parallaxX)
-        n.parallaxY = getJsFloat(o, "parallaxY", n.parallaxY)
-        n.slopeType = getJsStr(o, "slopeType", n.slopeType)
-        n.bodyMode = getJsStr(o, "bodyMode", n.bodyMode)
-        n.gravity = getJsFloat(o, "gravity", n.gravity)
-        n.fallMultiplier = getJsFloat(o, "fallMultiplier", n.fallMultiplier)
-        n.maxJumps = getJsInt(o, "maxJumps", n.maxJumps)
-        n.isHitbox = getJsBool(o, "isHitbox", n.isHitbox)
-        n.isHurtbox = getJsBool(o, "isHurtbox", n.isHurtbox)
-        n.damage = getJsFloat(o, "damage", n.damage)
-        n.invulnTimer = getJsFloat(o, "invulnTimer", n.invulnTimer)
-        n.r = getJsFloat(o, "r", n.r)
-        n.g = getJsFloat(o, "g", n.g)
-        n.b = getJsFloat(o, "b", n.b)
-        n.a = getJsFloat(o, "a", n.a)
-        n.visible = getJsBool(o, "visible", n.visible)
-        n.text = getJsStr(o, "text", n.text)
-        n.lightRadius = getJsFloat(o, "lightRadius", n.lightRadius)
-        n.lightIntensity = getJsFloat(o, "lightIntensity", n.lightIntensity)
-    }
-
-    // ==================== 拼图 1：含斜坡自动爬升与贴地的 moveAndSlide ====================
+    // ==================== 含斜坡自动爬升与贴地的 moveAndSlide ====================
     private fun computeSlopeSurfaceY(slope: GameNode, footX: Float): Float {
         val gb = getGlobalTransform(slope)
         val sw = slope.width * abs(gb.gSx)
@@ -1663,7 +1896,6 @@ class ZeroEngineView(
                             n.coyoteTimer = n.coyoteTimeMax
                             collidedSolids.add(other)
                         } else if (wasGrounded && n.vy >= 0f && !n.isGrounded) {
-                            // 下坡吸附：防止角色走下斜坡时一跳一顿
                             val gb = getGlobalTransform(other)
                             val sw = other.width * abs(gb.gSx)
                             if (abs(ga.gx - gb.gx) <= sw * 0.5f && surfY - footY in 0f..24f) {
@@ -2009,6 +2241,8 @@ class ZeroEngineView(
         GLES20.glAttachShader(prog, vs)
         GLES20.glAttachShader(prog, fs)
         GLES20.glLinkProgram(prog)
+        GLES20.glDeleteShader(vs)
+        GLES20.glDeleteShader(fs)
         return prog
     }
 
@@ -2056,6 +2290,11 @@ class ZeroEngineView(
         }
     }
 
+    private fun toJsFloat(v: Any?, def: Float): Float = (v as? Number)?.toFloat() ?: def
+    private fun toJsInt(v: Any?, def: Int): Int = (v as? Number)?.toInt() ?: def
+    private fun toJsStr(v: Any?, def: String): String = v?.takeIf { it !== Scriptable.NOT_FOUND }?.toString() ?: def
+    private fun toJsBool(v: Any?, def: Boolean): Boolean = (v as? Boolean) ?: def
+
     private fun getJsFloat(s: Scriptable, k: String, def: Float): Float =
         (ScriptableObject.getProperty(s, k) as? Number)?.toFloat() ?: def
     private fun getJsInt(s: Scriptable, k: String, def: Int): Int =
@@ -2066,6 +2305,16 @@ class ZeroEngineView(
         (ScriptableObject.getProperty(s, k) as? Boolean) ?: def
 
     companion object {
+        private val BRIDGED_PROPS = setOf(
+            "name", "tag", "x", "y", "z", "vx", "vy", "vz",
+            "width", "height", "rotation", "tiltX", "scaleX", "scaleY",
+            "parallaxX", "parallaxY", "slopeType", "bodyMode",
+            "gravity", "fallMultiplier", "maxJumps", "isGrounded",
+            "isHitbox", "isHurtbox", "damage", "invulnTimer",
+            "r", "g", "b", "a", "visible", "text", "currentClip",
+            "lightRadius", "lightIntensity"
+        )
+
         private const val VERTEX_SHADER = """
             attribute vec4 aPosition;
             attribute vec2 aTexCoord;
