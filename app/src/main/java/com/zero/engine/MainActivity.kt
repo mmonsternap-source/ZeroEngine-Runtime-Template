@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.util.Base64
 import android.view.Gravity
@@ -32,6 +33,8 @@ class MainActivity : Activity() {
 
     companion object {
         const val EDITOR_MODE = true
+        private const val PREFS_NAME = "ZeroEnginePrefs"
+        private const val KEY_SAVE_TREE_URI = "save_tree_uri"
     }
 
     private lateinit var container: FrameLayout
@@ -41,27 +44,98 @@ class MainActivity : Activity() {
     private val PICK_IMAGE_CODE = 1001
     private val PICK_AUDIO_CODE = 1002
     private val EXPORT_ZIP_CODE = 1003
+    private val PICK_SAVE_DIR_CODE = 1004
     private val uiHandler = Handler(Looper.getMainLooper())
     private val consoleLogs = Collections.synchronizedList(mutableListOf<String>())
     private var liveConsoleView: TextView? = null
 
     private var currentProject: String = "DefaultProject"
 
-    /**
-     * 公开存档根目录：/storage/emulated/0/Android/data/com.zero.engine/files/ZeroEngine/
-     * 无需额外存储权限，可用手机文件管理器 / MT管理器 / 电脑USB 直接查看与备份
-     */
-    private fun getProjectsRoot(): File {
+    private fun getSavedTreeUri(): Uri? {
+        val raw = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_SAVE_TREE_URI, null)
+        return if (!raw.isNullOrBlank()) Uri.parse(raw) else null
+    }
+
+    private fun getDefaultProjectsRoot(): File {
         val baseDir = getExternalFilesDir(null) ?: filesDir
         return File(baseDir, "ZeroEngine/projects").apply { mkdirs() }
     }
 
     private fun getProjectDir(projName: String = currentProject): File {
-        return File(getProjectsRoot(), projName).apply {
+        return File(getDefaultProjectsRoot(), projName).apply {
             File(this, "scenes").mkdirs()
             File(this, "textures").mkdirs()
             File(this, "audio").mkdirs()
         }
+    }
+
+    /**
+     * 将本地工程文件同步写入用户选择的 SAF 外部文件夹（如 Documents/ZeroEngine）
+     */
+    private fun syncFileToSaf(projName: String, subDir: String, fileName: String, bytes: ByteArray, mimeType: String) {
+        val treeUri = getSavedTreeUri() ?: return
+        try {
+            val rootDocId = DocumentsContract.getTreeDocumentId(treeUri)
+            val rootDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, rootDocId)
+            val projectsUri = findOrCreateSafDir(treeUri, rootDocUri, "ZeroEngine_Projects") ?: return
+            val projUri = findOrCreateSafDir(treeUri, projectsUri, projName) ?: return
+            val subUri = findOrCreateSafDir(treeUri, projUri, subDir) ?: return
+
+            val existingFileUri = findSafChild(treeUri, subUri, fileName)
+            val targetUri = existingFileUri ?: DocumentsContract.createDocument(contentResolver, subUri, mimeType, fileName)
+            if (targetUri != null) {
+                contentResolver.openOutputStream(targetUri, "wt")?.use { it.write(bytes) }
+            }
+        } catch (e: Exception) {
+            appendConsoleLog("[SYNC] 外部目录同步提示: ${e.message}")
+        }
+    }
+
+    private fun findSafChild(treeUri: Uri, parentDocUri: Uri, displayName: String): Uri? {
+        val parentDocId = DocumentsContract.getDocumentId(parentDocUri)
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+        contentResolver.query(
+            childrenUri,
+            arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME),
+            null, null, null
+        )?.use { cursor ->
+            while (cursor.moveToNext()) {
+                val id = cursor.getString(0)
+                val name = cursor.getString(1)
+                if (name == displayName) {
+                    return DocumentsContract.buildDocumentUriUsingTree(treeUri, id)
+                }
+            }
+        }
+        return null
+    }
+
+    private fun findOrCreateSafDir(treeUri: Uri, parentDocUri: Uri, dirName: String): Uri? {
+        findSafChild(treeUri, parentDocUri, dirName)?.let { return it }
+        return DocumentsContract.createDocument(
+            contentResolver,
+            parentDocUri,
+            DocumentsContract.Document.MIME_TYPE_DIR,
+            dirName
+        )
+    }
+
+    private fun syncWholeProjectToSaf(projName: String) {
+        val projDir = getProjectDir(projName)
+        listOf("scenes" to "application/json", "textures" to "image/png", "audio" to "audio/mpeg").forEach { (sub, mime) ->
+            File(projDir, sub).listFiles()?.filter { it.isFile }?.forEach { f ->
+                syncFileToSaf(projName, sub, f.name, f.readBytes(), mime)
+            }
+        }
+    }
+
+    private fun formatReadableSaveLocation(): String {
+        val treeUri = getSavedTreeUri()
+        if (treeUri != null) {
+            val docId = try { DocumentsContract.getTreeDocumentId(treeUri) } catch (_: Exception) { treeUri.toString() }
+            return "已选自定义目录 ($docId/ZeroEngine_Projects/$currentProject)"
+        }
+        return getProjectDir(currentProject).absolutePath
     }
 
     private fun appendConsoleLog(msg: String) {
@@ -115,8 +189,29 @@ class MainActivity : Activity() {
     inner class EngineBridge {
 
         @JavascriptInterface
-        fun getSaveLocation(): String {
-            return getProjectDir(currentProject).absolutePath
+        fun hasCustomSaveLocation(): Boolean = getSavedTreeUri() != null
+
+        @JavascriptInterface
+        fun getSaveLocation(): String = formatReadableSaveLocation()
+
+        @JavascriptInterface
+        fun pickSaveLocation() {
+            runOnUiThread {
+                val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                    addFlags(
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                        Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                        Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                    )
+                }
+                startActivityForResult(intent, PICK_SAVE_DIR_CODE)
+            }
+        }
+
+        @JavascriptInterface
+        fun resetDefaultSaveLocation() {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().remove(KEY_SAVE_TREE_URI).apply()
+            appendConsoleLog("[STORAGE] 已恢复默认存储目录: ${getProjectDir().absolutePath}")
         }
 
         @JavascriptInterface
@@ -136,7 +231,7 @@ class MainActivity : Activity() {
 
         @JavascriptInterface
         fun listProjects(): String {
-            val root = getProjectsRoot()
+            val root = getDefaultProjectsRoot()
             val names = root.listFiles()?.filter { it.isDirectory }?.map { it.name }?.sorted() ?: listOf("DefaultProject")
             return JSONArray(names.ifEmpty { listOf("DefaultProject") }).toString()
         }
@@ -169,6 +264,7 @@ class MainActivity : Activity() {
         fun saveSceneFile(sceneFileName: String, sceneJson: String) {
             val safeName = if (sceneFileName.endsWith(".scene")) sceneFileName else "$sceneFileName.scene"
             File(getProjectDir(), "scenes/$safeName").writeText(sceneJson)
+            syncFileToSaf(currentProject, "scenes", safeName, sceneJson.toByteArray(Charsets.UTF_8), "application/json")
         }
 
         @JavascriptInterface
@@ -273,7 +369,25 @@ class MainActivity : Activity() {
         if (resultCode != RESULT_OK) return
         val uri: Uri = data?.data ?: return
 
-        if (requestCode == PICK_IMAGE_CODE) {
+        if (requestCode == PICK_SAVE_DIR_CODE) {
+            try {
+                val takeFlags = (data.flags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION))
+                contentResolver.takePersistableUriPermission(
+                    uri,
+                    if (takeFlags != 0) takeFlags else (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                )
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .edit()
+                    .putString(KEY_SAVE_TREE_URI, uri.toString())
+                    .apply()
+                syncWholeProjectToSaf(currentProject)
+                val loc = formatReadableSaveLocation()
+                appendConsoleLog("[STORAGE] 已切换存档目录: $loc")
+                editorWebView?.evaluateJavascript("if(window.onSaveLocationPicked)onSaveLocationPicked()", null)
+            } catch (e: Exception) {
+                appendConsoleLog("[STORAGE 错误] ${e.message}")
+            }
+        } else if (requestCode == PICK_IMAGE_CODE) {
             val texDir = File(getProjectDir(), "textures").apply { mkdirs() }
             val fileName = "tex_${System.currentTimeMillis() % 100000}.png"
             val destFile = File(texDir, fileName)
@@ -281,10 +395,12 @@ class MainActivity : Activity() {
             contentResolver.openInputStream(uri)?.use { input ->
                 destFile.outputStream().use { output -> input.copyTo(output) }
             }
+            val bytes = destFile.readBytes()
+            syncFileToSaf(currentProject, "textures", fileName, bytes, "image/png")
 
             val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(destFile.absolutePath, opts)
-            val b64 = Base64.encodeToString(destFile.readBytes(), Base64.NO_WRAP)
+            val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
             val dataUrl = "data:image/png;base64,$b64"
 
             editorWebView?.evaluateJavascript(
@@ -300,6 +416,7 @@ class MainActivity : Activity() {
             contentResolver.openInputStream(uri)?.use { input ->
                 destFile.outputStream().use { output -> input.copyTo(output) }
             }
+            syncFileToSaf(currentProject, "audio", safeName, destFile.readBytes(), "audio/mpeg")
             appendConsoleLog("[AUDIO] 已导入音频资源: $safeName")
             editorWebView?.evaluateJavascript("onNativeAudioPicked('$safeName')", null)
         } else if (requestCode == EXPORT_ZIP_CODE) {
