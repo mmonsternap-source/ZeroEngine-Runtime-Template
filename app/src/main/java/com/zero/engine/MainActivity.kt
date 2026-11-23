@@ -16,6 +16,7 @@ import android.view.Gravity
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.widget.Button
 import android.widget.FrameLayout
@@ -85,6 +86,7 @@ class MainActivity : Activity() {
             editorWebView = WebView(this).apply {
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
+                webChromeClient = WebChromeClient()
                 addJavascriptInterface(EngineBridge(), "ZeroBridge")
                 loadUrl("file:///android_asset/editor.html")
             }
@@ -220,14 +222,12 @@ class MainActivity : Activity() {
         val projDir = getProjectDir()
         contentResolver.openOutputStream(uri)?.use { rawOut ->
             ZipOutputStream(rawOut).use { zos ->
-                // 写入根目录 main.scene.json 便于直接替换进独立 APK assets 目录
                 val mainSceneFile = File(projDir, "scenes/main.scene")
                 if (mainSceneFile.exists()) {
                     zos.putNextEntry(ZipEntry("main.scene.json"))
                     zos.write(mainSceneFile.readBytes())
                     zos.closeEntry()
                 }
-                // 递归写入 scenes / textures / audio 全部资源
                 projDir.walkTopDown().filter { it.isFile }.forEach { file ->
                     val relPath = file.relativeTo(projDir).path.replace("\\", "/")
                     zos.putNextEntry(ZipEntry(relPath))
