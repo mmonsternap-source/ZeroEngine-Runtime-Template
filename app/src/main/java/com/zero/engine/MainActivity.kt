@@ -10,19 +10,24 @@ class MainActivity : Activity() {
 
     private lateinit var glView: GLSurfaceView
     private val rootNode = Node2D("Root")
-
+    private val camera = Camera2D("MainCamera")
     private val playerCollider = Collider2D("PlayerCollider", 130f, 130f, "player")
+    private var wasHitting = false
 
     private val playerNode = object : Sprite2D("Player", 130f, 130f, r = 0.2f, g = 0.85f, b = 0.6f) {
         override fun onProcess(delta: Float) {
-            // 实时检测是否撞到场景里的任何障碍物
             val allColliders = rootNode.findNodesByType<Collider2D>()
             val hit = allColliders.any { it !== playerCollider && playerCollider.intersects(it) }
             if (hit) {
-                r = 0.95f; g = 0.25f; b = 0.25f // 撞墙变红报警
+                r = 0.95f; g = 0.25f; b = 0.25f
+                if (!wasHitting) {
+                    // 刚撞上的瞬间触发强烈屏幕震动！
+                    camera.shake(intensity = 28f, duration = 0.25f)
+                }
             } else {
-                r = 0.2f; g = 0.85f; b = 0.6f   // 正常绿色
+                r = 0.2f; g = 0.85f; b = 0.6f
             }
+            wasHitting = hit
         }
     }
 
@@ -30,10 +35,15 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        // 1. 从 JSON 加载关卡与障碍物
+        // 设置相机默认中心点
+        camera.x = 540f
+        camera.y = 960f
+        rootNode.addChild(camera)
+
+        // 加载 JSON 关卡
         SceneLoader.loadFromAssets(this, "main.scene.json", rootNode)
 
-        // 2. 挂载主角及碰撞体
+        // 挂载主角
         playerNode.x = 540f
         playerNode.y = 850f
         playerNode.addChild(playerCollider)
@@ -63,5 +73,10 @@ class MainActivity : Activity() {
     override fun onPause() {
         super.onPause()
         glView.onPause()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        AudioEngine.release()
     }
 }
