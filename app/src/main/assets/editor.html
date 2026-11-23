@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>ZeroEngine SDK v0.4</title>
+<title>ZeroEngine SDK v0.5-Alpha</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, sans-serif; }
   body { background: #0b0e14; color: #e2e8f0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; user-select: none; }
@@ -26,7 +26,7 @@
   canvas { width: 100%; height: 100%; display: block; }
   .vp-hud { position: absolute; top: 6px; left: 6px; font-size: 10px; color: #94a3b8; background: rgba(11,14,20,0.8); padding: 3px 6px; border-radius: 4px; pointer-events: none; font-family: monospace; }
 
-  .bottom-dock { height: 290px; background: #131822; border-top: 1px solid #232c3d; display: flex; flex-direction: column; }
+  .bottom-dock { height: 295px; background: #131822; border-top: 1px solid #232c3d; display: flex; flex-direction: column; }
   .tabs { display: flex; background: #0e121a; border-bottom: 1px solid #232c3d; }
   .tab { flex: 1; text-align: center; padding: 6px 2px; font-size: 11px; color: #94a3b8; border-bottom: 2px solid transparent; }
   .tab.active { color: #38bdf8; border-bottom-color: #38bdf8; font-weight: 700; background: #131822; }
@@ -35,7 +35,7 @@
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
   .field { display: flex; flex-direction: column; gap: 2px; font-size: 10px; color: #94a3b8; }
   .field input, .field select { background: #090c12; border: 1px solid #334155; color: #fff; padding: 4px 5px; border-radius: 4px; font-size: 11px; width: 100%; }
-  .field.row { flex-direction: row; align-items: center; gap: 5px; padding-top: 8px; }
+  .field.row { flex-direction: row; align-items: center; gap: 5px; padding-top: 6px; }
 
   .clip-box { margin-top: 10px; padding: 7px; background: #0c1018; border: 1px solid #232c3d; border-radius: 6px; }
   .clip-row { display: grid; grid-template-columns: 1.3fr 0.7fr 0.7fr 0.7fr auto auto; gap: 4px; align-items: center; margin-top: 5px; font-size: 10px; }
@@ -65,6 +65,7 @@
   <div class="scene-tree">
     <div class="tree-header">
       <button onclick="addNode('Sprite2D')">+精</button>
+      <button onclick="addNode('ParticleEmitter')">+粒</button>
       <button onclick="pickNativeImage()">+图</button>
       <button onclick="pickNativeAudio()">+音</button>
       <button onclick="addNode('PointLight')">+光</button>
@@ -75,7 +76,7 @@
   </div>
   <div class="viewport" id="vpBox">
     <canvas id="stage"></canvas>
-    <div class="vp-hud" id="vpHud">2.5D 透视 | 双指缩放/平移</div>
+    <div class="vp-hud" id="vpHud">v0.5-Alpha | 2.5D 透视</div>
   </div>
 </div>
 
@@ -112,14 +113,14 @@ function defaultNodes() {
       name: "GroundFloor", nodeType: "Sprite2D", layer: "World", parent: "", tag: "ground",
       x: 540, y: 960, z: -2, width: 2200, height: 2200, rotation: 0, tiltX: 0, billboard: false,
       scaleX: 1, scaleY: 1, zIndex: -10, texture: "", r: 0.16, g: 0.20, b: 0.28, a: 1,
-      collider: false, isTrigger: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
+      shadowCaster: false, collider: false, isTrigger: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
       defaultClip: "", clips: [], shader: "", script: ""
     },
     {
       name: "Hero", nodeType: "Sprite2D", layer: "World", parent: "", tag: "player",
       x: 540, y: 960, z: 0, width: 120, height: 150, rotation: 0, tiltX: 0, billboard: true,
       scaleX: 1, scaleY: 1, zIndex: 1, texture: "", r: 0.25, g: 0.82, b: 0.98, a: 1,
-      collider: true, isTrigger: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
+      shadowCaster: true, collider: true, isTrigger: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
       defaultClip: "idle",
       clips: [
         { name: "idle", start: 0, end: 0, fps: 8, loop: true },
@@ -131,7 +132,7 @@ function onReady() {
   Engine.setCameraMode("2.5D");
   Engine.setCameraTarget(self);
   self.play("idle");
-  Engine.log("ZeroEngine v0.4 动画状态机/音频/碰撞已就绪");
+  Engine.log("ZeroEngine v0.5-Alpha 粒子/实时阴影/补间已就绪");
 }
 function onProcess(dt) {
   if (Input.isTouching && Input.screenY < 1550) {
@@ -156,8 +157,10 @@ function onProcess(dt) {
 function onTriggerEnter(other) {
   if (other.tag === "coin") {
     Engine.playTone(980, 90);
+    self.flash(0.14);
+    Engine.tween(self, "scaleX", 1.25, 0.12, "easeOut");
     Engine.destroy(other);
-    Engine.log("拾取金币: " + other.name);
+    Engine.log("拾取金币并触发补间反馈: " + other.name);
   }
 }`
     },
@@ -165,26 +168,43 @@ function onTriggerEnter(other) {
       name: "TorchLight", nodeType: "PointLight", layer: "World", parent: "Hero", tag: "light",
       x: 0, y: 0, z: 60, width: 60, height: 60, rotation: 0, tiltX: 0, billboard: false,
       scaleX: 1, scaleY: 1, zIndex: 5, texture: "", r: 1.0, g: 0.72, b: 0.28, a: 1,
-      lightRadius: 560, lightIntensity: 1.8, collider: false, isTrigger: false,
+      lightRadius: 580, lightIntensity: 1.8, shadowCaster: false, collider: false, isTrigger: false,
+      hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12, defaultClip: "", clips: [], shader: "", script: ""
+    },
+    {
+      name: "EmberParticles", nodeType: "ParticleEmitter", layer: "World", parent: "TorchLight", tag: "fx",
+      x: 0, y: 0, z: 20, width: 40, height: 40, rotation: 0, tiltX: 0, billboard: false,
+      scaleX: 1, scaleY: 1, zIndex: 6, texture: "", r: 1.0, g: 0.65, b: 0.18, a: 0.95,
+      emitRate: 28, particleLife: 1.0, particleSpeed: 130, particleSize: 16, particleGravity: -90,
+      shadowCaster: false, collider: false, isTrigger: false,
+      hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12, defaultClip: "", clips: [], shader: "", script: ""
+    },
+    {
+      name: "StonePillar", nodeType: "Sprite2D", layer: "World", parent: "", tag: "wall",
+      x: 340, y: 760, z: 0, width: 130, height: 130, rotation: 0, tiltX: 0, billboard: true,
+      scaleX: 1, scaleY: 1, zIndex: 1, texture: "", r: 0.45, g: 0.50, b: 0.60, a: 1,
+      shadowCaster: true, collider: true, isTrigger: false,
       hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12, defaultClip: "", clips: [], shader: "", script: ""
     },
     {
       name: "GoldCoin", nodeType: "Sprite2D", layer: "World", parent: "", tag: "coin",
       x: 780, y: 780, z: 0, width: 70, height: 70, rotation: 0, tiltX: 0, billboard: true,
       scaleX: 1, scaleY: 1, zIndex: 1, texture: "", r: 1.0, g: 0.84, b: 0.12, a: 1,
-      collider: true, isTrigger: true, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
+      shadowCaster: false, collider: true, isTrigger: true, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
       defaultClip: "", clips: [], shader: "", script: ""
     },
     {
       name: "ActionBtn", nodeType: "Sprite2D", layer: "UI", parent: "", tag: "ui_btn",
       x: 880, y: 1680, z: 0, width: 170, height: 170, rotation: 0, tiltX: 0, billboard: false,
       scaleX: 1, scaleY: 1, zIndex: 100, texture: "", r: 0.95, g: 0.32, b: 0.36, a: 0.85,
-      collider: false, isTrigger: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
+      shadowCaster: false, collider: false, isTrigger: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
       defaultClip: "", clips: [], shader: "",
       script: `function onInput(ev) {
   if (ev.type === "down" && Math.abs(ev.screenX - self.x) < 95 && Math.abs(ev.screenY - self.y) < 95) {
     Engine.shake(16, 0.15);
     Engine.playTone(680, 70);
+    Engine.tween(self, "scaleX", 0.82, 0.08, "easeOut");
+    Engine.tween(self, "scaleY", 0.82, 0.08, "easeOut");
     var hero = Engine.findNode("Hero");
     if (hero) {
       Engine.spawn({
@@ -193,6 +213,9 @@ function onTriggerEnter(other) {
         script: "var t=0.35; function onProcess(dt){ t-=dt; self.scaleX+=6*dt; self.scaleY+=6*dt; self.a=t/0.35; if(t<=0) Engine.destroy(self); }"
       }, "");
     }
+  } else if (ev.type === "up") {
+    Engine.tween(self, "scaleX", 1.0, 0.14, "easeOut");
+    Engine.tween(self, "scaleY", 1.0, 0.14, "easeOut");
   }
 }`
     }
@@ -336,7 +359,7 @@ function onNativeImagePicked(fileName, dataUrl, w, h) {
       name: fileName.replace(/\.[^.]+$/, ''), nodeType: "Sprite2D", layer: "World", parent: "", tag: "sprite",
       x: 540, y: 960, z: 0, width: w || img.width || 160, height: h || img.height || 160,
       rotation: 0, tiltX: 0, billboard: true, scaleX: 1, scaleY: 1, zIndex: 1,
-      texture: fileName, r: 1, g: 1, b: 1, a: 1, collider: true, isTrigger: false,
+      texture: fileName, r: 1, g: 1, b: 1, a: 1, shadowCaster: false, collider: true, isTrigger: false,
       hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12, defaultClip: "", clips: [], shader: "", script: ""
     });
     selectedIndex = nodes.length - 1;
@@ -356,13 +379,21 @@ function playScene() {
 
 function addNode(type) {
   const idx = nodes.length + 1;
+  const isEmitter = type === 'ParticleEmitter';
+  const isLight = type === 'PointLight';
   nodes.push({
-    name: `${type}_${idx}`, nodeType: type, layer: "World", parent: "", tag: type === 'PointLight' ? 'light' : 'default',
-    x: 540, y: 960, z: type === 'PointLight' ? 60 : 0, width: type === 'PointLight' ? 60 : 140, height: type === 'PointLight' ? 60 : 140,
-    rotation: 0, tiltX: 0, billboard: type === 'Sprite2D', scaleX: 1, scaleY: 1, zIndex: 1,
+    name: `${type}_${idx}`, nodeType: type, layer: "World", parent: "",
+    tag: isLight ? 'light' : (isEmitter ? 'fx' : 'default'),
+    x: 540, y: 960, z: isLight ? 60 : 0, width: isLight ? 60 : 140, height: isLight ? 60 : 140,
+    rotation: 0, tiltX: 0, billboard: type === 'Sprite2D', scaleX: 1, scaleY: 1, zIndex: isEmitter ? 6 : 1,
     text: type === 'Label2D' ? 'Label' : '', fontSize: 44, texture: "",
-    r: type === 'PointLight' ? 1.0 : 0.25, g: type === 'PointLight' ? 0.8 : 0.85, b: type === 'PointLight' ? 0.35 : 0.65, a: 1,
-    lightRadius: 500, lightIntensity: 1.6, collider: type === 'Sprite2D', isTrigger: false,
+    r: isLight ? 1.0 : (isEmitter ? 1.0 : 0.25),
+    g: isLight ? 0.8 : (isEmitter ? 0.65 : 0.85),
+    b: isLight ? 0.35 : (isEmitter ? 0.2 : 0.65),
+    a: isEmitter ? 0.95 : 1,
+    lightRadius: 500, lightIntensity: 1.6, shadowCaster: false,
+    emitRate: 24, particleLife: 1.0, particleSpeed: 150, particleSize: 16, particleGravity: -60,
+    collider: type === 'Sprite2D', isTrigger: false,
     hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12, defaultClip: "", clips: [], shader: "", script: ""
   });
   selectedIndex = nodes.length - 1;
@@ -375,7 +406,7 @@ function addUINode() {
     name: `UI_Button_${idx}`, nodeType: "Sprite2D", layer: "UI", parent: "", tag: "ui",
     x: 200, y: 1680, z: 0, width: 160, height: 160, rotation: 0, tiltX: 0, billboard: false,
     scaleX: 1, scaleY: 1, zIndex: 100, texture: "", r: 0.3, g: 0.6, b: 1.0, a: 0.85,
-    collider: false, isTrigger: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
+    shadowCaster: false, collider: false, isTrigger: false, hFrames: 1, vFrames: 1, currentFrame: 0, animFps: 12,
     defaultClip: "", clips: [], shader: "", script: ""
   });
   selectedIndex = nodes.length - 1;
@@ -552,6 +583,11 @@ function draw() {
       ctx.fillStyle = grad;
       ctx.beginPath(); ctx.arc(0, 0, n.lightRadius || 300, 0, Math.PI * 2); ctx.fill();
       ctx.fillStyle = '#fde047'; ctx.beginPath(); ctx.arc(0, 0, 18 / camZoom, 0, Math.PI * 2); ctx.fill();
+    } else if (n.nodeType === 'ParticleEmitter') {
+      ctx.strokeStyle = '#fb923c'; ctx.lineWidth = 3 / camZoom;
+      ctx.beginPath(); ctx.arc(0, 0, 26 / camZoom, 0, Math.PI * 2); ctx.stroke();
+      ctx.fillStyle = rgbToHex(n.r, n.g, n.b);
+      ctx.beginPath(); ctx.arc(0, 0, 10 / camZoom, 0, Math.PI * 2); ctx.fill();
     } else if (n.nodeType === 'Label2D') {
       ctx.fillStyle = '#ffffff'; ctx.font = `bold ${n.fontSize || 44}px sans-serif`;
       ctx.fillText(n.text || 'Label', -w / 2, 10);
@@ -597,7 +633,7 @@ function draw() {
 function renderTree() {
   document.getElementById('treeList').innerHTML = nodes.map((n, i) => {
     const indent = n.parent ? '└ ' : '';
-    const icon = n.nodeType === 'PointLight' ? '💡' : (n.layer === 'UI' ? '📱' : (n.billboard ? '🧍' : ''));
+    const icon = n.nodeType === 'PointLight' ? '💡' : (n.nodeType === 'ParticleEmitter' ? '🔥' : (n.layer === 'UI' ? '📱' : (n.billboard ? '🧍' : '')));
     const badges = (n.script && n.script.trim() ? '📜' : '') + (n.shader && n.shader.trim() ? '✨' : '');
     return `<div class="tree-item ${i === selectedIndex ? 'active' : ''}" onclick="selectNode(${i})">${indent}${icon}${n.name} ${badges}</div>`;
   }).join('');
@@ -647,12 +683,12 @@ function renderDock() {
     refreshAudioList();
     const audioStr = audioAssets.length ? audioAssets.join(', ') : '(暂无导入音频，点击左上角 +音 导入)';
     body.innerHTML = `<div class="doc-box">
-<b>ZeroEngine SDK v0.4 工业管线 API 手册</b><br>
-• <b>当前工程已导入音频</b>: ${audioStr}<br>
-• <b>动画状态机</b>: self.play("run") / self.stopAnim() / 回调 function onAnimFinished(name)<br>
-• <b>原生音频播放</b>: Engine.playBGM("bgm.mp3", true, 0.8) / Engine.stopBGM() / Engine.playSFX("hit.wav", 1.0)<br>
-• <b>物理与触发器回调</b>: function onCollision(other) / function onTriggerEnter(other)<br>
-• <b>2.5D 摄像机与触控</b>: Engine.setCameraMode("2.5D"|"2D") / Input.worldX, Input.worldY / Input.screenX, Input.screenY
+<b>ZeroEngine SDK v0.5-Alpha 旗舰 API 手册</b><br>
+• <b>已导入音频</b>: ${audioStr}<br>
+• <b>缓动补间</b>: Engine.tween(self, "scaleX", 1.3, 0.15, "easeOut")<br>
+• <b>受击闪白与粒子爆发</b>: self.flash(0.14) / self.emitBurst(30)<br>
+• <b>实时动态阴影</b>: 勾选节点「投射阴影」，灯光自动计算投影<br>
+• <b>动画状态机与音频</b>: self.play("run") / Engine.playSFX("hit.wav") / Engine.playBGM("bgm.mp3")
 </div>`;
     return;
   }
@@ -677,12 +713,13 @@ function renderDock() {
   if (activeTab === 'script') {
     body.innerHTML = `
       <div class="script-toolbar">
+        <button onclick="insertCode('scriptEditor','Engine.tween(self, \\'scaleX\\', 1.25, 0.12, \\'easeOut\\')')">tween</button>
+        <button onclick="insertCode('scriptEditor','self.flash(0.14)')">self.flash</button>
+        <button onclick="insertCode('scriptEditor','self.emitBurst(25)')">emitBurst</button>
         <button onclick="insertCode('scriptEditor','self.play(\\'run\\')')">self.play</button>
         <button onclick="insertCode('scriptEditor','Engine.playSFX(\\'\\', 1.0)')">playSFX</button>
-        <button onclick="insertCode('scriptEditor','Engine.playBGM(\\'\\', true, 0.8)')">playBGM</button>
         <button onclick="insertCode('scriptEditor','function onCollision(other) {\\n  \\n}\\n')">+onCollision</button>
         <button onclick="insertCode('scriptEditor','function onTriggerEnter(other) {\\n  \\n}\\n')">+onTrigger</button>
-        <button onclick="insertCode('scriptEditor','function onAnimFinished(name) {\\n  \\n}\\n')">+onAnimEnd</button>
       </div>
       <textarea id="scriptEditor" class="code-box" spellcheck="false" oninput="updateProp('script', this.value)">${n.script || ''}</textarea>`;
     return;
@@ -714,6 +751,28 @@ function renderDock() {
     </div>
   `).join('');
 
+  let extraFields = '';
+  if (n.nodeType === 'PointLight') {
+    extraFields = `
+      <div class="field"><label>光照半径 (Radius)</label><input type="number" value="${n.lightRadius || 450}" oninput="updateProp('lightRadius', +this.value)"></div>
+      <div class="field"><label>光照强度 (Intensity)</label><input type="number" step="0.1" value="${n.lightIntensity || 1.4}" oninput="updateProp('lightIntensity', +this.value)"></div>
+      <div class="field"><label>灯光颜色</label><input type="color" value="${rgbToHex(n.r, n.g, n.b)}" oninput="updateColor(this.value)"></div>`;
+  } else if (n.nodeType === 'ParticleEmitter') {
+    extraFields = `
+      <div class="field"><label>发射速率 (/秒)</label><input type="number" value="${n.emitRate ?? 24}" oninput="updateProp('emitRate', +this.value)"></div>
+      <div class="field"><label>粒子寿命 (秒)</label><input type="number" step="0.1" value="${n.particleLife ?? 1.0}" oninput="updateProp('particleLife', +this.value)"></div>
+      <div class="field"><label>初速度</label><input type="number" value="${n.particleSpeed ?? 150}" oninput="updateProp('particleSpeed', +this.value)"></div>
+      <div class="field"><label>粒子大小</label><input type="number" value="${n.particleSize ?? 16}" oninput="updateProp('particleSize', +this.value)"></div>
+      <div class="field"><label>重力加速度</label><input type="number" value="${n.particleGravity ?? -60}" oninput="updateProp('particleGravity', +this.value)"></div>
+      <div class="field"><label>粒子颜色</label><input type="color" value="${rgbToHex(n.r, n.g, n.b)}" oninput="updateColor(this.value)"></div>`;
+  } else {
+    extraFields = `
+      <div class="field"><label>混合颜色</label><input type="color" value="${rgbToHex(n.r, n.g, n.b)}" oninput="updateColor(this.value)"></div>
+      <div class="field"><label>透明度 (0~1)</label><input type="number" step="0.1" value="${n.a ?? 1}" oninput="updateProp('a', +this.value)"></div>
+      <div class="field"><label>序列帧列数 (H-Frames)</label><input type="number" min="1" value="${n.hFrames || 1}" oninput="updateProp('hFrames', Math.max(1,+this.value))"></div>
+      <div class="field"><label>序列帧行数 (V-Frames)</label><input type="number" min="1" value="${n.vFrames || 1}" oninput="updateProp('vFrames', Math.max(1,+this.value))"></div>`;
+  }
+
   body.innerHTML = `
     <div style="display:flex;gap:6px;align-items:center;margin-bottom:7px;">
       <input style="background:#090c12;border:1px solid #334155;color:#fbbf24;font-weight:700;padding:4px 6px;border-radius:4px;font-size:12px;flex:1;" value="${n.name}" onchange="updateProp('name', this.value)">
@@ -736,16 +795,9 @@ function renderDock() {
       <div class="field"><label>高度</label><input type="number" value="${n.height}" oninput="updateProp('height', +this.value)"></div>
       <div class="field"><label>Z轴旋转</label><input type="number" value="${n.rotation || 0}" oninput="updateProp('rotation', +this.value)"></div>
       <div class="field"><label>X轴倾角 (TiltX)</label><input type="number" value="${n.tiltX || 0}" oninput="updateProp('tiltX', +this.value)"></div>
-      ${n.nodeType === 'PointLight'
-        ? `<div class="field"><label>光照半径 (Radius)</label><input type="number" value="${n.lightRadius || 450}" oninput="updateProp('lightRadius', +this.value)"></div>
-           <div class="field"><label>光照强度 (Intensity)</label><input type="number" step="0.1" value="${n.lightIntensity || 1.4}" oninput="updateProp('lightIntensity', +this.value)"></div>
-           <div class="field"><label>灯光颜色</label><input type="color" value="${rgbToHex(n.r, n.g, n.b)}" oninput="updateColor(this.value)"></div>`
-        : `<div class="field"><label>混合颜色</label><input type="color" value="${rgbToHex(n.r, n.g, n.b)}" oninput="updateColor(this.value)"></div>
-           <div class="field"><label>透明度 (0~1)</label><input type="number" step="0.1" value="${n.a ?? 1}" oninput="updateProp('a', +this.value)"></div>
-           <div class="field"><label>序列帧列数 (H-Frames)</label><input type="number" min="1" value="${n.hFrames || 1}" oninput="updateProp('hFrames', Math.max(1,+this.value))"></div>
-           <div class="field"><label>序列帧行数 (V-Frames)</label><input type="number" min="1" value="${n.vFrames || 1}" oninput="updateProp('vFrames', Math.max(1,+this.value))"></div>`
-      }
+      ${extraFields}
       <div class="field row"><input type="checkbox" ${n.billboard ? 'checked' : ''} onchange="updateProp('billboard', this.checked)"><label>HD-2D 立牌</label></div>
+      <div class="field row"><input type="checkbox" ${n.shadowCaster ? 'checked' : ''} onchange="updateProp('shadowCaster', this.checked)"><label>投射阴影</label></div>
       <div class="field row"><input type="checkbox" ${n.collider ? 'checked' : ''} onchange="updateProp('collider', this.checked)"><label>开启碰撞体</label></div>
       <div class="field row"><input type="checkbox" ${n.isTrigger ? 'checked' : ''} onchange="updateProp('isTrigger', this.checked)"><label>触发器 (不阻挡)</label></div>
     </div>
