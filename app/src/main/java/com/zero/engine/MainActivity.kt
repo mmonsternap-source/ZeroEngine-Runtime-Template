@@ -5,9 +5,12 @@ import android.app.Activity
 import android.content.Intent
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.Typeface
 import android.net.Uri
 import android.opengl.GLSurfaceView
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Base64
 import android.view.Gravity
 import android.view.MotionEvent
@@ -18,20 +21,24 @@ import android.webkit.WebView
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.TextView
 import java.io.File
-import kotlin.math.sin
 
 class MainActivity : Activity() {
 
     companion object {
+        // true = 启动完整移动端 IDE 编辑器；false = 打包为纯粹的正式发行版游戏
         const val EDITOR_MODE = true
     }
 
     private lateinit var container: FrameLayout
     private var editorWebView: WebView? = null
     private var glView: GLSurfaceView? = null
+    private var scriptRuntime: ScriptRuntime? = null
     private var isPlaying = false
     private val PICK_IMAGE_CODE = 1001
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private var profilerTask: Runnable? = null
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -70,6 +77,12 @@ class MainActivity : Activity() {
             val f = File(filesDir, "saved_scene.json")
             return if (f.exists()) f.readText() else ""
         }
+
+        @JavascriptInterface
+        fun getConsoleLogs(): String = EngineConsole.dump()
+
+        @JavascriptInterface
+        fun clearConsoleLogs() = EngineConsole.clear()
 
         @JavascriptInterface
         fun pickImage() {
@@ -119,170 +132,45 @@ class MainActivity : Activity() {
     private fun startPlayMode(sceneJson: String) {
         if (isPlaying) return
         isPlaying = true
+        EngineConsole.clear()
+        EngineConsole.log("Runtime initialized.")
 
         val rootNode = Node2D("Root")
         val camera = Camera2D("MainCamera").apply { x = 540f; y = 960f }
         rootNode.addChild(camera)
 
         SceneLoader.loadFromString(sceneJson, rootNode)
-        val allSprites = rootNode.findNodesByType<Sprite2D>()
 
-        var score = 0
-        var moveLeft = false
-        var moveRight = false
-        var jumpRequested = false
-        var shootTimer = 0f
-        var virusTimer = 0f
-        var pulseTime = 0f
-        val bullets = mutableListOf<Sprite2D>()
-
-        val hudLabel = Label2D("HUD", "得分: 0", 48f, Color.parseColor("#34D399")).apply {
-            x = 220f
-            y = 110f
-        }
-        rootNode.addChild(hudLabel)
-
-        val gameLoop = object : Node2D("UniversalGameLoop") {
-            override fun onProcess(delta: Float) {
-                pulseTime += delta * 6f
-                val colliders = rootNode.findNodesByType<Collider2D>()
-                val virusCells = allSprites.filter { it.behavior == "virus" }
-
-                for (obj in allSprites) {
-                    if (!obj.visible) continue
-                    when (obj.behavior) {
-                        "patrol" -> {
-                            obj.x += obj.vx * delta
-                            if (obj.x > 960f) { obj.x = 960f; obj.vx = -240f }
-                            if (obj.x < 120f) { obj.x = 120f; obj.vx = 240f }
-                        }
-                        "platformer" -> {
-                            obj.vx = when {
-                                moveLeft -> -420f
-                                moveRight -> 420f
-                                else -> 0f
-                            }
-                            if (jumpRequested && obj.stateFlag) {
-                                obj.vy = -1050f
-                                obj.stateFlag = false
-                                jumpRequested = false
-                            }
-                            obj.vy += 2200f * delta
-                            obj.x = (obj.x + obj.vx * delta).coerceIn(60f, 1020f)
-                            obj.y += obj.vy * delta
-
-                            val myCol = obj.findNodesByType<Collider2D>().firstOrNull()
-                            if (myCol != null) {
-                                for (other in colliders) {
-                                    val parentSprite = other.parent as? Sprite2D ?: continue
-                                    if (parentSprite === obj || !parentSprite.visible) continue
-                                    if (myCol.intersects(other)) {
-                                        when (parentSprite.behavior) {
-                                            "coin" -> {
-                                                parentSprite.visible = false
-                                                score += 10
-                                                camera.shake(12f, 0.12f)
-                                            }
-                                            "patrol" -> {
-                                                camera.shake(28f, 0.25f)
-                                                obj.x = 260f; obj.y = 800f; obj.vy = 0f
-                                            }
-                                            else -> {
-                                                if (obj.vy > 0f) {
-                                                    obj.y = parentSprite.y - parentSprite.height / 2f - obj.height / 2f
-                                                    obj.vy = 0f
-                                                    obj.stateFlag = true
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            if (obj.y > 1950f) { obj.x = 260f; obj.y = 800f; obj.vy = 0f }
-                        }
-                        "shooter" -> {
-                            shootTimer += delta
-                            if (shootTimer >= 0.45f) {
-                                shootTimer = 0f
-                                val b = Sprite2D("Bullet", 24f, 48f, r = 0.98f, g = 0.9f, b = 0.2f).apply {
-                                    x = obj.x; y = obj.y - obj.height / 2f - 20f
-                                    addChild(Collider2D("BCol", 24f, 48f, "bullet"))
-                                }
-                                bullets.add(b)
-                                rootNode.addChild(b)
-                            }
-                        }
-                        "virus" -> {
-                            if (obj.stateFlag) {
-                                obj.r = 0.95f; obj.g = 0.2f; obj.b = 0.25f
-                                val s = 1f + 0.08f * sin(pulseTime)
-                                obj.scaleX = s; obj.scaleY = s
-                            }
-                        }
-                    }
-                }
-
-                val bulletIter = bullets.iterator()
-                while (bulletIter.hasNext()) {
-                    val b = bulletIter.next()
-                    b.y -= 1100f * delta
-                    var hitEnemy = false
-                    val bCol = b.findNodesByType<Collider2D>().firstOrNull()
-                    if (bCol != null) {
-                        for (target in allSprites) {
-                            if (target.visible && target.behavior == "patrol") {
-                                val tCol = target.findNodesByType<Collider2D>().firstOrNull()
-                                if (tCol != null && bCol.intersects(tCol)) {
-                                    target.visible = false
-                                    hitEnemy = true
-                                    score += 50
-                                    camera.shake(22f, 0.2f)
-                                    break
-                                }
-                            }
-                        }
-                    }
-                    if (hitEnemy || b.y < -50f) {
-                        rootNode.removeChild(b)
-                        bulletIter.remove()
-                    }
-                }
-
-                if (virusCells.isNotEmpty()) {
-                    val infected = virusCells.filter { it.stateFlag }
-                    if (infected.isNotEmpty() && infected.size < virusCells.size) {
-                        virusTimer += delta
-                        if (virusTimer >= 0.8f) {
-                            virusTimer = 0f
-                            val nextWave = virusCells.filter { !it.stateFlag && infected.any { src -> src.distanceTo(it) <= 450f } }
-                            if (nextWave.isNotEmpty()) {
-                                nextWave.forEach { it.stateFlag = true }
-                                camera.shake(14f, 0.15f)
-                            }
-                        }
-                    }
-                    val pct = (infected.size * 100) / virusCells.size
-                    hudLabel.text = if (infected.isEmpty()) "点击细胞投放病毒！" else "感染进度: $pct%"
-                } else {
-                    hudLabel.text = "得分: $score"
-                }
-            }
-        }
-        rootNode.addChild(gameLoop)
+        val runtime = ScriptRuntime(rootNode, camera)
+        scriptRuntime = runtime
+        val renderer = GLRenderer(this, rootNode, camera, runtime)
 
         val surface = GLSurfaceView(this).apply {
             setEGLContextClientVersion(2)
-            setRenderer(GLRenderer(this@MainActivity, rootNode))
+            setRenderer(renderer)
             renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
             setOnTouchListener { _, event ->
-                if (event.action == MotionEvent.ACTION_DOWN) {
-                    allSprites.firstOrNull { it.behavior == "virus" && !it.stateFlag && it.containsPoint(event.x, event.y) }
-                        ?.let { it.stateFlag = true; camera.shake(22f, 0.2f) }
-                }
-                if (event.action == MotionEvent.ACTION_DOWN || event.action == MotionEvent.ACTION_MOVE) {
-                    allSprites.filter { it.behavior == "drag" || it.behavior == "shooter" }.forEach {
-                        it.x = event.x
-                        it.y = event.y
+                val tx = event.x
+                val ty = event.y
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        InputState.isTouching = true
+                        InputState.justPressed = true
+                        InputState.touchX = tx
+                        InputState.touchY = ty
+                        queueEvent { runtime.dispatchInput("down", tx, ty) }
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        InputState.touchX = tx
+                        InputState.touchY = ty
+                        queueEvent { runtime.dispatchInput("move", tx, ty) }
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        InputState.isTouching = false
+                        InputState.justReleased = true
+                        InputState.touchX = tx
+                        InputState.touchY = ty
+                        queueEvent { runtime.dispatchInput("up", tx, ty) }
                     }
                 }
                 true
@@ -293,59 +181,83 @@ class MainActivity : Activity() {
         container.removeAllViews()
         container.addView(surface)
 
-        if (allSprites.any { it.behavior == "platformer" }) {
-            val controls = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                setPadding(40, 20, 40, 60)
-            }
-            fun makePadBtn(label: String, onState: (Boolean) -> Unit): Button {
-                return Button(this).apply {
-                    text = label
-                    textSize = 20f
-                    setBackgroundColor(Color.parseColor("#882B3142"))
-                    setTextColor(Color.WHITE)
-                    setOnTouchListener { _, ev ->
-                        if (ev.action == MotionEvent.ACTION_DOWN) onState(true)
-                        if (ev.action == MotionEvent.ACTION_UP || ev.action == MotionEvent.ACTION_CANCEL) onState(false)
-                        true
-                    }
-                }
-            }
-            controls.addView(makePadBtn("◀ 左") { moveLeft = it }, LinearLayout.LayoutParams(220, 150).apply { rightMargin = 24 })
-            controls.addView(makePadBtn("右 ▶") { moveRight = it }, LinearLayout.LayoutParams(220, 150))
-            val spacer = android.view.View(this)
-            controls.addView(spacer, LinearLayout.LayoutParams(0, 1, 1f))
-            controls.addView(makePadBtn("▲ 跳跃") { if (it) jumpRequested = true }, LinearLayout.LayoutParams(240, 150))
-
-            container.addView(controls, FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.BOTTOM
-            ))
-        }
-
         if (EDITOR_MODE) {
+            // 顶部开发者调试栏（FPS / 节点数 / 控制台预览 / 停止按钮）
+            val hudOverlay = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(24, 48, 24, 12)
+            }
+
+            val topRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+
+            val profilerText = TextView(this).apply {
+                text = "FPS: 60 | Nodes: 0"
+                textSize = 12f
+                typeface = Typeface.MONOSPACE
+                setTextColor(Color.parseColor("#34D399"))
+                setBackgroundColor(Color.parseColor("#AA0F172A"))
+                setPadding(16, 10, 16, 10)
+            }
+
             val stopBtn = Button(this).apply {
-                text = "■ 返回编辑"
+                text = "■ 停止运行"
+                textSize = 12f
                 setBackgroundColor(Color.parseColor("#CCEF4444"))
                 setTextColor(Color.WHITE)
                 setOnClickListener { stopPlayMode() }
             }
-            container.addView(stopBtn, FrameLayout.LayoutParams(
+
+            topRow.addView(profilerText, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = 16 })
+            topRow.addView(stopBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+            val liveConsole = TextView(this).apply {
+                text = ""
+                textSize = 11f
+                typeface = Typeface.MONOSPACE
+                setTextColor(Color.parseColor("#F8FAFC"))
+                setBackgroundColor(Color.parseColor("#88020617"))
+                setPadding(16, 8, 16, 8)
+                maxLines = 4
+            }
+
+            hudOverlay.addView(topRow)
+            hudOverlay.addView(liveConsole, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = 8 })
+
+            container.addView(hudOverlay, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP or Gravity.END
-            ).apply { topMargin = 48; rightMargin = 36 })
+                Gravity.TOP
+            ))
+
+            profilerTask = object : Runnable {
+                override fun run() {
+                    if (!isPlaying) return
+                    profilerText.text = "FPS: ${renderer.currentFps} | Nodes: ${renderer.nodeCount}"
+                    val logs = EngineConsole.dump().lines().takeLast(3).joinToString("\n")
+                    liveConsole.text = logs
+                    uiHandler.postDelayed(this, 300)
+                }
+            }
+            uiHandler.post(profilerTask!!)
         }
     }
 
     private fun stopPlayMode() {
         if (!isPlaying) return
         isPlaying = false
+        profilerTask?.let { uiHandler.removeCallbacks(it) }
+        glView?.queueEvent { scriptRuntime?.release() }
         glView?.onPause()
         glView = null
+        scriptRuntime = null
         container.removeAllViews()
-        editorWebView?.let { container.addView(it) }
+        editorWebView?.let {
+            container.addView(it)
+            it.evaluateJavascript("refreshConsoleFromNative()", null)
+        }
     }
 
     @Deprecated("Deprecated in Java")
