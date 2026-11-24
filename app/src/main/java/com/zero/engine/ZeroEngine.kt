@@ -15,6 +15,8 @@ import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.GLUtils
 import android.opengl.Matrix
+import android.view.InputDevice
+import android.view.KeyEvent
 import android.view.MotionEvent
 import org.json.JSONArray
 import org.json.JSONObject
@@ -34,6 +36,343 @@ import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.*
 
+// ==================== P3 独立子系统 1：音频引擎 ====================
+class ZeroAudioSystem(
+    private val projectDir: File,
+    private val onConsoleLog: (String) -> Unit
+) {
+    private var bgmPlayer: MediaPlayer? = null
+    private val soundPool: SoundPool = SoundPool.Builder()
+        .setMaxStreams(8)
+        .setAudioAttributes(
+            AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_GAME)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+        )
+        .build()
+    private val sfxCache = ConcurrentHashMap<String, Int>()
+
+    fun playBGM(fileName: String, loop: Boolean, volume: Float) {
+        try {
+            stopBGM()
+            val file = File(File(projectDir, "audio"), fileName)
+            if (!file.exists()) {
+                onConsoleLog("[AUDIO 警告] 找不到 BGM 文件: $fileName")
+                return
+            }
+            bgmPlayer = MediaPlayer().apply {
+                setDataSource(file.absolutePath)
+                isLooping = loop
+                setVolume(volume.coerceIn(0f, 1f), volume.coerceIn(0f, 1f))
+                prepare()
+                start()
+            }
+        } catch (e: Exception) {
+            onConsoleLog("[AUDIO BGM 错误] ${e.message}")
+        }
+    }
+
+    fun stopBGM() {
+        try {
+            bgmPlayer?.stop()
+            bgmPlayer?.release()
+            bgmPlayer = null
+        } catch (_: Exception) {}
+    }
+
+    fun playSFX(fileName: String, volume: Float) {
+        try {
+            val vol = volume.coerceIn(0f, 1f)
+            val cachedId = sfxCache[fileName]
+            if (cachedId != null) {
+                soundPool.play(cachedId, vol, vol, 1, 0, 1.0f)
+                return
+            }
+            val file = File(File(projectDir, "audio"), fileName)
+            if (!file.exists()) {
+                onConsoleLog("[AUDIO 警告] 找不到音效文件: $fileName")
+                return
+            }
+            val sid = soundPool.load(file.absolutePath, 1)
+            sfxCache[fileName] = sid
+            soundPool.setOnLoadCompleteListener { sp, sampleId, status ->
+                if (status == 0 && sampleId == sid) {
+                    sp.play(sampleId, vol, vol, 1, 0, 1.0f)
+                }
+            }
+        } catch (e: Exception) {
+            onConsoleLog("[AUDIO SFX 错误] ${e.message}")
+        }
+    }
+
+    fun playToneAsync(hz: Int, ms: Int) {
+        Thread {
+            try {
+                val sampleRate = 22050
+                val count = (sampleRate * (ms / 1000.0)).toInt()
+                val buf = ShortArray(count)
+                for (i in 0 until count) {
+                    val env = 1.0 - (i.toDouble() / count)
+                    buf[i] = (sin(2.0 * PI * i * hz / sampleRate) * 12000 * env).toInt().toShort()
+                }
+                val track = AudioTrack.Builder()
+                    .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_GAME).build())
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(sampleRate)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(buf.size * 2)
+                    .setTransferMode(AudioTrack.MODE_STATIC)
+                    .build()
+                track.write(buf, 0, buf.size)
+                track.play()
+                Thread.sleep(ms.toLong() + 30)
+                track.release()
+            } catch (_: Exception) {}
+        }.start()
+    }
+
+    fun release() {
+        stopBGM()
+        try {
+            soundPool.release()
+        } catch (_: Exception) {}
+    }
+}
+
+// ==================== P3 独立子系统 2：跨平台统一输入映射（多点触控 + 键盘 + 手柄） ====================
+class ZeroInputSystem {
+    data class TouchZone(
+        val action: String,
+        val cx: Float,
+        val cy: Float,
+        val w: Float,
+        val h: Float
+    )
+
+    private val lock = Any()
+    private val actionBindings = mutableMapOf<String, MutableSet<String>>()
+    private val keyDownSet = mutableSetOf<String>()
+    private val virtualActionDown = mutableSetOf<String>()
+    private val activePointers = mutableMapOf<Int, Pair<Float, Float>>()
+    private val touchZones = mutableListOf<TouchZone>()
+
+    private var stickX = 0f
+    private var stickY = 0f
+
+    // 帧级快照（在渲染线程 onDrawFrame 头部统一采样，确保同一帧内三态判定一致）
+    private var prevActionStates = mutableMapOf<String, Boolean>()
+    private var currActionStates = mutableMapOf<String, Boolean>()
+    private var frameStickX = 0f
+    private var frameStickY = 0f
+
+    init {
+        resetDefaultBindings()
+    }
+
+    fun resetDefaultBindings() = synchronized(lock) {
+        actionBindings.clear()
+        actionBindings["move_left"] = mutableSetOf("A", "LEFT", "DPAD_LEFT", "STICK_LEFT")
+        actionBindings["move_right"] = mutableSetOf("D", "RIGHT", "DPAD_RIGHT", "STICK_RIGHT")
+        actionBindings["move_up"] = mutableSetOf("W", "UP", "DPAD_UP", "STICK_UP")
+        actionBindings["move_down"] = mutableSetOf("S", "DOWN", "DPAD_DOWN", "STICK_DOWN")
+        actionBindings["jump"] = mutableSetOf("SPACE", "K", "GAMEPAD_A")
+        actionBindings["attack"] = mutableSetOf("J", "Z", "GAMEPAD_X")
+        actionBindings["dash"] = mutableSetOf("SHIFT", "L", "X", "GAMEPAD_B", "GAMEPAD_R1")
+        actionBindings["pause"] = mutableSetOf("ESC", "P", "GAMEPAD_START")
+    }
+
+    fun bindAction(action: String, keys: List<String>) = synchronized(lock) {
+        if (action.isEmpty()) return@synchronized
+        actionBindings[action] = keys.map { it.uppercase() }.toMutableSet()
+    }
+
+    fun setVirtualAction(action: String, pressed: Boolean) = synchronized(lock) {
+        if (pressed) virtualActionDown.add(action) else virtualActionDown.remove(action)
+    }
+
+    fun bindTouchZone(action: String, cx: Float, cy: Float, w: Float, h: Float) = synchronized(lock) {
+        touchZones.removeAll { it.action == action && abs(it.cx - cx) < 1f && abs(it.cy - cy) < 1f }
+        touchZones.add(TouchZone(action, cx, cy, max(16f, w), max(16f, h)))
+    }
+
+    fun clearTouchZones() = synchronized(lock) {
+        touchZones.clear()
+    }
+
+    fun getTouchZonesSnapshot(): List<TouchZone> = synchronized(lock) {
+        touchZones.toList()
+    }
+
+    fun onKeyEvent(keyCode: Int, isDown: Boolean): Boolean {
+        val name = mapAndroidKeyCode(keyCode) ?: return false
+        synchronized(lock) {
+            if (isDown) keyDownSet.add(name) else keyDownSet.remove(name)
+        }
+        return true
+    }
+
+    fun onGamepadMotion(event: MotionEvent): Boolean {
+        val isJoystick = (event.source and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK ||
+            (event.source and InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
+        if (!isJoystick) return false
+
+        val deadzone = 0.22f
+        val rawX = event.getAxisValue(MotionEvent.AXIS_X)
+        val rawY = event.getAxisValue(MotionEvent.AXIS_Y)
+        val hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X)
+        val hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
+
+        val ax = if (abs(rawX) > deadzone) rawX else 0f
+        val ay = if (abs(rawY) > deadzone) rawY else 0f
+
+        synchronized(lock) {
+            stickX = ax
+            stickY = ay
+            updateKeyFlag("STICK_LEFT", ax < -deadzone)
+            updateKeyFlag("STICK_RIGHT", ax > deadzone)
+            updateKeyFlag("STICK_UP", ay < -deadzone)
+            updateKeyFlag("STICK_DOWN", ay > deadzone)
+            updateKeyFlag("DPAD_LEFT", hatX < -0.5f)
+            updateKeyFlag("DPAD_RIGHT", hatX > 0.5f)
+            updateKeyFlag("DPAD_UP", hatY < -0.5f)
+            updateKeyFlag("DPAD_DOWN", hatY > 0.5f)
+        }
+        return true
+    }
+
+    fun onMultiTouch(event: MotionEvent, viewW: Int, viewH: Int) = synchronized(lock) {
+        val w = max(1, viewW).toFloat()
+        val h = max(1, viewH).toFloat()
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                val idx = event.actionIndex
+                val pid = event.getPointerId(idx)
+                activePointers[pid] = ((event.getX(idx) / w) * 1080f) to ((event.getY(idx) / h) * 1920f)
+            }
+            MotionEvent.ACTION_MOVE -> {
+                for (i in 0 until event.pointerCount) {
+                    val pid = event.getPointerId(i)
+                    activePointers[pid] = ((event.getX(i) / w) * 1080f) to ((event.getY(i) / h) * 1920f)
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
+                val idx = event.actionIndex
+                activePointers.remove(event.getPointerId(idx))
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                activePointers.clear()
+            }
+        }
+    }
+
+    fun clearAllPointers() = synchronized(lock) {
+        activePointers.clear()
+        virtualActionDown.clear()
+    }
+
+    fun beginFrame() = synchronized(lock) {
+        prevActionStates.clear()
+        prevActionStates.putAll(currActionStates)
+        currActionStates.clear()
+
+        frameStickX = stickX
+        frameStickY = stickY
+
+        // 收集所有注册的动作名（含绑定表、虚拟按钮与触控热区）
+        val allActions = HashSet<String>(actionBindings.keys)
+        allActions.addAll(virtualActionDown)
+        for (z in touchZones) allActions.add(z.action)
+
+        for (act in allActions) {
+            var active = virtualActionDown.contains(act)
+            if (!active) {
+                val keys = actionBindings[act]
+                if (keys != null) {
+                    for (k in keys) {
+                        if (keyDownSet.contains(k)) {
+                            active = true
+                            break
+                        }
+                    }
+                }
+            }
+            if (!active && activePointers.isNotEmpty()) {
+                for (z in touchZones) {
+                    if (z.action != act) continue
+                    val hw = z.w * 0.5f
+                    val hh = z.h * 0.5f
+                    for ((px, py) in activePointers.values) {
+                        if (abs(px - z.cx) <= hw && abs(py - z.cy) <= hh) {
+                            active = true
+                            break
+                        }
+                    }
+                    if (active) break
+                }
+            }
+            currActionStates[act] = active
+        }
+    }
+
+    fun isActionPressed(action: String): Boolean = currActionStates[action] == true
+
+    fun isActionJustPressed(action: String): Boolean =
+        currActionStates[action] == true && prevActionStates[action] != true
+
+    fun isActionJustReleased(action: String): Boolean =
+        currActionStates[action] != true && prevActionStates[action] == true
+
+    fun getAxis(negAction: String, posAction: String): Float {
+        if (negAction == "move_left" && posAction == "move_right" && abs(frameStickX) > 0.22f) {
+            return frameStickX.coerceIn(-1f, 1f)
+        }
+        if (negAction == "move_up" && posAction == "move_down" && abs(frameStickY) > 0.22f) {
+            return frameStickY.coerceIn(-1f, 1f)
+        }
+        var v = 0f
+        if (isActionPressed(negAction)) v -= 1f
+        if (isActionPressed(posAction)) v += 1f
+        return v
+    }
+
+    fun getTouchCount(): Int = synchronized(lock) { activePointers.size }
+
+    private fun updateKeyFlag(key: String, down: Boolean) {
+        if (down) keyDownSet.add(key) else keyDownSet.remove(key)
+    }
+
+    private fun mapAndroidKeyCode(keyCode: Int): String? = when (keyCode) {
+        in KeyEvent.KEYCODE_A..KeyEvent.KEYCODE_Z -> ('A' + (keyCode - KeyEvent.KEYCODE_A)).toString()
+        in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 -> ('0' + (keyCode - KeyEvent.KEYCODE_0)).toString()
+        KeyEvent.KEYCODE_SPACE -> "SPACE"
+        KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> "ENTER"
+        KeyEvent.KEYCODE_ESCAPE -> "ESC"
+        KeyEvent.KEYCODE_SHIFT_LEFT, KeyEvent.KEYCODE_SHIFT_RIGHT -> "SHIFT"
+        KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.KEYCODE_CTRL_RIGHT -> "CTRL"
+        KeyEvent.KEYCODE_DPAD_LEFT -> "LEFT"
+        KeyEvent.KEYCODE_DPAD_RIGHT -> "RIGHT"
+        KeyEvent.KEYCODE_DPAD_UP -> "UP"
+        KeyEvent.KEYCODE_DPAD_DOWN -> "DOWN"
+        KeyEvent.KEYCODE_BUTTON_A -> "GAMEPAD_A"
+        KeyEvent.KEYCODE_BUTTON_B -> "GAMEPAD_B"
+        KeyEvent.KEYCODE_BUTTON_X -> "GAMEPAD_X"
+        KeyEvent.KEYCODE_BUTTON_Y -> "GAMEPAD_Y"
+        KeyEvent.KEYCODE_BUTTON_L1 -> "GAMEPAD_L1"
+        KeyEvent.KEYCODE_BUTTON_R1 -> "GAMEPAD_R1"
+        KeyEvent.KEYCODE_BUTTON_L2 -> "GAMEPAD_L2"
+        KeyEvent.KEYCODE_BUTTON_R2 -> "GAMEPAD_R2"
+        KeyEvent.KEYCODE_BUTTON_START -> "GAMEPAD_START"
+        KeyEvent.KEYCODE_BUTTON_SELECT -> "GAMEPAD_SELECT"
+        else -> null
+    }
+}
+
+// ==================== ZeroEngine 主视图与渲染/物理/脚本核心 ====================
 class ZeroEngineView(
     context: Context,
     private val projectDir: File,
@@ -106,7 +445,6 @@ class ZeroEngineView(
         var layer: String = "World",       // World | UI
         var parent: String = "",
         var tag: String = "default",
-        // P2：多场景分组与跨场景常驻标记
         var sceneGroup: String = "main",
         var persistent: Boolean = false,
         var x: Float = 0f,
@@ -121,7 +459,6 @@ class ZeroEngineView(
         var scaleY: Float = 1f,
         var zIndex: Int = 0,
         var visible: Boolean = true,
-        // 通用视差滚动系数
         var parallaxX: Float = 1f,
         var parallaxY: Float = 1f,
         var texture: String = "",
@@ -135,18 +472,18 @@ class ZeroEngineView(
         var lightRadius: Float = 450f,
         var lightIntensity: Float = 1.4f,
         var shadowCaster: Boolean = false,
-        // 通用物理、平台、斜坡与 P1 独立碰撞体参数
+        // 通用物理、平台、斜坡与独立碰撞体
         var collider: Boolean = false,
         var isTrigger: Boolean = false,
         var oneWay: Boolean = false,
-        var slopeType: String = "none",     // none | left_up (/) | right_up (\)
+        var slopeType: String = "none",
         var colOffsetX: Float = 0f,
         var colOffsetY: Float = 0f,
-        var colWidth: Float = 0f,           // <= 0 时自动使用 node.width
-        var colHeight: Float = 0f,          // <= 0 时自动使用 node.height
+        var colWidth: Float = 0f,
+        var colHeight: Float = 0f,
         var colLayer: Int = 1,
         var colMask: Int = 0xFFFF,
-        var bodyMode: String = "kinematic", // kinematic | platformer | rigid
+        var bodyMode: String = "kinematic",
         var gravity: Float = 2200f,
         var fallMultiplier: Float = 1.55f,
         var maxFallSpeed: Float = 1450f,
@@ -158,7 +495,7 @@ class ZeroEngineView(
         var jumpCount: Int = 0,
         var maxJumps: Int = 2,
         var dropThroughTimer: Float = 0f,
-        // 通用战斗判定属性
+        // 战斗判定
         var isHitbox: Boolean = false,
         var isHurtbox: Boolean = false,
         var damage: Float = 10f,
@@ -176,7 +513,7 @@ class ZeroEngineView(
         var animTimer: Float = 0f,
         var currentClipName: String = "",
         val clips: MutableMap<String, AnimClip> = mutableMapOf(),
-        // TileMap 稀疏瓦片数据 + P0 VBO 缓存 + P1 O(1) 哈希查表
+        // TileMap 稀疏瓦片数据 + VBO + O(1) 查表
         var tileSize: Float = 90f,
         val tiles: MutableList<TileCell> = mutableListOf(),
         val tileLookup: HashMap<Long, TileCell> = HashMap(),
@@ -187,7 +524,7 @@ class ZeroEngineView(
         var tileMaxX: Float = 0f,
         var tileMinY: Float = 0f,
         var tileMaxY: Float = 0f,
-        // 原生 GPU 粒子池参数
+        // GPU 粒子池
         var emitRate: Float = 24f,
         var particleLife: Float = 1.1f,
         var particleSpeed: Float = 160f,
@@ -204,7 +541,7 @@ class ZeroEngineView(
         var customProgram: Int = 0
     )
 
-    // ==================== P0 + P1 + P2：零拷贝 JS 属性代理 ====================
+    // ==================== 零拷贝 JS 属性代理 ====================
     private inner class GameNodeJsProxy(val n: GameNode) : ScriptableObject() {
         override fun getClassName() = "GameNode"
 
@@ -309,6 +646,10 @@ class ZeroEngineView(
         }
     }
 
+    // P3：解耦后的子系统实例
+    private val audioSystem = ZeroAudioSystem(projectDir, onConsoleLog)
+    private val inputSystem = ZeroInputSystem()
+
     private val nodes = mutableListOf<GameNode>()
     private val pendingAdd = mutableListOf<GameNode>()
     private val pendingRemove = mutableSetOf<GameNode>()
@@ -316,7 +657,7 @@ class ZeroEngineView(
     private val textureCache = ConcurrentHashMap<String, Int>()
     private val eventListeners = mutableMapOf<String, MutableList<Function>>()
 
-    // ==================== P1：空间哈希网格与调试线框状态 ====================
+    // P1：空间哈希网格与调试线框
     private val spatialCellSize = 256f
     private val spatialGrid = HashMap<Long, MutableList<GameNode>>(256)
     private val activeTileMaps = mutableListOf<GameNode>()
@@ -328,7 +669,7 @@ class ZeroEngineView(
         .order(ByteOrder.nativeOrder()).asFloatBuffer()
     private val identityMatrix = FloatArray(16).apply { Matrix.setIdentityM(this, 0) }
 
-    // ==================== P2：多场景叠加、后台异步预加载与平滑转场 ====================
+    // P2：多场景叠加、后台预加载与 FBO 后处理
     private val globalDataStore = ConcurrentHashMap<String, Any?>()
     private val preloadedSceneCache = ConcurrentHashMap<String, String>()
     private val sceneIoExecutor = Executors.newSingleThreadExecutor()
@@ -336,7 +677,6 @@ class ZeroEngineView(
     private val pendingAdditiveLoads = mutableListOf<AdditiveLoadReq>()
     private val pendingUnloadScenes = mutableListOf<String>()
 
-    // P2：FBO 离屏光照 + 全屏后处理管线状态
     private var postFxEnabled = true
     private var fboReady = false
     private var sceneFbo = 0
@@ -383,20 +723,7 @@ class ZeroEngineView(
         }
     }
 
-    // 音频管理器 (BGM + SFX)
-    private var bgmPlayer: MediaPlayer? = null
-    private val soundPool: SoundPool = SoundPool.Builder()
-        .setMaxStreams(8)
-        .setAudioAttributes(
-            AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_GAME)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                .build()
-        )
-        .build()
-    private val sfxCache = ConcurrentHashMap<String, Int>()
-
-    // 2D / 2.5D 摄像机状态与视锥边界
+    // 摄像机与视锥边界
     private var camMode = "2.5D"
     private var camX = 540f
     private var camY = 960f
@@ -430,7 +757,7 @@ class ZeroEngineView(
     private var lastFrameCulled = 0
     private var lastFrameLights = 0
 
-    // 全局顿帧与时间缩放
+    // 顿帧与时间缩放
     private var hitstopTimer = 0f
     private var timeScale = 1f
 
@@ -439,7 +766,7 @@ class ZeroEngineView(
     private var ambientG = 0.56f
     private var ambientB = 0.68f
 
-    // 触控输入状态
+    // 兼容旧版单指触控状态
     @Volatile private var isTouching = false
     @Volatile private var touchScreenX = 0f
     @Volatile private var touchScreenY = 0f
@@ -466,7 +793,6 @@ class ZeroEngineView(
     private lateinit var rhino: RhinoContext
     private lateinit var globalScope: ScriptableObject
 
-    // 标准矩形顶点
     private val quadBuffer: FloatBuffer = ByteBuffer.allocateDirect(4 * 5 * 4)
         .order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
             put(floatArrayOf(
@@ -478,7 +804,6 @@ class ZeroEngineView(
             position(0)
         }
 
-    // 斜坡三角形顶点: left_up (/) -> 右上、左下、右下
     private val slopeLeftUpBuffer: FloatBuffer = ByteBuffer.allocateDirect(3 * 5 * 4)
         .order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
             put(floatArrayOf(
@@ -489,7 +814,6 @@ class ZeroEngineView(
             position(0)
         }
 
-    // 斜坡三角形顶点: right_up (\) -> 左上、左下、右下
     private val slopeRightUpBuffer: FloatBuffer = ByteBuffer.allocateDirect(3 * 5 * 4)
         .order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
             put(floatArrayOf(
@@ -501,6 +825,9 @@ class ZeroEngineView(
         }
 
     init {
+        isFocusable = true
+        isFocusableInTouchMode = true
+        requestFocus()
         setEGLContextClientVersion(2)
         setRenderer(this)
         renderMode = RENDERMODE_CONTINUOUSLY
@@ -516,6 +843,7 @@ class ZeroEngineView(
         try {
             sceneIoExecutor.shutdownNow()
         } catch (_: Exception) {}
+        inputSystem.clearAllPointers()
         queueEvent {
             releaseFbos()
             releaseSceneGpuResources(includePersistent = true)
@@ -530,14 +858,7 @@ class ZeroEngineView(
                 textTextureCache.clear()
             }
         }
-        try {
-            bgmPlayer?.stop()
-            bgmPlayer?.release()
-            bgmPlayer = null
-        } catch (_: Exception) {}
-        try {
-            soundPool.release()
-        } catch (_: Exception) {}
+        audioSystem.release()
     }
 
     private fun releaseNodeGpuResources(n: GameNode) {
@@ -559,7 +880,6 @@ class ZeroEngineView(
         }
     }
 
-    // ==================== P2：FBO 离屏帧缓冲创建与管理 ====================
     private fun releaseFbos() {
         fboReady = false
         if (sceneFbo != 0) { GLES20.glDeleteFramebuffers(1, intArrayOf(sceneFbo), 0); sceneFbo = 0 }
@@ -699,7 +1019,6 @@ class ZeroEngineView(
         recreateFbos(surfaceW, surfaceH)
     }
 
-    // ==================== P1：独立碰撞体边界计算与空间哈希索引 ====================
     private fun getColliderBounds(n: GameNode): ColliderBounds {
         val gt = getGlobalTransform(n)
         val rawW = if (n.colWidth > 0f) n.colWidth else n.width
@@ -711,9 +1030,8 @@ class ZeroEngineView(
         return ColliderBounds(cx, cy, hw, hh)
     }
 
-    private fun canCollideLayer(mover: GameNode, target: GameNode): Boolean {
-        return (mover.colMask and target.colLayer) != 0
-    }
+    private fun canCollideLayer(mover: GameNode, target: GameNode): Boolean =
+        (mover.colMask and target.colLayer) != 0
 
     private fun rebuildSpatialIndex() {
         spatialGrid.clear()
@@ -752,14 +1070,10 @@ class ZeroEngineView(
         for (cx in minCx..maxCx) {
             for (cy in minCy..maxCy) {
                 val bucket = spatialGrid[packGridKey(cx, cy)] ?: continue
-                for (i in bucket.indices) {
-                    out.add(bucket[i])
-                }
+                for (i in bucket.indices) out.add(bucket[i])
             }
         }
-        for (tm in activeTileMaps) {
-            out.add(tm)
-        }
+        for (tm in activeTileMaps) out.add(tm)
     }
 
     private fun updateFadeTransition(rawDt: Float) {
@@ -791,9 +1105,10 @@ class ZeroEngineView(
         val instFps = 1f / rawDt
         smoothedFps = smoothedFps * 0.9f + instFps * 0.1f
 
+        // P3：每帧最先采样多点触控 + 键盘 + 手柄动作快照
+        inputSystem.beginFrame()
         updateFadeTransition(rawDt)
 
-        // 处理主场景切换（优先读后台预加载缓存）
         pendingSceneLoad?.let { nextSceneFile ->
             pendingSceneLoad = null
             val norm = normalizeSceneName(nextSceneFile)
@@ -806,7 +1121,6 @@ class ZeroEngineView(
             }
         }
 
-        // 处理叠加场景加载
         if (pendingAdditiveLoads.isNotEmpty()) {
             val reqs = pendingAdditiveLoads.toList()
             pendingAdditiveLoads.clear()
@@ -822,14 +1136,11 @@ class ZeroEngineView(
             }
         }
 
-        // 处理按场景组卸载
         if (pendingUnloadScenes.isNotEmpty()) {
             val groups = pendingUnloadScenes.toSet()
             pendingUnloadScenes.clear()
             for (n in nodes) {
-                if (!n.persistent && n.sceneGroup in groups) {
-                    pendingRemove.add(n)
-                }
+                if (!n.persistent && n.sceneGroup in groups) pendingRemove.add(n)
             }
         }
 
@@ -891,9 +1202,7 @@ class ZeroEngineView(
         processCombatOverlaps()
 
         if (pendingRemove.isNotEmpty()) {
-            for (rem in pendingRemove) {
-                releaseNodeGpuResources(rem)
-            }
+            for (rem in pendingRemove) releaseNodeGpuResources(rem)
             nodes.removeAll(pendingRemove)
             pendingRemove.clear()
         }
@@ -901,11 +1210,9 @@ class ZeroEngineView(
         renderSceneFrame()
     }
 
-    private fun isBoxInView(minX: Float, maxX: Float, minY: Float, maxY: Float): Boolean {
-        return maxX >= viewMinX && minX <= viewMaxX && maxY >= viewMinY && minY <= viewMaxY
-    }
+    private fun isBoxInView(minX: Float, maxX: Float, minY: Float, maxY: Float): Boolean =
+        maxX >= viewMinX && minX <= viewMaxX && maxY >= viewMinY && minY <= viewMaxY
 
-    // ==================== P2：多 Pass FBO 离屏光照 + 后处理渲染管线 ====================
     private fun renderSceneFrame() {
         frameDrawCalls = 0
         frameCulled = 0
@@ -921,7 +1228,6 @@ class ZeroEngineView(
         val useFbo = postFxEnabled && fboReady
 
         if (useFbo) {
-            // Pass 1：将所有世界实体与动态阴影无光照绘制到 sceneFbo
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, sceneFbo)
             GLES20.glViewport(0, 0, surfaceW, surfaceH)
             GLES20.glClearColor(0.04f, 0.05f, 0.08f, 1f)
@@ -945,22 +1251,18 @@ class ZeroEngineView(
                 }
             }
 
-            // Pass 2：将无限数量点光源累加渲染到半分辨率 lightFbo
             renderLightsToFbo(allLights)
 
-            // Pass 3：在默认屏幕上合成光照 + 泛光 + 色差 + 暗角 + 转场黑屏
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
             GLES20.glViewport(0, 0, surfaceW, surfaceH)
             GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1f)
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
             renderPostComposite()
 
-            // 自发光粒子叠加在光照合成之后（暗场依然耀眼，同时响应转场淡出）
             for (pNode in particleNodes) {
                 renderParticles(pNode, vpMatrix, isWorld = true, fadeAlpha = 1f - postFade)
             }
         } else {
-            // 降级直出模式（兼容关闭后处理或不支持 FBO 的极旧设备）
             val lights = allLights.take(8)
             val lightPosArr = FloatArray(8 * 4)
             val lightColArr = FloatArray(8 * 4)
@@ -1000,12 +1302,10 @@ class ZeroEngineView(
             }
         }
 
-        // P1：调试线框渲染层
         if (debugDrawEnabled) {
             renderDebugOverlay(vpMatrix)
         }
 
-        // Pass 4：锐利 UI HUD 层（不受世界光照与色差影响）
         val emptyUiArr = FloatArray(4)
         val uiNodes = nodes.filter { it.visible && it.layer == "UI" }.sortedBy { it.zIndex }
         for (n in uiNodes) {
@@ -1014,6 +1314,11 @@ class ZeroEngineView(
             } else {
                 renderNode(n, uiVpMatrix, isWorld = false, enableInlineLight = false, 0, emptyUiArr, emptyUiArr)
             }
+        }
+
+        // P3：开启 Debug 时在 UI 层画出所有多点触控热区框
+        if (debugDrawEnabled) {
+            renderTouchZonesDebugOverlay(uiVpMatrix)
         }
 
         lastFrameDrawCalls = frameDrawCalls
@@ -1106,7 +1411,6 @@ class ZeroEngineView(
         GLES20.glEnable(GLES20.GL_BLEND)
     }
 
-    // ==================== P1：一键 Debug 线框绘制 ====================
     private fun drawDebugRect(
         posLoc: Int, uvLoc: Int, colLoc: Int,
         minX: Float, minY: Float, maxX: Float, maxY: Float, z: Float,
@@ -1245,6 +1549,44 @@ class ZeroEngineView(
         GLES20.glDisableVertexAttribArray(uvLoc)
     }
 
+    private fun renderTouchZonesDebugOverlay(uiVp: FloatArray) {
+        val zones = inputSystem.getTouchZonesSnapshot()
+        if (zones.isEmpty()) return
+
+        val prog = defaultLitProgram
+        GLES20.glUseProgram(prog)
+        GLES20.glLineWidth(3f)
+
+        val posLoc = GLES20.glGetAttribLocation(prog, "aPosition")
+        val uvLoc = GLES20.glGetAttribLocation(prog, "aTexCoord")
+        val colLoc = GLES20.glGetUniformLocation(prog, "uColor")
+        GLES20.glEnableVertexAttribArray(posLoc)
+        GLES20.glEnableVertexAttribArray(uvLoc)
+
+        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uMVP"), 1, false, uiVp, 0)
+        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uModel"), 1, false, identityMatrix, 0)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uEnableLight"), 0)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uFlash"), 0f)
+        GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uUvRect"), 0f, 0f, 1f, 1f)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, whiteTexId)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uTexture"), 0)
+
+        for (z in zones) {
+            val active = inputSystem.isActionPressed(z.action)
+            val hw = z.w * 0.5f
+            val hh = z.h * 0.5f
+            if (active) {
+                drawDebugRect(posLoc, uvLoc, colLoc, z.cx - hw, z.cy - hh, z.cx + hw, z.cy + hh, 20f, 1.0f, 0.85f, 0.1f, 0.95f)
+            } else {
+                drawDebugRect(posLoc, uvLoc, colLoc, z.cx - hw, z.cy - hh, z.cx + hw, z.cy + hh, 20f, 0.2f, 0.85f, 1.0f, 0.55f)
+            }
+        }
+
+        GLES20.glDisableVertexAttribArray(posLoc)
+        GLES20.glDisableVertexAttribArray(uvLoc)
+    }
+
     private fun processCombatOverlaps() {
         val hitboxes = nodes.filter { it.visible && it.isHitbox && !pendingRemove.contains(it) }
         if (hitboxes.isEmpty()) return
@@ -1275,7 +1617,6 @@ class ZeroEngineView(
         }
     }
 
-    // ==================== P0：TileMap 静态 VBO 合批 ====================
     private fun buildTileMapVbo(n: GameNode) {
         if (n.tileVboId != 0) {
             GLES20.glDeleteBuffers(1, intArrayOf(n.tileVboId), 0)
@@ -1869,63 +2210,7 @@ class ZeroEngineView(
         }
     }
 
-    // ==================== 音频播放引擎 ====================
-    private fun playBGMFile(fileName: String, loop: Boolean, volume: Float) {
-        try {
-            bgmPlayer?.stop()
-            bgmPlayer?.release()
-            bgmPlayer = null
-            val file = File(File(projectDir, "audio"), fileName)
-            if (!file.exists()) {
-                onConsoleLog("[AUDIO 警告] 找不到 BGM 文件: $fileName")
-                return
-            }
-            bgmPlayer = MediaPlayer().apply {
-                setDataSource(file.absolutePath)
-                isLooping = loop
-                setVolume(volume.coerceIn(0f, 1f), volume.coerceIn(0f, 1f))
-                prepare()
-                start()
-            }
-        } catch (e: Exception) {
-            onConsoleLog("[AUDIO BGM 错误] ${e.message}")
-        }
-    }
-
-    private fun stopBGMFile() {
-        try {
-            bgmPlayer?.stop()
-            bgmPlayer?.release()
-            bgmPlayer = null
-        } catch (_: Exception) {}
-    }
-
-    private fun playSFXFile(fileName: String, volume: Float) {
-        try {
-            val vol = volume.coerceIn(0f, 1f)
-            val cachedId = sfxCache[fileName]
-            if (cachedId != null) {
-                soundPool.play(cachedId, vol, vol, 1, 0, 1.0f)
-                return
-            }
-            val file = File(File(projectDir, "audio"), fileName)
-            if (!file.exists()) {
-                onConsoleLog("[AUDIO 警告] 找不到音效文件: $fileName")
-                return
-            }
-            val sid = soundPool.load(file.absolutePath, 1)
-            sfxCache[fileName] = sid
-            soundPool.setOnLoadCompleteListener { sp, sampleId, status ->
-                if (status == 0 && sampleId == sid) {
-                    sp.play(sampleId, vol, vol, 1, 0, 1.0f)
-                }
-            }
-        } catch (e: Exception) {
-            onConsoleLog("[AUDIO SFX 错误] ${e.message}")
-        }
-    }
-
-    // ==================== P1：空间加速射线检测 ====================
+    // ==================== 空间加速射线检测 ====================
     private fun performRaycast(x1: Float, y1: Float, x2: Float, y2: Float, ignoreTag: String, mask: Int): Scriptable {
         var closestT = 1.0f
         var hitNode: GameNode? = null
@@ -2086,7 +2371,6 @@ class ZeroEngineView(
             null
         })
         ScriptableObject.putProperty(engineApi, "isDebugDraw", jsFunc { debugDrawEnabled })
-        // P2：屏幕后处理与转场 API
         ScriptableObject.putProperty(engineApi, "setPostFX", jsFunc { args ->
             val cfg = args.getOrNull(0) as? Scriptable ?: return@jsFunc null
             postFxEnabled = getJsBool(cfg, "enabled", postFxEnabled)
@@ -2101,12 +2385,9 @@ class ZeroEngineView(
             val dur = (args.getOrNull(1) as? Number)?.toFloat() ?: 0.3f
             pendingFadeScene = null
             if (dur <= 0.01f) {
-                postFade = target
-                fadeTarget = target
-                fadeSpeed = 0f
+                postFade = target; fadeTarget = target; fadeSpeed = 0f
             } else {
-                fadeTarget = target
-                fadeSpeed = abs(target - postFade) / dur
+                fadeTarget = target; fadeSpeed = abs(target - postFade) / dur
             }
             null
         })
@@ -2122,7 +2403,6 @@ class ZeroEngineView(
             }
             null
         })
-        // P2：后台异步预加载与多场景叠加/卸载 API
         ScriptableObject.putProperty(engineApi, "preloadScene", jsFunc { args ->
             val sName = RhinoContext.toString(args.getOrNull(0) ?: "")
             if (sName.isNotEmpty()) preloadSceneAsync(sName)
@@ -2139,9 +2419,7 @@ class ZeroEngineView(
         })
         ScriptableObject.putProperty(engineApi, "unloadScene", jsFunc { args ->
             val sName = RhinoContext.toString(args.getOrNull(0) ?: "")
-            if (sName.isNotEmpty()) {
-                pendingUnloadScenes.add(normalizeSceneName(sName))
-            }
+            if (sName.isNotEmpty()) pendingUnloadScenes.add(normalizeSceneName(sName))
             null
         })
         ScriptableObject.putProperty(engineApi, "clearSceneCache", jsFunc {
@@ -2158,15 +2436,14 @@ class ZeroEngineView(
             ScriptableObject.putProperty(obj, "spatialCells", spatialGrid.size)
             ScriptableObject.putProperty(obj, "cachedScenes", preloadedSceneCache.size)
             ScriptableObject.putProperty(obj, "fbo", postFxEnabled && fboReady)
+            ScriptableObject.putProperty(obj, "touches", inputSystem.getTouchCount())
             ScriptableObject.putProperty(obj, "textures", textureCache.size)
             ScriptableObject.putProperty(obj, "textTextures", textTextureCache.size)
             obj
         })
         ScriptableObject.putProperty(engineApi, "loadScene", jsFunc { args ->
             val sName = RhinoContext.toString(args.getOrNull(0) ?: "")
-            if (sName.isNotEmpty()) {
-                pendingSceneLoad = normalizeSceneName(sName)
-            }
+            if (sName.isNotEmpty()) pendingSceneLoad = normalizeSceneName(sName)
             null
         })
         ScriptableObject.putProperty(engineApi, "setGlobal", jsFunc { args ->
@@ -2279,24 +2556,24 @@ class ZeroEngineView(
         ScriptableObject.putProperty(engineApi, "playTone", jsFunc { args ->
             val hz = (args.getOrNull(0) as? Number)?.toInt() ?: 440
             val ms = (args.getOrNull(1) as? Number)?.toInt() ?: 80
-            playToneAsync(hz, ms)
+            audioSystem.playToneAsync(hz, ms)
             null
         })
         ScriptableObject.putProperty(engineApi, "playBGM", jsFunc { args ->
             val fileName = RhinoContext.toString(args.getOrNull(0) ?: "")
             val loop = (args.getOrNull(1) as? Boolean) ?: true
             val vol = (args.getOrNull(2) as? Number)?.toFloat() ?: 0.8f
-            if (fileName.isNotEmpty()) playBGMFile(fileName, loop, vol)
+            if (fileName.isNotEmpty()) audioSystem.playBGM(fileName, loop, vol)
             null
         })
         ScriptableObject.putProperty(engineApi, "stopBGM", jsFunc {
-            stopBGMFile()
+            audioSystem.stopBGM()
             null
         })
         ScriptableObject.putProperty(engineApi, "playSFX", jsFunc { args ->
             val fileName = RhinoContext.toString(args.getOrNull(0) ?: "")
             val vol = (args.getOrNull(1) as? Number)?.toFloat() ?: 1.0f
-            if (fileName.isNotEmpty()) playSFXFile(fileName, vol)
+            if (fileName.isNotEmpty()) audioSystem.playSFX(fileName, vol)
             null
         })
         ScriptableObject.putProperty(engineApi, "moveAndSlide", jsFunc { args ->
@@ -2423,11 +2700,13 @@ class ZeroEngineView(
         })
         ScriptableObject.putProperty(globalScope, "Engine", engineApi)
 
+        // P3：跨平台统一 Input API（兼容旧属性 + 新增 Action / 键鼠 / 手柄 / 多点触控热区）
         val inputApi = object : ScriptableObject() {
             override fun getClassName() = "Input"
             override fun get(name: String?, start: Scriptable?): Any? {
                 return when (name) {
-                    "isTouching" -> isTouching
+                    "isTouching" -> isTouching || inputSystem.getTouchCount() > 0
+                    "touchCount" -> inputSystem.getTouchCount()
                     "screenX", "touchX" -> touchScreenX.toDouble()
                     "screenY", "touchY" -> touchScreenY.toDouble()
                     "worldX" -> touchWorldX.toDouble()
@@ -2436,6 +2715,58 @@ class ZeroEngineView(
                 }
             }
         }
+        ScriptableObject.putProperty(inputApi, "isActionPressed", jsFunc { args ->
+            val act = RhinoContext.toString(args.getOrNull(0) ?: "")
+            inputSystem.isActionPressed(act)
+        })
+        ScriptableObject.putProperty(inputApi, "isActionJustPressed", jsFunc { args ->
+            val act = RhinoContext.toString(args.getOrNull(0) ?: "")
+            inputSystem.isActionJustPressed(act)
+        })
+        ScriptableObject.putProperty(inputApi, "isActionJustReleased", jsFunc { args ->
+            val act = RhinoContext.toString(args.getOrNull(0) ?: "")
+            inputSystem.isActionJustReleased(act)
+        })
+        ScriptableObject.putProperty(inputApi, "getAxis", jsFunc { args ->
+            val neg = RhinoContext.toString(args.getOrNull(0) ?: "move_left")
+            val pos = RhinoContext.toString(args.getOrNull(1) ?: "move_right")
+            inputSystem.getAxis(neg, pos).toDouble()
+        })
+        ScriptableObject.putProperty(inputApi, "bindAction", jsFunc { args ->
+            val act = RhinoContext.toString(args.getOrNull(0) ?: "")
+            val rawKeys = args.getOrNull(1)
+            val list = mutableListOf<String>()
+            if (rawKeys is Scriptable) {
+                val len = (ScriptableObject.getProperty(rawKeys, "length") as? Number)?.toInt() ?: 0
+                for (i in 0 until len) {
+                    val v = ScriptableObject.getProperty(rawKeys, i)
+                    if (v != null && v !== Scriptable.NOT_FOUND) list.add(RhinoContext.toString(v))
+                }
+            } else if (rawKeys != null) {
+                list.add(RhinoContext.toString(rawKeys))
+            }
+            if (act.isNotEmpty() && list.isNotEmpty()) inputSystem.bindAction(act, list)
+            null
+        })
+        ScriptableObject.putProperty(inputApi, "setVirtualAction", jsFunc { args ->
+            val act = RhinoContext.toString(args.getOrNull(0) ?: "")
+            val down = (args.getOrNull(1) as? Boolean) ?: false
+            if (act.isNotEmpty()) inputSystem.setVirtualAction(act, down)
+            null
+        })
+        ScriptableObject.putProperty(inputApi, "bindTouchZone", jsFunc { args ->
+            val act = RhinoContext.toString(args.getOrNull(0) ?: "")
+            val cx = (args.getOrNull(1) as? Number)?.toFloat() ?: 0f
+            val cy = (args.getOrNull(2) as? Number)?.toFloat() ?: 0f
+            val w = (args.getOrNull(3) as? Number)?.toFloat() ?: 160f
+            val h = (args.getOrNull(4) as? Number)?.toFloat() ?: 160f
+            if (act.isNotEmpty()) inputSystem.bindTouchZone(act, cx, cy, w, h)
+            null
+        })
+        ScriptableObject.putProperty(inputApi, "clearTouchZones", jsFunc {
+            inputSystem.clearTouchZones()
+            null
+        })
         ScriptableObject.putProperty(globalScope, "Input", inputApi)
     }
 
@@ -2547,7 +2878,7 @@ class ZeroEngineView(
         }
     }
 
-    // ==================== P1：空间哈希加速 + 独立 Collider 的 moveAndSlide ====================
+    // ==================== 空间哈希加速 + 独立 Collider 的 moveAndSlide ====================
     private fun computeSlopeSurfaceY(slope: GameNode, footX: Float): Float {
         val sb = getColliderBounds(slope)
         val sw = sb.hw * 2f
@@ -2584,7 +2915,6 @@ class ZeroEngineView(
         querySpatialCandidates(sweepMinX, sweepMaxX, sweepMinY, sweepMaxY, queryCandidates)
         val nearby = queryCandidates.toList()
 
-        // 1. X 轴位移与斜坡平滑爬升
         n.x += n.vx * dt
         var climbedSlope = false
         if (n.collider && !n.isTrigger) {
@@ -2614,7 +2944,6 @@ class ZeroEngineView(
             }
         }
 
-        // 2. Y 轴位移与地面/斜坡/单向平台碰撞
         val wasGrounded = n.isGrounded
         if (!climbedSlope) n.isGrounded = false
         n.y += n.vy * dt
@@ -2718,9 +3047,7 @@ class ZeroEngineView(
             val maxGy = floor((ba.cy + ba.hh - gb.gy) / ts).toInt()
             for (gx in minGx..maxGx) {
                 for (gy in minGy..maxGy) {
-                    if (b.tileLookup.containsKey(packGridKey(gx, gy))) {
-                        return true
-                    }
+                    if (b.tileLookup.containsKey(packGridKey(gx, gy))) return true
                 }
             }
             return false
@@ -2757,25 +3084,46 @@ class ZeroEngineView(
         )
     }
 
+    // ==================== P3：多点触控 + 物理键盘 + 游戏手柄事件入口 ====================
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        val sx = (event.x / max(1, width)) * 1080f
-        val sy = (event.y / max(1, height)) * 1920f
+        inputSystem.onMultiTouch(event, width, height)
+
+        val idx = event.actionIndex
+        val sx = (event.getX(idx) / max(1, width)) * 1080f
+        val sy = (event.getY(idx) / max(1, height)) * 1920f
         touchScreenX = sx
         touchScreenY = sy
         when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
                 isTouching = true
                 synchronized(pendingTouchEvents) { pendingTouchEvents.add(Triple("down", sx, sy)) }
             }
             MotionEvent.ACTION_MOVE -> {
                 synchronized(pendingTouchEvents) { pendingTouchEvents.add(Triple("move", sx, sy)) }
             }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                isTouching = false
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_CANCEL -> {
+                if (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL) {
+                    isTouching = false
+                }
                 synchronized(pendingTouchEvents) { pendingTouchEvents.add(Triple("up", sx, sy)) }
             }
         }
         return true
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (inputSystem.onKeyEvent(keyCode, isDown = true)) return true
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
+        if (inputSystem.onKeyEvent(keyCode, isDown = false)) return true
+        return super.onKeyUp(keyCode, event)
+    }
+
+    override fun onGenericMotionEvent(event: MotionEvent?): Boolean {
+        if (event != null && inputSystem.onGamepadMotion(event)) return true
+        return super.onGenericMotionEvent(event)
     }
 
     private fun flushTouchEvents() {
@@ -3014,30 +3362,6 @@ class ZeroEngineView(
             return 0
         }
         return shader
-    }
-
-    private fun playToneAsync(hz: Int, ms: Int) {
-        Thread {
-            try {
-                val sampleRate = 22050
-                val count = (sampleRate * (ms / 1000.0)).toInt()
-                val buf = ShortArray(count)
-                for (i in 0 until count) {
-                    val env = 1.0 - (i.toDouble() / count)
-                    buf[i] = (sin(2.0 * PI * i * hz / sampleRate) * 12000 * env).toInt().toShort()
-                }
-                val track = AudioTrack.Builder()
-                    .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_GAME).build())
-                    .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(sampleRate).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
-                    .setBufferSizeInBytes(buf.size * 2)
-                    .setTransferMode(AudioTrack.MODE_STATIC)
-                    .build()
-                track.write(buf, 0, buf.size)
-                track.play()
-                Thread.sleep(ms.toLong() + 30)
-                track.release()
-            } catch (_: Exception) {}
-        }.start()
     }
 
     private fun jsFunc(block: (Array<out Any?>) -> Any?): org.mozilla.javascript.BaseFunction {
