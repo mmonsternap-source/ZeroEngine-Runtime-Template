@@ -48,6 +48,7 @@ class ZeroEngineView(
         var rotation: Float = 0f, var tiltX: Float = 0f, var billboard: Boolean = false, var scaleX: Float = 1f, var scaleY: Float = 1f,
         var zIndex: Int = 0, var visible: Boolean = true, var parallaxX: Float = 1f, var parallaxY: Float = 1f,
         var texture: String = "", var atlas: String = "", var atlasFrame: String = "",
+        var normalMap: String = "", var normalStrength: Float = 1.0f, var specular: Float = 0.25f,
         var text: String = "", var fontSize: Float = 44f, var r: Float = 1f, var g: Float = 1f, var b: Float = 1f, var a: Float = 1f,
         var flashTimer: Float = 0f, var lightRadius: Float = 450f, var lightIntensity: Float = 1.4f, var shadowCaster: Boolean = false,
         var sliceLeft: Float = 0f, var sliceRight: Float = 0f, var sliceTop: Float = 0f, var sliceBottom: Float = 0f,
@@ -84,6 +85,7 @@ class ZeroEngineView(
             "tiltX" -> n.tiltX.toDouble(); "scaleX" -> n.scaleX.toDouble(); "scaleY" -> n.scaleY.toDouble()
             "parallaxX" -> n.parallaxX.toDouble(); "parallaxY" -> n.parallaxY.toDouble()
             "atlas" -> n.atlas; "atlasFrame" -> n.atlasFrame
+            "normalMap" -> n.normalMap; "normalStrength" -> n.normalStrength.toDouble(); "specular" -> n.specular.toDouble()
             "sliceLeft" -> n.sliceLeft.toDouble(); "sliceRight" -> n.sliceRight.toDouble()
             "sliceTop" -> n.sliceTop.toDouble(); "sliceBottom" -> n.sliceBottom.toDouble()
             "clipChildren" -> n.clipChildren; "clipX" -> n.clipX.toDouble(); "clipY" -> n.clipY.toDouble()
@@ -110,6 +112,9 @@ class ZeroEngineView(
                 "scaleX" -> n.scaleX = toJsFloat(value, n.scaleX); "scaleY" -> n.scaleY = toJsFloat(value, n.scaleY)
                 "parallaxX" -> n.parallaxX = toJsFloat(value, n.parallaxX); "parallaxY" -> n.parallaxY = toJsFloat(value, n.parallaxY)
                 "atlas" -> n.atlas = toJsStr(value, n.atlas); "atlasFrame" -> n.atlasFrame = toJsStr(value, n.atlasFrame)
+                "normalMap" -> n.normalMap = toJsStr(value, n.normalMap)
+                "normalStrength" -> n.normalStrength = toJsFloat(value, n.normalStrength)
+                "specular" -> n.specular = toJsFloat(value, n.specular)
                 "sliceLeft" -> n.sliceLeft = toJsFloat(value, n.sliceLeft); "sliceRight" -> n.sliceRight = toJsFloat(value, n.sliceRight)
                 "sliceTop" -> n.sliceTop = toJsFloat(value, n.sliceTop); "sliceBottom" -> n.sliceBottom = toJsFloat(value, n.sliceBottom)
                 "clipChildren" -> n.clipChildren = toJsBool(value, n.clipChildren)
@@ -138,6 +143,7 @@ class ZeroEngineView(
     private val spriteBatch = ZeroSpriteBatch(1024)
     private val dataStore = ZeroDataStore(projectDir, onConsoleLog)
     private val physicsSystem = ZeroPhysicsSystem(onConsoleLog)
+    private val lightingSystem = ZeroLightingSystem(projectDir, onConsoleLog)
 
     private val atlasCache = ConcurrentHashMap<String, TextureAtlasData>()
     private val nodes = mutableListOf<GameNode>()
@@ -219,7 +225,7 @@ class ZeroEngineView(
         try { sceneIoExecutor.shutdownNow() } catch (_: Exception) {}
         inputSystem.clearAllPointers()
         queueEvent {
-            releaseFbos(); releaseSceneGpuResources(includePersistent = true)
+            releaseFbos(); releaseSceneGpuResources(includePersistent = true); lightingSystem.releaseGL()
             val texIds = (textureCache.values + textTextureCache.values).filter { it != 0 && it != whiteTexId }.toIntArray()
             if (texIds.isNotEmpty()) GLES20.glDeleteTextures(texIds.size, texIds, 0)
             textureCache.clear(); textureSizes.clear(); textTextureCache.clear()
@@ -228,13 +234,14 @@ class ZeroEngineView(
     }
 
     private fun unloadUnusedTextures(): Int {
-        if (textureCache.isEmpty()) return 0
-        val active = HashSet<String>()
+        val active = HashSet<String>(); val activeNormals = HashSet<String>()
         for (n in (nodes + pendingAdd)) {
             if (pendingRemove.contains(n)) continue
             if (n.texture.isNotEmpty()) active.add(n.texture)
+            if (n.normalMap.isNotEmpty()) activeNormals.add(n.normalMap)
             if (n.atlas.isNotEmpty()) queryAtlas(n.atlas)?.let { active.add(it.imageFile) }
         }
+        lightingSystem.unloadUnusedNormals(activeNormals)
         val delKeys = textureCache.keys.filter { it !in active }
         val ids = delKeys.mapNotNull { textureCache[it] }.filter { it != 0 && it != whiteTexId }.toIntArray()
         if (ids.isNotEmpty()) GLES20.glDeleteTextures(ids.size, ids, 0)
@@ -252,7 +259,7 @@ class ZeroEngineView(
 
     private fun releaseFbos() {
         fboReady = false
-        listOf(sceneFbo, sceneColorTex, lightFbo, lightMapTex).filter { it != 0 }.forEach { GLES20.glDeleteTextures(1, intArrayOf(it), 0) }
+        listOf(sceneColorTex, lightMapTex).filter { it != 0 }.forEach { GLES20.glDeleteTextures(1, intArrayOf(it), 0) }
         listOf(sceneFbo, lightFbo).filter { it != 0 }.forEach { GLES20.glDeleteFramebuffers(1, intArrayOf(it), 0) }
         sceneFbo = 0; sceneColorTex = 0; lightFbo = 0; lightMapTex = 0
     }
@@ -272,6 +279,7 @@ class ZeroEngineView(
         postProgram = ZeroShaders.buildShaderProgram(ZeroShaders.POST_VERTEX_SHADER, ZeroShaders.POST_FRAGMENT_SHADER, onConsoleLog)
         batchProgram = ZeroShaders.buildShaderProgram(ZeroShaders.BATCH_VERTEX_SHADER, ZeroShaders.BATCH_FRAGMENT_SHADER, onConsoleLog)
         spriteBatch.init(batchProgram)
+        lightingSystem.initGL()
         initRhinoVM(); dataStore.loadI18nFromDiskIfNeeded(dataStore.currentLang)
         loadSceneContent(sceneJson, groupName = "main", additive = false); lastFrameNs = System.nanoTime()
     }
@@ -359,7 +367,10 @@ class ZeroEngineView(
                 if (n.flashTimer > 0f) n.flashTimer = max(0f, n.flashTimer - dt)
                 if (n.invulnTimer > 0f) n.invulnTimer = max(0f, n.invulnTimer - dt)
                 if (n.dropThroughTimer > 0f) n.dropThroughTimer = max(0f, n.dropThroughTimer - dt)
-                n.hitCooldownMap.entries.removeAll { (_, v) -> v - dt <= 0f }
+                if (n.hitCooldownMap.isNotEmpty()) {
+                    val it = n.hitCooldownMap.iterator()
+                    while (it.hasNext()) { val e = it.next(); val left = e.value - dt; if (left <= 0f) it.remove() else e.setValue(left) }
+                }
                 if (n.animator.clips.isNotEmpty() || n.animator.currentClip != null) updateProAnimator(n, dt) else updateSpriteAnimation(n, dt)
                 if (n.nodeType == "ParticleEmitter") updateParticleEmitter(n, dt)
                 callLifecycle(n, "onProcess", dt)
@@ -412,21 +423,35 @@ class ZeroEngineView(
         GLES20.glEnable(GLES20.GL_SCISSOR_TEST); GLES20.glScissor(sx, sy, max(0, ex - sx), max(0, ey - sy))
     }
 
+    private fun packLightsArrays(lights: List<GameNode>): Pair<FloatArray, FloatArray> {
+        val pos = FloatArray(32); val col = FloatArray(32)
+        lights.take(ZeroLightingSystem.MAX_LIGHTS).forEachIndexed { idx, l ->
+            val gt = getGlobalTransform(l)
+            pos[idx * 4] = gt.gx; pos[idx * 4 + 1] = gt.gy; pos[idx * 4 + 2] = gt.gz; pos[idx * 4 + 3] = l.lightRadius
+            col[idx * 4] = l.r * l.lightIntensity; col[idx * 4 + 1] = l.g * l.lightIntensity; col[idx * 4 + 2] = l.b * l.lightIntensity; col[idx * 4 + 3] = 1f
+        }
+        return pos to col
+    }
+
     private fun renderSceneFrame() {
         frameDrawCalls = 0; frameCulled = 0
         val allLights = nodes.filter { it.visible && it.nodeType == "PointLight" }; lastFrameLights = allLights.size
         val worldNodes = nodes.filter { it.visible && it.layer != "UI" && it.nodeType != "PointLight" }
             .sortedWith(compareBy({ it.zIndex }, { it.nodeType != "TileMap" }, { it.tiltX >= -45f }, { getGlobalTransform(it).gy }))
-        val casters = nodes.filter { it.visible && it.layer != "UI" && it.shadowCaster && it.nodeType != "PointLight" }
         val particleNodes = worldNodes.filter { it.nodeType == "ParticleEmitter" }
-        val solidWorldNodes = worldNodes.filter { it.nodeType != "ParticleEmitter" }
+        val normalNodes = worldNodes.filter { it.nodeType != "ParticleEmitter" && it.nodeType != "TileMap" && it.normalMap.isNotEmpty() }
+        val solidWorldNodes = worldNodes.filter { it.nodeType != "ParticleEmitter" && (it.nodeType == "TileMap" || it.normalMap.isEmpty()) }
         val emptyArr = FloatArray(4)
+
+        // P8：每帧收集视口内 SDF 软阴影遮挡体
+        lightingSystem.collectOccluders(nodes, { x0, x1, y0, y1 -> isBoxInView(x0, x1, y0, y1) }, { getGlobalTransform(it) })
+        val (lightPosArr, lightColArr) = packLightsArrays(allLights)
+        val clampedLightCount = min(allLights.size, ZeroLightingSystem.MAX_LIGHTS)
 
         if (postFxEnabled && fboReady) {
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, sceneFbo); GLES20.glViewport(0, 0, surfaceW, surfaceH)
             GLES20.glClearColor(0.04f, 0.05f, 0.08f, 1f); GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
             spriteBatch.begin(vpMatrix, false, ambientR, ambientG, ambientB, 0, null, null) { frameDrawCalls++ }
-            if (allLights.isNotEmpty()) casters.forEach { c -> val cg = getGlobalTransform(c); val pad = max(c.width * abs(cg.gSx), c.height * abs(cg.gSy)) * 1.6f; if (isBoxInView(cg.gx - pad, cg.gx + pad, cg.gy - pad, cg.gy + pad)) submitDynamicShadowToBatch(c, allLights) }
             solidWorldNodes.forEach { n ->
                 when {
                     n.nodeType == "TileMap" -> { spriteBatch.flush(); renderTileMap(n, vpMatrix, true, false, 0, emptyArr, emptyArr) }
@@ -437,23 +462,25 @@ class ZeroEngineView(
             spriteBatch.end(); renderLightsToFbo(allLights)
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0); GLES20.glViewport(0, 0, surfaceW, surfaceH)
             GLES20.glClearColor(0f, 0f, 0f, 1f); GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT); renderPostComposite()
+
+            // P8：法线贴图角色/物体走独立实时逐像素立体高光 + SDF 软阴影
+            if (normalNodes.isNotEmpty() && postFade < 0.99f) {
+                normalNodes.forEach { renderNodeSingle(it, vpMatrix, true, true, clampedLightCount, lightPosArr, lightColArr) }
+            }
             if (particleNodes.isNotEmpty()) {
                 spriteBatch.begin(vpMatrix, false, ambientR, ambientG, ambientB, 0, null, null) { frameDrawCalls++ }
                 particleNodes.forEach { submitParticlesToBatch(it, true, 1f - postFade) }; spriteBatch.end()
             }
         } else {
-            val lights = allLights.take(8); val lightPosArr = FloatArray(32); val lightColArr = FloatArray(32)
-            lights.forEachIndexed { idx, l -> val gt = getGlobalTransform(l); lightPosArr[idx * 4] = gt.gx; lightPosArr[idx * 4 + 1] = gt.gy; lightPosArr[idx * 4 + 2] = gt.gz; lightPosArr[idx * 4 + 3] = l.lightRadius; lightColArr[idx * 4] = l.r * l.lightIntensity; lightColArr[idx * 4 + 1] = l.g * l.lightIntensity; lightColArr[idx * 4 + 2] = l.b * l.lightIntensity; lightColArr[idx * 4 + 3] = 1f }
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0); GLES20.glViewport(0, 0, surfaceW, surfaceH)
             GLES20.glClearColor(0.04f, 0.05f, 0.08f, 1f); GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
-            spriteBatch.begin(vpMatrix, false, ambientR, ambientG, ambientB, lights.size, lightPosArr, lightColArr) { frameDrawCalls++ }
-            if (lights.isNotEmpty()) casters.forEach { c -> val cg = getGlobalTransform(c); val pad = max(c.width * abs(cg.gSx), c.height * abs(cg.gSy)) * 1.6f; if (isBoxInView(cg.gx - pad, cg.gx + pad, cg.gy - pad, cg.gy + pad)) submitDynamicShadowToBatch(c, lights) }
+            spriteBatch.begin(vpMatrix, false, ambientR, ambientG, ambientB, clampedLightCount, lightPosArr, lightColArr) { frameDrawCalls++ }
             worldNodes.forEach { n ->
                 when {
                     n.nodeType == "ParticleEmitter" -> { spriteBatch.setInlineLight(false); submitParticlesToBatch(n, true, 1f) }
-                    n.nodeType == "TileMap" -> { spriteBatch.flush(); renderTileMap(n, vpMatrix, true, true, lights.size, lightPosArr, lightColArr) }
+                    n.nodeType == "TileMap" -> { spriteBatch.flush(); renderTileMap(n, vpMatrix, true, true, clampedLightCount, lightPosArr, lightColArr) }
                     canBatchNode(n) -> { spriteBatch.setInlineLight(true); submitNodeToBatch(n, true) }
-                    else -> { spriteBatch.flush(); renderNodeSingle(n, vpMatrix, true, true, lights.size, lightPosArr, lightColArr) }
+                    else -> { spriteBatch.flush(); renderNodeSingle(n, vpMatrix, true, true, clampedLightCount, lightPosArr, lightColArr) }
                 }
             }
             spriteBatch.end()
@@ -478,7 +505,8 @@ class ZeroEngineView(
         lastFrameDrawCalls = frameDrawCalls; lastFrameCulled = frameCulled
     }
 
-    private fun canBatchNode(n: GameNode): Boolean = n.shader.isBlank() && n.slopeType != "left_up" && n.slopeType != "right_up"
+    private fun canBatchNode(n: GameNode): Boolean =
+        n.shader.isBlank() && n.normalMap.isBlank() && n.slopeType != "left_up" && n.slopeType != "right_up"
 
     private fun submitNodeToBatch(n: GameNode, isWorld: Boolean) {
         val gt = getGlobalTransform(n); val w = n.width * gt.gSx; val h = n.height * gt.gSy
@@ -529,17 +557,6 @@ class ZeroEngineView(
         }
     }
 
-    private fun submitDynamicShadowToBatch(caster: GameNode, lights: List<GameNode>) {
-        val cg = getGlobalTransform(caster); val cw = caster.width * abs(cg.gSx); val ch = caster.height * abs(cg.gSy)
-        lights.forEach { l -> val lg = getGlobalTransform(l); val dx = cg.gx - lg.gx; val dy = cg.gy - lg.gy; val dist = hypot(dx, dy)
-            if (dist in 1f..l.lightRadius) { val atten = (1f - dist / l.lightRadius).coerceIn(0f, 1f); val sLen = max(cw, ch) * 1.15f * atten
-                Matrix.setIdentityM(modelMatrix, 0); Matrix.translateM(modelMatrix, 0, cg.gx + (dx / dist) * (sLen * 0.5f + cw * 0.35f), cg.gy + (dy / dist) * (sLen * 0.5f + ch * 0.35f), cg.gz - 0.5f)
-                Matrix.rotateM(modelMatrix, 0, Math.toDegrees(atan2(dy.toDouble(), dx.toDouble())).toFloat() - 90f, 0f, 0f, 1f); Matrix.scaleM(modelMatrix, 0, cw * 0.9f, sLen, 1f)
-                spriteBatch.drawQuad(whiteTexId, modelMatrix, 0f, 0f, 1f, 1f, 0.02f, 0.03f, 0.06f, 0.52f * atten, 0f, false)
-            }
-        }
-    }
-
     private fun submitParticlesToBatch(n: GameNode, isWorld: Boolean, fadeAlpha: Float) {
         if (fadeAlpha <= 0.001f) return; val gt = getGlobalTransform(n); val texId = if (n.texture.isNotEmpty()) getImageTexture(n.texture) else whiteTexId
         n.particles.forEach { p -> if (!p.active) return@forEach
@@ -556,16 +573,20 @@ class ZeroEngineView(
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, lightFbo); GLES20.glViewport(0, 0, lightW, lightH)
         GLES20.glClearColor(ambientR, ambientG, ambientB, 1f); GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         if (lights.isEmpty()) return
-        GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE); GLES20.glUseProgram(lightProgram)
-        val posLoc = GLES20.glGetAttribLocation(lightProgram, "aPosition"); val uvLoc = GLES20.glGetAttribLocation(lightProgram, "aTexCoord")
+        val prog = if (lightingSystem.p8LightFboProgram != 0) lightingSystem.p8LightFboProgram else lightProgram
+        GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE); GLES20.glUseProgram(prog)
+        if (prog == lightingSystem.p8LightFboProgram) lightingSystem.bindSdfUniforms(prog)
+        val posLoc = GLES20.glGetAttribLocation(prog, "aPosition"); val uvLoc = GLES20.glGetAttribLocation(prog, "aTexCoord")
+        val centerLoc = GLES20.glGetUniformLocation(prog, "uLightCenter")
         quadBuffer.position(0); GLES20.glEnableVertexAttribArray(posLoc); GLES20.glVertexAttribPointer(posLoc, 3, GLES20.GL_FLOAT, false, 20, quadBuffer)
         quadBuffer.position(3); GLES20.glEnableVertexAttribArray(uvLoc); GLES20.glVertexAttribPointer(uvLoc, 2, GLES20.GL_FLOAT, false, 20, quadBuffer)
-        GLES20.glUniform4f(GLES20.glGetUniformLocation(lightProgram, "uUvRect"), 0f, 0f, 1f, 1f)
+        GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uUvRect"), 0f, 0f, 1f, 1f)
         lights.forEach { l -> val gt = getGlobalTransform(l); val rad = max(8f, l.lightRadius)
             if (!isBoxInView(gt.gx - rad, gt.gx + rad, gt.gy - rad, gt.gy + rad)) { frameCulled++; return@forEach }
             Matrix.setIdentityM(modelMatrix, 0); Matrix.translateM(modelMatrix, 0, gt.gx, gt.gy, gt.gz); Matrix.scaleM(modelMatrix, 0, rad * 2f, rad * 2f, 1f); Matrix.multiplyMM(mvpMatrix, 0, vpMatrix, 0, modelMatrix, 0)
-            GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(lightProgram, "uMVP"), 1, false, mvpMatrix, 0); GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(lightProgram, "uModel"), 1, false, modelMatrix, 0)
-            GLES20.glUniform4f(GLES20.glGetUniformLocation(lightProgram, "uColor"), l.r * l.lightIntensity, l.g * l.lightIntensity, l.b * l.lightIntensity, 1f)
+            GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uMVP"), 1, false, mvpMatrix, 0); GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uModel"), 1, false, modelMatrix, 0)
+            if (centerLoc >= 0) GLES20.glUniform2f(centerLoc, gt.gx, gt.gy)
+            GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uColor"), l.r * l.lightIntensity, l.g * l.lightIntensity, l.b * l.lightIntensity, 1f)
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4); frameDrawCalls++
         }
         GLES20.glDisableVertexAttribArray(posLoc); GLES20.glDisableVertexAttribArray(uvLoc); GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
@@ -691,6 +712,7 @@ class ZeroEngineView(
         if (enableInlineLight) {
             GLES20.glUniform3f(GLES20.glGetUniformLocation(prog, "uAmbient"), ambientR, ambientG, ambientB); GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uLightCount"), lightCount)
             if (lightCount > 0) { GLES20.glUniform4fv(GLES20.glGetUniformLocation(prog, "uLightPos"), lightCount, lightPos, 0); GLES20.glUniform4fv(GLES20.glGetUniformLocation(prog, "uLightColor"), lightCount, lightCol, 0) }
+            if (prog == lightingSystem.p8LitProgram) { lightingSystem.bindNormalMaterial(prog, n.normalMap, n.normalStrength, n.specular, false); lightingSystem.bindSdfUniforms(prog) }
         }
         val texId = if (n.texture.isNotEmpty()) getImageTexture(n.texture) else whiteTexId
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0); GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId); GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uTexture"), 0)
@@ -789,8 +811,9 @@ class ZeroEngineView(
         activeBuf.position(0); GLES20.glEnableVertexAttribArray(posLoc); GLES20.glVertexAttribPointer(posLoc, 3, GLES20.GL_FLOAT, false, 20, activeBuf)
         activeBuf.position(3); GLES20.glEnableVertexAttribArray(uvLoc); GLES20.glVertexAttribPointer(uvLoc, 2, GLES20.GL_FLOAT, false, 20, activeBuf)
 
+        val fadeMul = if (isWorld && postFxEnabled && fboReady && n.normalMap.isNotEmpty()) (1f - postFade) else 1f
         GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uMVP"), 1, false, mvpMatrix, 0); GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uModel"), 1, false, modelMatrix, 0)
-        GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uColor"), n.r, n.g, n.b, n.a); GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uTime"), engineTime)
+        GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uColor"), n.r * fadeMul, n.g * fadeMul, n.b * fadeMul, n.a); GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uTime"), engineTime)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uFlash"), if (n.flashTimer > 0f) (n.flashTimer * 8f).coerceIn(0f, 1f) else 0f)
 
         val atlasData = if (n.atlas.isNotEmpty()) queryAtlas(n.atlas) else null
@@ -810,6 +833,10 @@ class ZeroEngineView(
         if (enableInlineLight) {
             GLES20.glUniform3f(GLES20.glGetUniformLocation(prog, "uAmbient"), ambientR, ambientG, ambientB); GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uLightCount"), lightCount)
             if (lightCount > 0) { GLES20.glUniform4fv(GLES20.glGetUniformLocation(prog, "uLightPos"), lightCount, lightPos, 0); GLES20.glUniform4fv(GLES20.glGetUniformLocation(prog, "uLightColor"), lightCount, lightCol, 0) }
+            if (prog == lightingSystem.p8LitProgram) {
+                lightingSystem.bindNormalMaterial(prog, n.normalMap, n.normalStrength, n.specular, gt.gSx < 0f)
+                lightingSystem.bindSdfUniforms(prog)
+            }
         }
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0); GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId); GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uTexture"), 0)
         GLES20.glDrawArrays(if (vertCount == 3) GLES20.GL_TRIANGLES else GLES20.GL_TRIANGLE_STRIP, 0, vertCount); frameDrawCalls++
@@ -817,7 +844,9 @@ class ZeroEngineView(
     }
 
     private fun getProgramForNode(n: GameNode): Int {
-        if (n.shader.isBlank()) return defaultLitProgram
+        if (n.shader.isBlank()) {
+            return if (n.normalMap.isNotEmpty() && lightingSystem.p8LitProgram != 0) lightingSystem.p8LitProgram else defaultLitProgram
+        }
         if (n.customProgram != 0) return n.customProgram
         val p = ZeroShaders.buildShaderProgram(ZeroShaders.VERTEX_SHADER, n.shader, onConsoleLog)
         n.customProgram = if (p != 0) p else defaultLitProgram; return n.customProgram
@@ -842,6 +871,12 @@ class ZeroEngineView(
         ScriptableObject.putProperty(engineApi, "log", jsFunc { args -> onConsoleLog("[LOG] ${args.joinToString(" ") { RhinoContext.toString(it) }}"); null })
         ScriptableObject.putProperty(engineApi, "unloadUnusedTextures", jsFunc { unloadUnusedTextures() })
         ScriptableObject.putProperty(engineApi, "clearModuleCache", jsFunc { dataStore.moduleCache.clear(); null })
+        ScriptableObject.putProperty(engineApi, "setSdfShadow", jsFunc { args ->
+            lightingSystem.sdfShadowEnabled = (args.getOrNull(0) as? Boolean) ?: true
+            (args.getOrNull(1) as? Number)?.toFloat()?.let { lightingSystem.shadowSoftness = it.coerceIn(1f, 40f) }
+            (args.getOrNull(2) as? Number)?.toFloat()?.let { lightingSystem.shadowMinLight = it.coerceIn(0f, 1f) }
+            null
+        })
         ScriptableObject.putProperty(engineApi, "loadAtlas", jsFunc { args ->
             val d = queryAtlas(RhinoContext.toString(args.getOrNull(0) ?: "")) ?: return@jsFunc null
             rhino.newObject(globalScope).apply {
@@ -875,7 +910,8 @@ class ZeroEngineView(
         ScriptableObject.putProperty(engineApi, "getStats", jsFunc {
             rhino.newObject(globalScope).apply {
                 ScriptableObject.putProperty(this, "fps", smoothedFps.toDouble()); ScriptableObject.putProperty(this, "drawCalls", lastFrameDrawCalls); ScriptableObject.putProperty(this, "culled", lastFrameCulled)
-                ScriptableObject.putProperty(this, "nodes", nodes.size); ScriptableObject.putProperty(this, "lights", lastFrameLights); ScriptableObject.putProperty(this, "spatialCells", physicsSystem.spatialCellsCount)
+                ScriptableObject.putProperty(this, "nodes", nodes.size); ScriptableObject.putProperty(this, "lights", lastFrameLights); ScriptableObject.putProperty(this, "occluders", lightingSystem.activeOccluderCount)
+                ScriptableObject.putProperty(this, "sdfShadow", lightingSystem.sdfShadowEnabled); ScriptableObject.putProperty(this, "spatialCells", physicsSystem.spatialCellsCount)
                 ScriptableObject.putProperty(this, "modules", dataStore.moduleCache.size); ScriptableObject.putProperty(this, "atlases", atlasCache.size); ScriptableObject.putProperty(this, "flags", dataStore.worldFlags.size)
                 ScriptableObject.putProperty(this, "tables", dataStore.dataTableCache.size); ScriptableObject.putProperty(this, "lang", dataStore.currentLang); ScriptableObject.putProperty(this, "fbo", postFxEnabled && fboReady)
                 ScriptableObject.putProperty(this, "touches", inputSystem.getTouchCount()); ScriptableObject.putProperty(this, "textures", textureCache.size)
@@ -913,7 +949,7 @@ class ZeroEngineView(
         ScriptableObject.putProperty(engineApi, "angleTo", jsFunc { args -> val a = (args.getOrNull(0) as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === (args.getOrNull(0) as? Scriptable) }; val b = (args.getOrNull(1) as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === (args.getOrNull(1) as? Scriptable) }; if (a != null && b != null) { val ga = getGlobalTransform(a); val gb = getGlobalTransform(b); Math.toDegrees(atan2((gb.gy - ga.gy).toDouble(), (gb.gx - ga.gx).toDouble())) } else 0.0 })
         ScriptableObject.putProperty(engineApi, "spawn", jsFunc { args ->
             val cfg = args.getOrNull(0) as? Scriptable ?: return@jsFunc null; val rawLayer = getJsStr(cfg, "layer", "World")
-            val sp = GameNode(name = getJsStr(cfg, "name", "Spawn_${System.nanoTime() % 10000}"), nodeType = getJsStr(cfg, "nodeType", "Sprite2D"), layer = if (rawLayer.startsWith("UI", ignoreCase = true)) "UI" else "World", parent = RhinoContext.toString(args.getOrNull(1) ?: ""), tag = getJsStr(cfg, "tag", "default"), persistent = getJsBool(cfg, "persistent", false), x = getJsFloat(cfg, "x", 0f), y = getJsFloat(cfg, "y", 0f), z = getJsFloat(cfg, "z", 0f), width = getJsFloat(cfg, "width", 64f), height = getJsFloat(cfg, "height", 64f), tiltX = getJsFloat(cfg, "tiltX", 0f), billboard = getJsBool(cfg, "billboard", false), zIndex = getJsInt(cfg, "zIndex", 0), texture = getJsStr(cfg, "texture", ""), atlas = getJsStr(cfg, "atlas", ""), atlasFrame = getJsStr(cfg, "atlasFrame", ""), text = getJsStr(cfg, "text", ""), fontSize = getJsFloat(cfg, "fontSize", 44f), r = getJsFloat(cfg, "r", 1f), g = getJsFloat(cfg, "g", 1f), b = getJsFloat(cfg, "b", 1f), a = getJsFloat(cfg, "a", 1f), sliceLeft = getJsFloat(cfg, "sliceLeft", 0f), sliceRight = getJsFloat(cfg, "sliceRight", 0f), sliceTop = getJsFloat(cfg, "sliceTop", 0f), sliceBottom = getJsFloat(cfg, "sliceBottom", 0f), clipChildren = getJsBool(cfg, "clipChildren", false), clipX = getJsFloat(cfg, "clipX", 0f), clipY = getJsFloat(cfg, "clipY", 0f), clipW = getJsFloat(cfg, "clipW", 0f), clipH = getJsFloat(cfg, "clipH", 0f), collider = getJsBool(cfg, "collider", false), isTrigger = getJsBool(cfg, "isTrigger", false), oneWay = getJsBool(cfg, "oneWay", false), slopeType = getJsStr(cfg, "slopeType", "none"), colOffsetX = getJsFloat(cfg, "colOffsetX", 0f), colOffsetY = getJsFloat(cfg, "colOffsetY", 0f), colWidth = getJsFloat(cfg, "colWidth", 0f), colHeight = getJsFloat(cfg, "colHeight", 0f), colLayer = getJsInt(cfg, "colLayer", 1), colMask = getJsInt(cfg, "colMask", 0xFFFF), bodyMode = getJsStr(cfg, "bodyMode", "kinematic"), isHitbox = getJsBool(cfg, "isHitbox", false), isHurtbox = getJsBool(cfg, "isHurtbox", false), damage = getJsFloat(cfg, "damage", 10f), shadowCaster = getJsBool(cfg, "shadowCaster", false), lightRadius = getJsFloat(cfg, "lightRadius", 400f), lightIntensity = getJsFloat(cfg, "lightIntensity", 1.5f), script = dataStore.resolveNodeScriptText(getJsStr(cfg, "script", ""), getJsStr(cfg, "scriptFile", "")))
+            val sp = GameNode(name = getJsStr(cfg, "name", "Spawn_${System.nanoTime() % 10000}"), nodeType = getJsStr(cfg, "nodeType", "Sprite2D"), layer = if (rawLayer.startsWith("UI", ignoreCase = true)) "UI" else "World", parent = RhinoContext.toString(args.getOrNull(1) ?: ""), tag = getJsStr(cfg, "tag", "default"), persistent = getJsBool(cfg, "persistent", false), x = getJsFloat(cfg, "x", 0f), y = getJsFloat(cfg, "y", 0f), z = getJsFloat(cfg, "z", 0f), width = getJsFloat(cfg, "width", 64f), height = getJsFloat(cfg, "height", 64f), tiltX = getJsFloat(cfg, "tiltX", 0f), billboard = getJsBool(cfg, "billboard", false), zIndex = getJsInt(cfg, "zIndex", 0), texture = getJsStr(cfg, "texture", ""), atlas = getJsStr(cfg, "atlas", ""), atlasFrame = getJsStr(cfg, "atlasFrame", ""), normalMap = getJsStr(cfg, "normalMap", ""), normalStrength = getJsFloat(cfg, "normalStrength", 1.0f), specular = getJsFloat(cfg, "specular", 0.25f), text = getJsStr(cfg, "text", ""), fontSize = getJsFloat(cfg, "fontSize", 44f), r = getJsFloat(cfg, "r", 1f), g = getJsFloat(cfg, "g", 1f), b = getJsFloat(cfg, "b", 1f), a = getJsFloat(cfg, "a", 1f), sliceLeft = getJsFloat(cfg, "sliceLeft", 0f), sliceRight = getJsFloat(cfg, "sliceRight", 0f), sliceTop = getJsFloat(cfg, "sliceTop", 0f), sliceBottom = getJsFloat(cfg, "sliceBottom", 0f), clipChildren = getJsBool(cfg, "clipChildren", false), clipX = getJsFloat(cfg, "clipX", 0f), clipY = getJsFloat(cfg, "clipY", 0f), clipW = getJsFloat(cfg, "clipW", 0f), clipH = getJsFloat(cfg, "clipH", 0f), collider = getJsBool(cfg, "collider", false), isTrigger = getJsBool(cfg, "isTrigger", false), oneWay = getJsBool(cfg, "oneWay", false), slopeType = getJsStr(cfg, "slopeType", "none"), colOffsetX = getJsFloat(cfg, "colOffsetX", 0f), colOffsetY = getJsFloat(cfg, "colOffsetY", 0f), colWidth = getJsFloat(cfg, "colWidth", 0f), colHeight = getJsFloat(cfg, "colHeight", 0f), colLayer = getJsInt(cfg, "colLayer", 1), colMask = getJsInt(cfg, "colMask", 0xFFFF), bodyMode = getJsStr(cfg, "bodyMode", "kinematic"), isHitbox = getJsBool(cfg, "isHitbox", false), isHurtbox = getJsBool(cfg, "isHurtbox", false), damage = getJsFloat(cfg, "damage", 10f), shadowCaster = getJsBool(cfg, "shadowCaster", false), lightRadius = getJsFloat(cfg, "lightRadius", 400f), lightIntensity = getJsFloat(cfg, "lightIntensity", 1.5f), script = dataStore.resolveNodeScriptText(getJsStr(cfg, "script", ""), getJsStr(cfg, "scriptFile", "")))
             pendingAdd.add(sp); bindNodeScript(sp); sp.jsObj
         })
         ScriptableObject.putProperty(engineApi, "instantiate", jsFunc { args -> val txt = readSceneText(RhinoContext.toString(args.getOrNull(0) ?: "")) ?: return@jsFunc null; val loaded = mutableListOf<GameNode>(); parseSceneJson(txt, loaded, normalizeSceneName(RhinoContext.toString(args.getOrNull(0) ?: "")), false); val sx = (args.getOrNull(1) as? Number)?.toFloat() ?: 0f; val sy = (args.getOrNull(2) as? Number)?.toFloat() ?: 0f; val sz = (args.getOrNull(3) as? Number)?.toFloat() ?: 0f; loaded.forEach { if (it.parent.isEmpty()) { it.x += sx; it.y += sy; it.z += sz }; pendingAdd.add(it); bindNodeScript(it) }; loaded.firstOrNull()?.jsObj })
@@ -944,6 +980,12 @@ class ZeroEngineView(
         val selfObj = GameNodeJsProxy(n).apply { parentScope = nodeScope; prototype = nodeScope }
         n.jsObj = selfObj
 
+        ScriptableObject.putProperty(selfObj, "setNormalMap", jsFunc { args ->
+            n.normalMap = RhinoContext.toString(args.getOrNull(0) ?: "")
+            (args.getOrNull(1) as? Number)?.toFloat()?.let { n.normalStrength = it }
+            (args.getOrNull(2) as? Number)?.toFloat()?.let { n.specular = it }
+            null
+        })
         ScriptableObject.putProperty(selfObj, "setAnimFloat", jsFunc { args -> n.animator.fsm.setFloat(RhinoContext.toString(args.getOrNull(0) ?: ""), (args.getOrNull(1) as? Number)?.toFloat() ?: 0f); null })
         ScriptableObject.putProperty(selfObj, "setAnimBool", jsFunc { args -> n.animator.fsm.setBool(RhinoContext.toString(args.getOrNull(0) ?: ""), (args.getOrNull(1) as? Boolean) ?: false); null })
         ScriptableObject.putProperty(selfObj, "triggerAnim", jsFunc { args -> n.animator.fsm.setTrigger(RhinoContext.toString(args.getOrNull(0) ?: "")); null })
@@ -1010,7 +1052,7 @@ class ZeroEngineView(
                 val tileList = mutableListOf<TileCell>(); val tileMap = HashMap<Long, TileCell>()
                 o.optJSONArray("tiles")?.let { ta -> for (ti in 0 until ta.length()) { val to = ta.getJSONObject(ti); val c = TileCell(to.optInt("gx", 0), to.optInt("gy", 0), to.optInt("frame", 0)); tileList.add(c); tileMap[physicsSystem.packGridKey(c.gx, c.gy)] = c } }
                 val rawLayer = o.optString("layer", "World")
-                val node = GameNode(name = o.optString("name", "Node_$i"), nodeType = o.optString("nodeType", "Sprite2D"), layer = if (rawLayer.startsWith("UI", ignoreCase = true)) "UI" else "World", parent = o.optString("parent", ""), tag = o.optString("tag", "default"), sceneGroup = groupName, persistent = o.optBoolean("persistent", false), x = o.optDouble("x", 0.0).toFloat(), y = o.optDouble("y", 0.0).toFloat(), z = o.optDouble("z", 0.0).toFloat(), width = o.optDouble("width", 120.0).toFloat(), height = o.optDouble("height", 120.0).toFloat(), rotation = o.optDouble("rotation", 0.0).toFloat(), tiltX = o.optDouble("tiltX", 0.0).toFloat(), billboard = o.optBoolean("billboard", false), scaleX = o.optDouble("scaleX", 1.0).toFloat(), scaleY = o.optDouble("scaleY", 1.0).toFloat(), zIndex = o.optInt("zIndex", 0), visible = o.optBoolean("visible", true), parallaxX = o.optDouble("parallaxX", 1.0).toFloat(), parallaxY = o.optDouble("parallaxY", 1.0).toFloat(), texture = o.optString("texture", ""), atlas = o.optString("atlas", ""), atlasFrame = o.optString("atlasFrame", ""), text = o.optString("text", ""), fontSize = o.optDouble("fontSize", 44.0).toFloat(), r = o.optDouble("r", 1.0).toFloat(), g = o.optDouble("g", 1.0).toFloat(), b = o.optDouble("b", 1.0).toFloat(), a = o.optDouble("a", 1.0).toFloat(), lightRadius = o.optDouble("lightRadius", 450.0).toFloat(), lightIntensity = o.optDouble("lightIntensity", 1.4).toFloat(), shadowCaster = o.optBoolean("shadowCaster", false), sliceLeft = o.optDouble("sliceLeft", 0.0).toFloat(), sliceRight = o.optDouble("sliceRight", 0.0).toFloat(), sliceTop = o.optDouble("sliceTop", 0.0).toFloat(), sliceBottom = o.optDouble("sliceBottom", 0.0).toFloat(), clipChildren = o.optBoolean("clipChildren", false), clipX = o.optDouble("clipX", 0.0).toFloat(), clipY = o.optDouble("clipY", 0.0).toFloat(), clipW = o.optDouble("clipW", 0.0).toFloat(), clipH = o.optDouble("clipH", 0.0).toFloat(), collider = o.optBoolean("collider", false), isTrigger = o.optBoolean("isTrigger", false), oneWay = o.optBoolean("oneWay", false), slopeType = o.optString("slopeType", "none"), colOffsetX = o.optDouble("colOffsetX", 0.0).toFloat(), colOffsetY = o.optDouble("colOffsetY", 0.0).toFloat(), colWidth = o.optDouble("colWidth", 0.0).toFloat(), colHeight = o.optDouble("colHeight", 0.0).toFloat(), colLayer = o.optInt("colLayer", 1), colMask = o.optInt("colMask", 0xFFFF), bodyMode = o.optString("bodyMode", "kinematic"), gravity = o.optDouble("gravity", 2200.0).toFloat(), fallMultiplier = o.optDouble("fallMultiplier", 1.55).toFloat(), maxFallSpeed = o.optDouble("maxFallSpeed", 1450.0).toFloat(), bounciness = o.optDouble("bounciness", 0.5).toFloat(), drag = o.optDouble("drag", 0.0).toFloat(), maxJumps = o.optInt("maxJumps", 2), isHitbox = o.optBoolean("isHitbox", false), isHurtbox = o.optBoolean("isHurtbox", false), damage = o.optDouble("damage", 10.0).toFloat(), hFrames = o.optInt("hFrames", 1), vFrames = o.optInt("vFrames", 1), currentFrame = o.optInt("currentFrame", 0), animFps = o.optDouble("animFps", 12.0).toFloat(), clips = clipMap, tileSize = o.optDouble("tileSize", 90.0).toFloat(), tiles = tileList, tileLookup = tileMap, emitRate = o.optDouble("emitRate", 24.0).toFloat(), particleLife = o.optDouble("particleLife", 1.1).toFloat(), particleSpeed = o.optDouble("particleSpeed", 160.0).toFloat(), particleSize = o.optDouble("particleSize", 16.0).toFloat(), particleGravity = o.optDouble("particleGravity", -60.0).toFloat(), shader = o.optString("shader", ""), script = dataStore.resolveNodeScriptText(o.optString("script", ""), o.optString("scriptFile", "")))
+                val node = GameNode(name = o.optString("name", "Node_$i"), nodeType = o.optString("nodeType", "Sprite2D"), layer = if (rawLayer.startsWith("UI", ignoreCase = true)) "UI" else "World", parent = o.optString("parent", ""), tag = o.optString("tag", "default"), sceneGroup = groupName, persistent = o.optBoolean("persistent", false), x = o.optDouble("x", 0.0).toFloat(), y = o.optDouble("y", 0.0).toFloat(), z = o.optDouble("z", 0.0).toFloat(), width = o.optDouble("width", 120.0).toFloat(), height = o.optDouble("height", 120.0).toFloat(), rotation = o.optDouble("rotation", 0.0).toFloat(), tiltX = o.optDouble("tiltX", 0.0).toFloat(), billboard = o.optBoolean("billboard", false), scaleX = o.optDouble("scaleX", 1.0).toFloat(), scaleY = o.optDouble("scaleY", 1.0).toFloat(), zIndex = o.optInt("zIndex", 0), visible = o.optBoolean("visible", true), parallaxX = o.optDouble("parallaxX", 1.0).toFloat(), parallaxY = o.optDouble("parallaxY", 1.0).toFloat(), texture = o.optString("texture", ""), atlas = o.optString("atlas", ""), atlasFrame = o.optString("atlasFrame", ""), normalMap = o.optString("normalMap", ""), normalStrength = o.optDouble("normalStrength", 1.0).toFloat(), specular = o.optDouble("specular", 0.25).toFloat(), text = o.optString("text", ""), fontSize = o.optDouble("fontSize", 44.0).toFloat(), r = o.optDouble("r", 1.0).toFloat(), g = o.optDouble("g", 1.0).toFloat(), b = o.optDouble("b", 1.0).toFloat(), a = o.optDouble("a", 1.0).toFloat(), lightRadius = o.optDouble("lightRadius", 450.0).toFloat(), lightIntensity = o.optDouble("lightIntensity", 1.4).toFloat(), shadowCaster = o.optBoolean("shadowCaster", false), sliceLeft = o.optDouble("sliceLeft", 0.0).toFloat(), sliceRight = o.optDouble("sliceRight", 0.0).toFloat(), sliceTop = o.optDouble("sliceTop", 0.0).toFloat(), sliceBottom = o.optDouble("sliceBottom", 0.0).toFloat(), clipChildren = o.optBoolean("clipChildren", false), clipX = o.optDouble("clipX", 0.0).toFloat(), clipY = o.optDouble("clipY", 0.0).toFloat(), clipW = o.optDouble("clipW", 0.0).toFloat(), clipH = o.optDouble("clipH", 0.0).toFloat(), collider = o.optBoolean("collider", false), isTrigger = o.optBoolean("isTrigger", false), oneWay = o.optBoolean("oneWay", false), slopeType = o.optString("slopeType", "none"), colOffsetX = o.optDouble("colOffsetX", 0.0).toFloat(), colOffsetY = o.optDouble("colOffsetY", 0.0).toFloat(), colWidth = o.optDouble("colWidth", 0.0).toFloat(), colHeight = o.optDouble("colHeight", 0.0).toFloat(), colLayer = o.optInt("colLayer", 1), colMask = o.optInt("colMask", 0xFFFF), bodyMode = o.optString("bodyMode", "kinematic"), gravity = o.optDouble("gravity", 2200.0).toFloat(), fallMultiplier = o.optDouble("fallMultiplier", 1.55).toFloat(), maxFallSpeed = o.optDouble("maxFallSpeed", 1450.0).toFloat(), bounciness = o.optDouble("bounciness", 0.5).toFloat(), drag = o.optDouble("drag", 0.0).toFloat(), maxJumps = o.optInt("maxJumps", 2), isHitbox = o.optBoolean("isHitbox", false), isHurtbox = o.optBoolean("isHurtbox", false), damage = o.optDouble("damage", 10.0).toFloat(), hFrames = o.optInt("hFrames", 1), vFrames = o.optInt("vFrames", 1), currentFrame = o.optInt("currentFrame", 0), animFps = o.optDouble("animFps", 12.0).toFloat(), clips = clipMap, tileSize = o.optDouble("tileSize", 90.0).toFloat(), tiles = tileList, tileLookup = tileMap, emitRate = o.optDouble("emitRate", 24.0).toFloat(), particleLife = o.optDouble("particleLife", 1.1).toFloat(), particleSpeed = o.optDouble("particleSpeed", 160.0).toFloat(), particleSize = o.optDouble("particleSize", 16.0).toFloat(), particleGravity = o.optDouble("particleGravity", -60.0).toFloat(), shader = o.optString("shader", ""), script = dataStore.resolveNodeScriptText(o.optString("script", ""), o.optString("scriptFile", "")))
                 ZeroAnimator.parseInto(node.animator, o)
                 val dcName = o.optString("defaultClip", "")
                 if (dcName.isNotEmpty()) {
@@ -1049,6 +1091,6 @@ class ZeroEngineView(
     private fun getJsBool(s: Scriptable, k: String, def: Boolean): Boolean = (ScriptableObject.getProperty(s, k) as? Boolean) ?: def
 
     companion object {
-        private val BRIDGED_PROPS = setOf("name", "tag", "sceneGroup", "persistent", "x", "y", "z", "vx", "vy", "vz", "width", "height", "rotation", "tiltX", "scaleX", "scaleY", "parallaxX", "parallaxY", "atlas", "atlasFrame", "sliceLeft", "sliceRight", "sliceTop", "sliceBottom", "clipChildren", "clipX", "clipY", "clipW", "clipH", "slopeType", "colOffsetX", "colOffsetY", "colWidth", "colHeight", "colLayer", "colMask", "bodyMode", "gravity", "fallMultiplier", "maxJumps", "isGrounded", "isHitbox", "isHurtbox", "damage", "invulnTimer", "r", "g", "b", "a", "visible", "text", "currentClip", "lightRadius", "lightIntensity")
+        private val BRIDGED_PROPS = setOf("name", "tag", "sceneGroup", "persistent", "x", "y", "z", "vx", "vy", "vz", "width", "height", "rotation", "tiltX", "scaleX", "scaleY", "parallaxX", "parallaxY", "atlas", "atlasFrame", "normalMap", "normalStrength", "specular", "sliceLeft", "sliceRight", "sliceTop", "sliceBottom", "clipChildren", "clipX", "clipY", "clipW", "clipH", "slopeType", "colOffsetX", "colOffsetY", "colWidth", "colHeight", "colLayer", "colMask", "bodyMode", "gravity", "fallMultiplier", "maxJumps", "isGrounded", "isHitbox", "isHurtbox", "damage", "invulnTimer", "r", "g", "b", "a", "visible", "text", "currentClip", "lightRadius", "lightIntensity")
     }
 }
