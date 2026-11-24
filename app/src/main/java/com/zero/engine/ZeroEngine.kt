@@ -6,16 +6,10 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
-import android.media.AudioAttributes
-import android.media.AudioFormat
-import android.media.AudioTrack
-import android.media.MediaPlayer
-import android.media.SoundPool
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.GLUtils
 import android.opengl.Matrix
-import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
 import org.json.JSONArray
@@ -30,680 +24,13 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
-import java.nio.ShortBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.*
 
-// ==================== P5 升级子系统 1：多轨混音音频引擎（BGM 交叉淡入淡出 + 独立音量总线 + 音高随机） ====================
-class ZeroAudioSystem(
-    private val projectDir: File,
-    private val onConsoleLog: (String) -> Unit
-) {
-    private val audioLock = Any()
-    private var activeBgm: MediaPlayer? = null
-    private var fadingBgm: MediaPlayer? = null
-    private var activeBgmFile: String = ""
-
-    private var masterVolume = 1.0f
-    private var bgmBusVolume = 0.85f
-    private var sfxBusVolume = 1.0f
-
-    private var activeTrackVol = 0.8f
-    private var activeTargetVol = 0.8f
-    private var fadingStartVol = 0.8f
-    private var fadeElapsed = 0f
-    private var fadeDuration = 0f
-
-    private val soundPool: SoundPool = SoundPool.Builder()
-        .setMaxStreams(12)
-        .setAudioAttributes(
-            AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_GAME)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                .build()
-        )
-        .build()
-    private val sfxCache = ConcurrentHashMap<String, Int>()
-
-    fun setVolume(bus: String, volume: Float) = synchronized(audioLock) {
-        val v = volume.coerceIn(0f, 1f)
-        when (bus.lowercase()) {
-            "master" -> masterVolume = v
-            "bgm" -> bgmBusVolume = v
-            "sfx" -> sfxBusVolume = v
-        }
-        applyBgmVolumesLocked()
-    }
-
-    fun getVolume(bus: String): Float = synchronized(audioLock) {
-        when (bus.lowercase()) {
-            "master" -> masterVolume
-            "bgm" -> bgmBusVolume
-            "sfx" -> sfxBusVolume
-            else -> masterVolume
-        }
-    }
-
-    fun playBGM(fileName: String, loop: Boolean, volume: Float) {
-        crossfadeBGM(fileName, 0f, loop, volume)
-    }
-
-    fun crossfadeBGM(fileName: String, durationSec: Float, loop: Boolean, volume: Float) = synchronized(audioLock) {
-        try {
-            val file = File(File(projectDir, "audio"), fileName)
-            if (!file.exists()) {
-                onConsoleLog("[AUDIO 警告] 找不到 BGM 文件: $fileName")
-                return@synchronized
-            }
-            val targetVol = volume.coerceIn(0f, 1f)
-            if (activeBgm != null && activeBgmFile == fileName && durationSec > 0.01f) {
-                activeTargetVol = targetVol
-                fadeDuration = durationSec
-                fadeElapsed = 0f
-                return@synchronized
-            }
-
-            releasePlayerSafe(fadingBgm)
-            fadingBgm = null
-
-            val dur = max(0f, durationSec)
-            if (dur > 0.02f && activeBgm != null) {
-                fadingBgm = activeBgm
-                fadingStartVol = activeTrackVol
-                activeBgm = null
-            } else {
-                releasePlayerSafe(activeBgm)
-                activeBgm = null
-            }
-
-            val startVol = if (dur > 0.02f) 0f else targetVol
-            val mp = MediaPlayer().apply {
-                setDataSource(file.absolutePath)
-                isLooping = loop
-                val finalV = (startVol * bgmBusVolume * masterVolume).coerceIn(0f, 1f)
-                setVolume(finalV, finalV)
-                prepare()
-                start()
-            }
-            activeBgm = mp
-            activeBgmFile = fileName
-            activeTrackVol = startVol
-            activeTargetVol = targetVol
-            fadeDuration = if (dur > 0.02f) dur else 0f
-            fadeElapsed = 0f
-        } catch (e: Exception) {
-            onConsoleLog("[AUDIO BGM 错误] ${e.message}")
-        }
-    }
-
-    fun update(dt: Float) = synchronized(audioLock) {
-        if (fadeDuration <= 0f) return@synchronized
-        fadeElapsed += dt
-        val t = (fadeElapsed / fadeDuration).coerceIn(0f, 1f)
-        activeTrackVol = activeTargetVol * t
-        val fadeOutVol = fadingStartVol * (1f - t)
-        applyBgmVolumesLocked(fadeOutOverride = fadeOutVol)
-        if (t >= 1f) {
-            releasePlayerSafe(fadingBgm)
-            fadingBgm = null
-            fadeDuration = 0f
-            fadeElapsed = 0f
-            activeTrackVol = activeTargetVol
-            applyBgmVolumesLocked()
-        }
-    }
-
-    private fun applyBgmVolumesLocked(fadeOutOverride: Float? = null) {
-        val mainV = (activeTrackVol * bgmBusVolume * masterVolume).coerceIn(0f, 1f)
-        try { activeBgm?.setVolume(mainV, mainV) } catch (_: Exception) {}
-        if (fadingBgm != null && fadeOutOverride != null) {
-            val outV = (fadeOutOverride * bgmBusVolume * masterVolume).coerceIn(0f, 1f)
-            try { fadingBgm?.setVolume(outV, outV) } catch (_: Exception) {}
-        }
-    }
-
-    fun stopBGM(fadeOutSec: Float = 0f) = synchronized(audioLock) {
-        if (fadeOutSec > 0.02f && activeBgm != null) {
-            releasePlayerSafe(fadingBgm)
-            fadingBgm = activeBgm
-            fadingStartVol = activeTrackVol
-            activeBgm = null
-            activeBgmFile = ""
-            activeTrackVol = 0f
-            activeTargetVol = 0f
-            fadeDuration = fadeOutSec
-            fadeElapsed = 0f
-            return@synchronized
-        }
-        releasePlayerSafe(activeBgm)
-        releasePlayerSafe(fadingBgm)
-        activeBgm = null
-        fadingBgm = null
-        activeBgmFile = ""
-        fadeDuration = 0f
-    }
-
-    fun playSFX(fileName: String, volume: Float, pitchMin: Float = 1.0f, pitchMax: Float = 1.0f) {
-        try {
-            val finalVol = (volume.coerceIn(0f, 1f) * sfxBusVolume * masterVolume).coerceIn(0f, 1f)
-            val pMin = pitchMin.coerceIn(0.5f, 2.0f)
-            val pMax = pitchMax.coerceIn(0.5f, 2.0f)
-            val rate = if (pMax > pMin) {
-                (pMin + Math.random().toFloat() * (pMax - pMin)).coerceIn(0.5f, 2.0f)
-            } else pMin
-
-            val cachedId = sfxCache[fileName]
-            if (cachedId != null) {
-                soundPool.play(cachedId, finalVol, finalVol, 1, 0, rate)
-                return
-            }
-            val file = File(File(projectDir, "audio"), fileName)
-            if (!file.exists()) {
-                onConsoleLog("[AUDIO 警告] 找不到音效文件: $fileName")
-                return
-            }
-            val sid = soundPool.load(file.absolutePath, 1)
-            sfxCache[fileName] = sid
-            soundPool.setOnLoadCompleteListener { sp, sampleId, status ->
-                if (status == 0 && sampleId == sid) {
-                    sp.play(sampleId, finalVol, finalVol, 1, 0, rate)
-                }
-            }
-        } catch (e: Exception) {
-            onConsoleLog("[AUDIO SFX 错误] ${e.message}")
-        }
-    }
-
-    fun playToneAsync(hz: Int, ms: Int) {
-        val volScale = (sfxBusVolume * masterVolume).coerceIn(0f, 1f)
-        if (volScale <= 0.001f) return
-        Thread {
-            try {
-                val sampleRate = 22050
-                val count = (sampleRate * (ms / 1000.0)).toInt()
-                val buf = ShortArray(count)
-                for (i in 0 until count) {
-                    val env = 1.0 - (i.toDouble() / count)
-                    buf[i] = (sin(2.0 * PI * i * hz / sampleRate) * 12000 * env * volScale).toInt().toShort()
-                }
-                val track = AudioTrack.Builder()
-                    .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_GAME).build())
-                    .setAudioFormat(
-                        AudioFormat.Builder()
-                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                            .setSampleRate(sampleRate)
-                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                            .build()
-                    )
-                    .setBufferSizeInBytes(buf.size * 2)
-                    .setTransferMode(AudioTrack.MODE_STATIC)
-                    .build()
-                track.write(buf, 0, buf.size)
-                track.play()
-                Thread.sleep(ms.toLong() + 30)
-                track.release()
-            } catch (_: Exception) {}
-        }.start()
-    }
-
-    private fun releasePlayerSafe(mp: MediaPlayer?) {
-        try { mp?.stop() } catch (_: Exception) {}
-        try { mp?.release() } catch (_: Exception) {}
-    }
-
-    fun release() {
-        stopBGM(0f)
-        try { soundPool.release() } catch (_: Exception) {}
-    }
-}
-
-// ==================== P3 独立子系统 2：跨平台统一输入映射（多点触控 + 键盘 + 手柄） ====================
-class ZeroInputSystem {
-    data class TouchZone(
-        val action: String,
-        val cx: Float,
-        val cy: Float,
-        val w: Float,
-        val h: Float
-    )
-
-    private val lock = Any()
-    private val actionBindings = mutableMapOf<String, MutableSet<String>>()
-    private val keyDownSet = mutableSetOf<String>()
-    private val virtualActionDown = mutableSetOf<String>()
-    private val activePointers = mutableMapOf<Int, Pair<Float, Float>>()
-    private val touchZones = mutableListOf<TouchZone>()
-
-    private var stickX = 0f
-    private var stickY = 0f
-
-    private var prevActionStates = mutableMapOf<String, Boolean>()
-    private var currActionStates = mutableMapOf<String, Boolean>()
-    private var frameStickX = 0f
-    private var frameStickY = 0f
-
-    init {
-        resetDefaultBindings()
-    }
-
-    fun resetDefaultBindings() = synchronized(lock) {
-        actionBindings.clear()
-        actionBindings["move_left"] = mutableSetOf("A", "LEFT", "DPAD_LEFT", "STICK_LEFT")
-        actionBindings["move_right"] = mutableSetOf("D", "RIGHT", "DPAD_RIGHT", "STICK_RIGHT")
-        actionBindings["move_up"] = mutableSetOf("W", "UP", "DPAD_UP", "STICK_UP")
-        actionBindings["move_down"] = mutableSetOf("S", "DOWN", "DPAD_DOWN", "STICK_DOWN")
-        actionBindings["jump"] = mutableSetOf("SPACE", "K", "GAMEPAD_A")
-        actionBindings["attack"] = mutableSetOf("J", "Z", "GAMEPAD_X")
-        actionBindings["dash"] = mutableSetOf("SHIFT", "L", "X", "GAMEPAD_B", "GAMEPAD_R1")
-        actionBindings["pause"] = mutableSetOf("ESC", "P", "GAMEPAD_START")
-    }
-
-    fun bindAction(action: String, keys: List<String>) = synchronized(lock) {
-        if (action.isEmpty()) return@synchronized
-        actionBindings[action] = keys.map { it.uppercase() }.toMutableSet()
-    }
-
-    fun setVirtualAction(action: String, pressed: Boolean) = synchronized(lock) {
-        if (pressed) virtualActionDown.add(action) else virtualActionDown.remove(action)
-    }
-
-    fun bindTouchZone(action: String, cx: Float, cy: Float, w: Float, h: Float) = synchronized(lock) {
-        touchZones.removeAll { it.action == action && abs(it.cx - cx) < 1f && abs(it.cy - cy) < 1f }
-        touchZones.add(TouchZone(action, cx, cy, max(16f, w), max(16f, h)))
-    }
-
-    fun clearTouchZones() = synchronized(lock) {
-        touchZones.clear()
-    }
-
-    fun getTouchZonesSnapshot(): List<TouchZone> = synchronized(lock) {
-        touchZones.toList()
-    }
-
-    fun onKeyEvent(keyCode: Int, isDown: Boolean): Boolean {
-        val name = mapAndroidKeyCode(keyCode) ?: return false
-        synchronized(lock) {
-            if (isDown) keyDownSet.add(name) else keyDownSet.remove(name)
-        }
-        return true
-    }
-
-    fun onGamepadMotion(event: MotionEvent): Boolean {
-        val isJoystick = (event.source and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK ||
-            (event.source and InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
-        if (!isJoystick) return false
-
-        val deadzone = 0.22f
-        val rawX = event.getAxisValue(MotionEvent.AXIS_X)
-        val rawY = event.getAxisValue(MotionEvent.AXIS_Y)
-        val hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X)
-        val hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
-
-        val ax = if (abs(rawX) > deadzone) rawX else 0f
-        val ay = if (abs(rawY) > deadzone) rawY else 0f
-
-        synchronized(lock) {
-            stickX = ax
-            stickY = ay
-            updateKeyFlag("STICK_LEFT", ax < -deadzone)
-            updateKeyFlag("STICK_RIGHT", ax > deadzone)
-            updateKeyFlag("STICK_UP", ay < -deadzone)
-            updateKeyFlag("STICK_DOWN", ay > deadzone)
-            updateKeyFlag("DPAD_LEFT", hatX < -0.5f)
-            updateKeyFlag("DPAD_RIGHT", hatX > 0.5f)
-            updateKeyFlag("DPAD_UP", hatY < -0.5f)
-            updateKeyFlag("DPAD_DOWN", hatY > 0.5f)
-        }
-        return true
-    }
-
-    fun onMultiTouch(event: MotionEvent, viewW: Int, viewH: Int) {
-        synchronized(lock) {
-            val w = max(1, viewW).toFloat()
-            val h = max(1, viewH).toFloat()
-            when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
-                    val idx = event.actionIndex
-                    val pid = event.getPointerId(idx)
-                    activePointers[pid] = ((event.getX(idx) / w) * 1080f) to ((event.getY(idx) / h) * 1920f)
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    for (i in 0 until event.pointerCount) {
-                        val pid = event.getPointerId(i)
-                        activePointers[pid] = ((event.getX(i) / w) * 1080f) to ((event.getY(i) / h) * 1920f)
-                    }
-                }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
-                    val idx = event.actionIndex
-                    activePointers.remove(event.getPointerId(idx))
-                }
-                MotionEvent.ACTION_CANCEL -> {
-                    activePointers.clear()
-                }
-                else -> Unit
-            }
-        }
-    }
-
-    fun clearAllPointers() = synchronized(lock) {
-        activePointers.clear()
-        virtualActionDown.clear()
-    }
-
-    fun beginFrame() = synchronized(lock) {
-        prevActionStates.clear()
-        prevActionStates.putAll(currActionStates)
-        currActionStates.clear()
-
-        frameStickX = stickX
-        frameStickY = stickY
-
-        val allActions = HashSet<String>(actionBindings.keys)
-        allActions.addAll(virtualActionDown)
-        for (z in touchZones) allActions.add(z.action)
-
-        for (act in allActions) {
-            var active = virtualActionDown.contains(act)
-            if (!active) {
-                val keys = actionBindings[act]
-                if (keys != null) {
-                    for (k in keys) {
-                        if (keyDownSet.contains(k)) {
-                            active = true
-                            break
-                        }
-                    }
-                }
-            }
-            if (!active && activePointers.isNotEmpty()) {
-                for (z in touchZones) {
-                    if (z.action != act) continue
-                    val hw = z.w * 0.5f
-                    val hh = z.h * 0.5f
-                    for ((px, py) in activePointers.values) {
-                        if (abs(px - z.cx) <= hw && abs(py - z.cy) <= hh) {
-                            active = true
-                            break
-                        }
-                    }
-                    if (active) break
-                }
-            }
-            currActionStates[act] = active
-        }
-    }
-
-    fun isActionPressed(action: String): Boolean = currActionStates[action] == true
-
-    fun isActionJustPressed(action: String): Boolean =
-        currActionStates[action] == true && prevActionStates[action] != true
-
-    fun isActionJustReleased(action: String): Boolean =
-        currActionStates[action] != true && prevActionStates[action] == true
-
-    fun getAxis(negAction: String, posAction: String): Float {
-        if (negAction == "move_left" && posAction == "move_right" && abs(frameStickX) > 0.22f) {
-            return frameStickX.coerceIn(-1f, 1f)
-        }
-        if (negAction == "move_up" && posAction == "move_down" && abs(frameStickY) > 0.22f) {
-            return frameStickY.coerceIn(-1f, 1f)
-        }
-        var v = 0f
-        if (isActionPressed(negAction)) v -= 1f
-        if (isActionPressed(posAction)) v += 1f
-        return v
-    }
-
-    fun getTouchCount(): Int = synchronized(lock) { activePointers.size }
-
-    private fun updateKeyFlag(key: String, down: Boolean) {
-        if (down) keyDownSet.add(key) else keyDownSet.remove(key)
-    }
-
-    private fun mapAndroidKeyCode(keyCode: Int): String? = when (keyCode) {
-        in KeyEvent.KEYCODE_A..KeyEvent.KEYCODE_Z -> ('A' + (keyCode - KeyEvent.KEYCODE_A)).toString()
-        in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 -> ('0' + (keyCode - KeyEvent.KEYCODE_0)).toString()
-        KeyEvent.KEYCODE_SPACE -> "SPACE"
-        KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> "ENTER"
-        KeyEvent.KEYCODE_ESCAPE -> "ESC"
-        KeyEvent.KEYCODE_SHIFT_LEFT, KeyEvent.KEYCODE_SHIFT_RIGHT -> "SHIFT"
-        KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.KEYCODE_CTRL_RIGHT -> "CTRL"
-        KeyEvent.KEYCODE_DPAD_LEFT -> "LEFT"
-        KeyEvent.KEYCODE_DPAD_RIGHT -> "RIGHT"
-        KeyEvent.KEYCODE_DPAD_UP -> "UP"
-        KeyEvent.KEYCODE_DPAD_DOWN -> "DOWN"
-        KeyEvent.KEYCODE_BUTTON_A -> "GAMEPAD_A"
-        KeyEvent.KEYCODE_BUTTON_B -> "GAMEPAD_B"
-        KeyEvent.KEYCODE_BUTTON_X -> "GAMEPAD_X"
-        KeyEvent.KEYCODE_BUTTON_Y -> "GAMEPAD_Y"
-        KeyEvent.KEYCODE_BUTTON_L1 -> "GAMEPAD_L1"
-        KeyEvent.KEYCODE_BUTTON_R1 -> "GAMEPAD_R1"
-        KeyEvent.KEYCODE_BUTTON_L2 -> "GAMEPAD_L2"
-        KeyEvent.KEYCODE_BUTTON_R2 -> "GAMEPAD_R2"
-        KeyEvent.KEYCODE_BUTTON_START -> "GAMEPAD_START"
-        KeyEvent.KEYCODE_BUTTON_SELECT -> "GAMEPAD_SELECT"
-        else -> null
-    }
-}
-
-// ==================== P4 独立子系统 3：GPU 动态合批渲染器（Sprite + 9-Slice + 粒子 + 阴影合批） ====================
-class ZeroSpriteBatch(
-    private val maxQuads: Int = 1024
-) {
-    private val floatsPerVertex = 10
-    private val strideBytes = floatsPerVertex * 4
-    private val vertexData = FloatArray(maxQuads * 4 * floatsPerVertex)
-    private val vertexBuffer: FloatBuffer = ByteBuffer.allocateDirect(vertexData.size * 4)
-        .order(ByteOrder.nativeOrder()).asFloatBuffer()
-    private val indexBuffer: ShortBuffer = ByteBuffer.allocateDirect(maxQuads * 6 * 2)
-        .order(ByteOrder.nativeOrder()).asShortBuffer().apply {
-            val indices = ShortArray(maxQuads * 6)
-            var idx = 0
-            for (i in 0 until maxQuads) {
-                val v = (i * 4).toShort()
-                indices[idx++] = v
-                indices[idx++] = (v + 1).toShort()
-                indices[idx++] = (v + 2).toShort()
-                indices[idx++] = v
-                indices[idx++] = (v + 2).toShort()
-                indices[idx++] = (v + 3).toShort()
-            }
-            put(indices)
-            position(0)
-        }
-
-    private var program = 0
-    private var aPosLoc = -1
-    private var aUvLoc = -1
-    private var aColLoc = -1
-    private var aFlashLoc = -1
-    private var uVpLoc = -1
-    private var uTexLoc = -1
-    private var uEnableLightLoc = -1
-    private var uAmbientLoc = -1
-    private var uLightCountLoc = -1
-    private var uLightPosLoc = -1
-    private var uLightColLoc = -1
-
-    private var activeVp: FloatArray = FloatArray(16)
-    private var currentTexId = 0
-    private var currentAdditive = false
-    private var currentLit = false
-    private var ambR = 0.5f
-    private var ambG = 0.5f
-    private var ambB = 0.5f
-    private var lightCount = 0
-    private var lightPosArr: FloatArray? = null
-    private var lightColArr: FloatArray? = null
-
-    private var quadCount = 0
-    private var floatPos = 0
-    private var onDrawCall: (() -> Unit)? = null
-
-    fun init(batchProgramId: Int) {
-        program = batchProgramId
-        aPosLoc = GLES20.glGetAttribLocation(program, "aPosition")
-        aUvLoc = GLES20.glGetAttribLocation(program, "aTexCoord")
-        aColLoc = GLES20.glGetAttribLocation(program, "aColor")
-        aFlashLoc = GLES20.glGetAttribLocation(program, "aFlash")
-        uVpLoc = GLES20.glGetUniformLocation(program, "uVP")
-        uTexLoc = GLES20.glGetUniformLocation(program, "uTexture")
-        uEnableLightLoc = GLES20.glGetUniformLocation(program, "uEnableLight")
-        uAmbientLoc = GLES20.glGetUniformLocation(program, "uAmbient")
-        uLightCountLoc = GLES20.glGetUniformLocation(program, "uLightCount")
-        uLightPosLoc = GLES20.glGetUniformLocation(program, "uLightPos")
-        uLightColLoc = GLES20.glGetUniformLocation(program, "uLightColor")
-    }
-
-    fun begin(
-        vpMatrix: FloatArray,
-        enableInlineLight: Boolean,
-        ambientR: Float,
-        ambientG: Float,
-        ambientB: Float,
-        lights: Int,
-        lightPos: FloatArray?,
-        lightCol: FloatArray?,
-        drawCounter: () -> Unit
-    ) {
-        activeVp = vpMatrix
-        currentLit = enableInlineLight
-        ambR = ambientR
-        ambG = ambientG
-        ambB = ambientB
-        lightCount = lights
-        lightPosArr = lightPos
-        lightColArr = lightCol
-        onDrawCall = drawCounter
-        quadCount = 0
-        floatPos = 0
-        currentTexId = 0
-        currentAdditive = false
-    }
-
-    fun setInlineLight(enabled: Boolean) {
-        if (enabled != currentLit) {
-            flush()
-            currentLit = enabled
-        }
-    }
-
-    fun drawQuad(
-        texId: Int,
-        m: FloatArray,
-        u0: Float, v0: Float, u1: Float, v1: Float,
-        r: Float, g: Float, b: Float, a: Float,
-        flash: Float,
-        additive: Boolean
-    ) {
-        if (program == 0) return
-        if (quadCount > 0 && (texId != currentTexId || additive != currentAdditive || quadCount >= maxQuads)) {
-            flush()
-        }
-        if (quadCount == 0) {
-            currentTexId = texId
-            currentAdditive = additive
-        }
-
-        val m0 = m[0]; val m1 = m[1]; val m2 = m[2]
-        val m4 = m[4]; val m5 = m[5]; val m6 = m[6]
-        val m12 = m[12]; val m13 = m[13]; val m14 = m[14]
-
-        val hx0 = m0 * 0.5f; val hx1 = m1 * 0.5f; val hx2 = m2 * 0.5f
-        val hy0 = m4 * 0.5f; val hy1 = m5 * 0.5f; val hy2 = m6 * 0.5f
-
-        var p = floatPos
-        vertexData[p++] = m12 - hx0 - hy0; vertexData[p++] = m13 - hx1 - hy1; vertexData[p++] = m14 - hx2 - hy2
-        vertexData[p++] = u0; vertexData[p++] = v0
-        vertexData[p++] = r; vertexData[p++] = g; vertexData[p++] = b; vertexData[p++] = a; vertexData[p++] = flash
-
-        vertexData[p++] = m12 + hx0 - hy0; vertexData[p++] = m13 + hx1 - hy1; vertexData[p++] = m14 + hx2 - hy2
-        vertexData[p++] = u1; vertexData[p++] = v0
-        vertexData[p++] = r; vertexData[p++] = g; vertexData[p++] = b; vertexData[p++] = a; vertexData[p++] = flash
-
-        vertexData[p++] = m12 + hx0 + hy0; vertexData[p++] = m13 + hx1 + hy1; vertexData[p++] = m14 + hx2 + hy2
-        vertexData[p++] = u1; vertexData[p++] = v1
-        vertexData[p++] = r; vertexData[p++] = g; vertexData[p++] = b; vertexData[p++] = a; vertexData[p++] = flash
-
-        vertexData[p++] = m12 - hx0 + hy0; vertexData[p++] = m13 - hx1 + hy1; vertexData[p++] = m14 - hx2 + hy2
-        vertexData[p++] = u0; vertexData[p++] = v1
-        vertexData[p++] = r; vertexData[p++] = g; vertexData[p++] = b; vertexData[p++] = a; vertexData[p++] = flash
-
-        floatPos = p
-        quadCount++
-    }
-
-    fun flush() {
-        if (quadCount == 0 || program == 0) return
-
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
-        if (currentAdditive) {
-            GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE)
-        } else {
-            GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
-        }
-
-        GLES20.glUseProgram(program)
-        GLES20.glUniformMatrix4fv(uVpLoc, 1, false, activeVp, 0)
-        GLES20.glUniform1i(uEnableLightLoc, if (currentLit) 1 else 0)
-        if (currentLit) {
-            GLES20.glUniform3f(uAmbientLoc, ambR, ambG, ambB)
-            GLES20.glUniform1i(uLightCountLoc, lightCount)
-            if (lightCount > 0 && lightPosArr != null && lightColArr != null) {
-                GLES20.glUniform4fv(uLightPosLoc, lightCount, lightPosArr, 0)
-                GLES20.glUniform4fv(uLightColLoc, lightCount, lightColArr, 0)
-            }
-        }
-
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, currentTexId)
-        GLES20.glUniform1i(uTexLoc, 0)
-
-        vertexBuffer.clear()
-        vertexBuffer.put(vertexData, 0, floatPos)
-
-        vertexBuffer.position(0)
-        GLES20.glEnableVertexAttribArray(aPosLoc)
-        GLES20.glVertexAttribPointer(aPosLoc, 3, GLES20.GL_FLOAT, false, strideBytes, vertexBuffer)
-
-        vertexBuffer.position(3)
-        GLES20.glEnableVertexAttribArray(aUvLoc)
-        GLES20.glVertexAttribPointer(aUvLoc, 2, GLES20.GL_FLOAT, false, strideBytes, vertexBuffer)
-
-        vertexBuffer.position(5)
-        GLES20.glEnableVertexAttribArray(aColLoc)
-        GLES20.glVertexAttribPointer(aColLoc, 4, GLES20.GL_FLOAT, false, strideBytes, vertexBuffer)
-
-        vertexBuffer.position(9)
-        GLES20.glEnableVertexAttribArray(aFlashLoc)
-        GLES20.glVertexAttribPointer(aFlashLoc, 1, GLES20.GL_FLOAT, false, strideBytes, vertexBuffer)
-
-        indexBuffer.position(0)
-        GLES20.glDrawElements(GLES20.GL_TRIANGLES, quadCount * 6, GLES20.GL_UNSIGNED_SHORT, indexBuffer)
-        onDrawCall?.invoke()
-
-        GLES20.glDisableVertexAttribArray(aPosLoc)
-        GLES20.glDisableVertexAttribArray(aUvLoc)
-        GLES20.glDisableVertexAttribArray(aColLoc)
-        GLES20.glDisableVertexAttribArray(aFlashLoc)
-
-        if (currentAdditive) {
-            GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
-        }
-        quadCount = 0
-        floatPos = 0
-    }
-
-    fun end() {
-        flush()
-        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
-    }
-}
-
-// ==================== ZeroEngine 主视图与渲染/物理/脚本/商业大世界/图集核心（P6） ====================
+// ==================== ZeroEngine 主视图与渲染/物理/脚本/P7专业动画核心 ====================
 class ZeroEngineView(
     context: Context,
     private val projectDir: File,
@@ -809,7 +136,6 @@ class ZeroEngineView(
         var parallaxX: Float = 1f,
         var parallaxY: Float = 1f,
         var texture: String = "",
-        // P6：纹理大图集（TextureAtlas）
         var atlas: String = "",
         var atlasFrame: String = "",
         var text: String = "",
@@ -861,7 +187,7 @@ class ZeroEngineView(
         var damage: Float = 10f,
         var invulnTimer: Float = 0f,
         var hitCooldownMap: MutableMap<String, Float> = mutableMapOf(),
-        // 序列帧与状态机
+        // 旧版序列帧（兼容保留）
         var hFrames: Int = 1,
         var vFrames: Int = 1,
         var currentFrame: Int = 0,
@@ -873,6 +199,8 @@ class ZeroEngineView(
         var animTimer: Float = 0f,
         var currentClipName: String = "",
         val clips: MutableMap<String, AnimClip> = mutableMapOf(),
+        // P7：商业级专业动画播放器（逐帧时长/偏移/帧同步Hitbox/骨骼轨道/FSM）
+        val animator: ZeroAnimator = ZeroAnimator(),
         // TileMap 稀疏瓦片数据 + VBO + O(1) 查表
         var tileSize: Float = 90f,
         val tiles: MutableList<TileCell> = mutableListOf(),
@@ -963,7 +291,7 @@ class ZeroEngineView(
                 "a" -> n.a.toDouble()
                 "visible" -> n.visible
                 "text" -> n.text
-                "currentClip" -> n.currentClipName
+                "currentClip" -> n.animator.currentClip?.name ?: n.currentClipName
                 "lightRadius" -> n.lightRadius.toDouble()
                 "lightIntensity" -> n.lightIntensity.toDouble()
                 else -> super.get(name, start)
@@ -1028,21 +356,16 @@ class ZeroEngineView(
         }
     }
 
-    // 独立子系统实例
+    // 独立子系统实例（已拆分至独立 .kt 文件）
     private val audioSystem = ZeroAudioSystem(projectDir, onConsoleLog)
     private val inputSystem = ZeroInputSystem()
     private val spriteBatch = ZeroSpriteBatch(1024)
 
-    // P4：外部 JS 模块缓存
     private val moduleCache = mutableMapOf<String, Any?>()
-
-    // P5：大世界状态标志、数据表与多语言（i18n）
     private val worldFlags = ConcurrentHashMap<String, Any>()
     private val dataTableCache = mutableMapOf<String, Any?>()
     private var currentLang = "zh"
     private val i18nDicts = mutableMapOf<String, MutableMap<String, String>>()
-
-    // P6：纹理大图集缓存（TextureAtlas）
     private val atlasCache = ConcurrentHashMap<String, TextureAtlasData>()
 
     private val nodes = mutableListOf<GameNode>()
@@ -1053,7 +376,6 @@ class ZeroEngineView(
     private val textureSizes = ConcurrentHashMap<String, Pair<Int, Int>>()
     private val eventListeners = mutableMapOf<String, MutableList<Function>>()
 
-    // P1：空间哈希网格与调试线框
     private val spatialCellSize = 256f
     private val spatialGrid = HashMap<Long, MutableList<GameNode>>(256)
     private val activeTileMaps = mutableListOf<GameNode>()
@@ -1065,7 +387,6 @@ class ZeroEngineView(
         .order(ByteOrder.nativeOrder()).asFloatBuffer()
     private val identityMatrix = FloatArray(16).apply { Matrix.setIdentityM(this, 0) }
 
-    // P2：多场景叠加、后台预加载与 FBO 后处理
     private val globalDataStore = ConcurrentHashMap<String, Any?>()
     private val preloadedSceneCache = ConcurrentHashMap<String, String>()
     private val sceneIoExecutor = Executors.newSingleThreadExecutor()
@@ -1105,7 +426,6 @@ class ZeroEngineView(
             position(0)
         }
 
-    // P0：有界 LRU 文字纹理缓存
     private val maxTextTextures = 64
     private val textTextureCache = object : LinkedHashMap<String, Int>(64, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Int>?): Boolean {
@@ -1120,7 +440,6 @@ class ZeroEngineView(
         }
     }
 
-    // 摄像机与视锥边界
     private var camMode = "2.5D"
     private var camX = 540f
     private var camY = 960f
@@ -1146,7 +465,6 @@ class ZeroEngineView(
     private var viewMinY = -99999f
     private var viewMaxY = 99999f
 
-    // 实时性能统计
     private var smoothedFps = 60f
     private var frameDrawCalls = 0
     private var lastFrameDrawCalls = 0
@@ -1154,16 +472,13 @@ class ZeroEngineView(
     private var lastFrameCulled = 0
     private var lastFrameLights = 0
 
-    // 顿帧与时间缩放
     private var hitstopTimer = 0f
     private var timeScale = 1f
 
-    // 环境光
     private var ambientR = 0.52f
     private var ambientG = 0.56f
     private var ambientB = 0.68f
 
-    // 兼容旧版单指触控状态
     @Volatile private var isTouching = false
     @Volatile private var touchScreenX = 0f
     @Volatile private var touchScreenY = 0f
@@ -1171,7 +486,6 @@ class ZeroEngineView(
     @Volatile private var touchWorldY = 0f
     private val pendingTouchEvents = mutableListOf<Triple<String, Float, Float>>()
 
-    // OpenGL 矩阵与着色器
     private val projMatrix = FloatArray(16)
     private val viewMatrix = FloatArray(16)
     private val vpMatrix = FloatArray(16)
@@ -1238,9 +552,7 @@ class ZeroEngineView(
         if (name.endsWith(".scene")) name else "$name.scene"
 
     fun releaseResources() {
-        try {
-            sceneIoExecutor.shutdownNow()
-        } catch (_: Exception) {}
+        try { sceneIoExecutor.shutdownNow() } catch (_: Exception) {}
         inputSystem.clearAllPointers()
         queueEvent {
             releaseFbos()
@@ -1260,15 +572,14 @@ class ZeroEngineView(
         audioSystem.release()
     }
 
-    // ==================== P6：纹理大图集（TextureAtlas）加载与 UV 查表 ====================
+    // ==================== P6：纹理大图集（TextureAtlas） ====================
     private fun loadAtlasData(atlasName: String): TextureAtlasData? {
         val cleaned = atlasName.trim().replace("\\", "/").removePrefix("./")
         if (cleaned.isEmpty() || cleaned.contains("..")) return null
         val norm = if (cleaned.endsWith(".json", ignoreCase = true)) cleaned else "$cleaned.json"
         atlasCache[norm]?.let { return it }
 
-        val texDir = File(projectDir, "textures")
-        val file = File(texDir, norm)
+        val file = File(File(projectDir, "textures"), norm)
         if (!file.exists()) {
             onConsoleLog("[ATLAS 警告] 找不到图集文件: textures/$norm")
             return null
@@ -1276,14 +587,8 @@ class ZeroEngineView(
         return try {
             val root = JSONObject(file.readText())
             val metaObj = root.optJSONObject("meta")
-            val imageFile = root.optString("image", "").ifEmpty {
-                metaObj?.optString("image", "") ?: ""
-            }
-            if (imageFile.isEmpty()) {
-                onConsoleLog("[ATLAS 错误] 图集缺少 image 字段: $norm")
-                return null
-            }
-            // 触发图片加载以记录宽高
+            val imageFile = root.optString("image", "").ifEmpty { metaObj?.optString("image", "") ?: "" }
+            if (imageFile.isEmpty()) return null
             getImageTexture(imageFile)
             val imgSize = textureSizes[imageFile]
             val sizeObj = root.optJSONObject("size") ?: metaObj?.optJSONObject("size")
@@ -1306,10 +611,8 @@ class ZeroEngineView(
                         y = rect.optDouble("y", 0.0).toFloat(),
                         w = rect.optDouble("w", 0.0).toFloat(),
                         h = rect.optDouble("h", 0.0).toFloat(),
-                        sourceW = srcSize?.optDouble("w", rect.optDouble("w", 0.0))?.toFloat()
-                            ?: rect.optDouble("w", 0.0).toFloat(),
-                        sourceH = srcSize?.optDouble("h", rect.optDouble("h", 0.0))?.toFloat()
-                            ?: rect.optDouble("h", 0.0).toFloat()
+                        sourceW = srcSize?.optDouble("w", rect.optDouble("w", 0.0))?.toFloat() ?: rect.optDouble("w", 0.0).toFloat(),
+                        sourceH = srcSize?.optDouble("h", rect.optDouble("h", 0.0))?.toFloat() ?: rect.optDouble("h", 0.0).toFloat()
                     )
                 }
             } else {
@@ -1330,7 +633,6 @@ class ZeroEngineView(
                     }
                 }
             }
-
             val data = TextureAtlasData(imageFile, max(1f, atlasW), max(1f, atlasH), frameMap)
             atlasCache[norm] = data
             data
@@ -1340,22 +642,17 @@ class ZeroEngineView(
         }
     }
 
-    // ==================== P4：显存自动回收器（含图集关联贴图保护） ====================
     private fun unloadUnusedTextures(): Int {
         if (textureCache.isEmpty()) return 0
         val activeTexNames = HashSet<String>()
         for (n in nodes) {
             if (pendingRemove.contains(n)) continue
             if (n.texture.isNotEmpty()) activeTexNames.add(n.texture)
-            if (n.atlas.isNotEmpty()) {
-                loadAtlasData(n.atlas)?.let { activeTexNames.add(it.imageFile) }
-            }
+            if (n.atlas.isNotEmpty()) loadAtlasData(n.atlas)?.let { activeTexNames.add(it.imageFile) }
         }
         for (n in pendingAdd) {
             if (n.texture.isNotEmpty()) activeTexNames.add(n.texture)
-            if (n.atlas.isNotEmpty()) {
-                loadAtlasData(n.atlas)?.let { activeTexNames.add(it.imageFile) }
-            }
+            if (n.atlas.isNotEmpty()) loadAtlasData(n.atlas)?.let { activeTexNames.add(it.imageFile) }
         }
         val toDelete = mutableListOf<String>()
         val ids = mutableListOf<Int>()
@@ -1365,9 +662,7 @@ class ZeroEngineView(
                 if (texId != 0 && texId != whiteTexId) ids.add(texId)
             }
         }
-        if (ids.isNotEmpty()) {
-            GLES20.glDeleteTextures(ids.size, ids.toIntArray(), 0)
-        }
+        if (ids.isNotEmpty()) GLES20.glDeleteTextures(ids.size, ids.toIntArray(), 0)
         for (k in toDelete) {
             textureCache.remove(k)
             textureSizes.remove(k)
@@ -1375,13 +670,9 @@ class ZeroEngineView(
         return toDelete.size
     }
 
-    // ==================== P4：外部 JS 模块化加载器（CommonJS require） ====================
     private fun requireScriptModule(rawPath: String): Any? {
         val cleaned = rawPath.trim().replace("\\", "/").removePrefix("./")
-        if (cleaned.isEmpty() || cleaned.contains("..")) {
-            onConsoleLog("[MODULE 拒绝] 非法模块路径: $rawPath")
-            return null
-        }
+        if (cleaned.isEmpty() || cleaned.contains("..")) return null
         val normPath = if (cleaned.endsWith(".js")) cleaned else "$cleaned.js"
         if (moduleCache.containsKey(normPath)) return moduleCache[normPath]
 
@@ -1407,7 +698,7 @@ class ZeroEngineView(
             finalExports
         } catch (e: Exception) {
             moduleCache.remove(normPath)
-            onConsoleLog("[MODULE 编译/运行错误 @ $normPath] ${e.message}")
+            onConsoleLog("[MODULE 错误 @ $normPath] ${e.message}")
             null
         }
     }
@@ -1423,23 +714,15 @@ class ZeroEngineView(
         if (cleaned.contains("..")) return rawScript
         val norm = if (cleaned.endsWith(".js")) cleaned else "$cleaned.js"
         val file = File(File(projectDir, "scripts"), norm)
-        return if (file.exists()) {
-            file.readText()
-        } else {
-            onConsoleLog("[SCRIPT 警告] 找不到外部脚本文件: scripts/$norm")
-            rawScript
-        }
+        return if (file.exists()) file.readText() else rawScript
     }
 
-    // ==================== P5：大世界状态标志（WorldFlags） ====================
     private fun saveWorldFlagsToDisk(slotName: String): Boolean {
         return try {
             val safeName = slotName.replace(Regex("[^a-zA-Z0-9_\\-\\u4e00-\\u9fa5]"), "_").ifEmpty { "world_flags" }
             val savesDir = File(projectDir, "saves").apply { mkdirs() }
             val jsonObj = JSONObject()
-            for ((k, v) in worldFlags) {
-                jsonObj.put(k, v)
-            }
+            for ((k, v) in worldFlags) jsonObj.put(k, v)
             File(savesDir, "flags_$safeName.json").writeText(jsonObj.toString())
             true
         } catch (e: Exception) {
@@ -1460,10 +743,7 @@ class ZeroEngineView(
                 val k = keys.next()
                 val v = root.opt(k)
                 if (v != null && v !== JSONObject.NULL) {
-                    worldFlags[k] = when (v) {
-                        is Number -> v.toDouble()
-                        else -> v
-                    }
+                    worldFlags[k] = if (v is Number) v.toDouble() else v
                 }
             }
             true
@@ -1473,15 +753,9 @@ class ZeroEngineView(
         }
     }
 
-    // ==================== P5：数值数据表（DataTable）与多语言（i18n） ====================
     private fun parseJsonStringToJs(raw: String): Any? {
         val reviver = object : Callable {
-            override fun call(
-                cx: RhinoContext?,
-                scope: Scriptable?,
-                thisObj: Scriptable?,
-                args: Array<out Any?>
-            ): Any? = args.getOrNull(1)
+            override fun call(cx: RhinoContext?, scope: Scriptable?, thisObj: Scriptable?, args: Array<out Any?>): Any? = args.getOrNull(1)
         }
         return NativeJSON.parse(rhino, globalScope, raw, reviver)
     }
@@ -1517,44 +791,30 @@ class ZeroEngineView(
             try {
                 val obj = JSONObject(perLangFile.readText())
                 val it = obj.keys()
-                while (it.hasNext()) {
-                    val k = it.next()
-                    dict[k] = obj.optString(k, "")
-                }
-            } catch (e: Exception) {
-                onConsoleLog("[I18N 解析错误 @ i18n_$lang.json] ${e.message}")
-            }
+                while (it.hasNext()) { val k = it.next(); dict[k] = obj.optString(k, "") }
+            } catch (_: Exception) {}
             return
         }
         val combinedFile = File(dataDir, "i18n.json")
         if (combinedFile.exists()) {
             try {
-                val root = JSONObject(combinedFile.readText())
-                val sub = root.optJSONObject(lang) ?: return
+                val sub = JSONObject(combinedFile.readText()).optJSONObject(lang) ?: return
                 val it = sub.keys()
-                while (it.hasNext()) {
-                    val k = it.next()
-                    dict[k] = sub.optString(k, "")
-                }
-            } catch (e: Exception) {
-                onConsoleLog("[I18N 解析错误 @ i18n.json] ${e.message}")
-            }
+                while (it.hasNext()) { val k = it.next(); dict[k] = sub.optString(k, "") }
+            } catch (_: Exception) {}
         }
     }
 
     private fun translateKey(key: String, fallback: String): String {
         val dict = i18nDicts[currentLang]
-        if (dict != null && dict.containsKey(key)) {
-            return dict[key] ?: fallback
-        }
+        if (dict != null && dict.containsKey(key)) return dict[key] ?: fallback
         return if (fallback.isNotEmpty()) fallback else key
     }
 
     private fun releaseNodeGpuResources(n: GameNode) {
         if (n.tileVboId != 0) {
             GLES20.glDeleteBuffers(1, intArrayOf(n.tileVboId), 0)
-            n.tileVboId = 0
-            n.tileVertexCount = 0
+            n.tileVboId = 0; n.tileVertexCount = 0
         }
         if (n.customProgram != 0 && n.customProgram != defaultLitProgram) {
             GLES20.glDeleteProgram(n.customProgram)
@@ -1595,9 +855,7 @@ class ZeroEngineView(
         val status = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER)
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
 
-        return if (status == GLES20.GL_FRAMEBUFFER_COMPLETE) {
-            fbos[0] to texs[0]
-        } else {
+        return if (status == GLES20.GL_FRAMEBUFFER_COMPLETE) fbos[0] to texs[0] else {
             GLES20.glDeleteFramebuffers(1, fbos, 0)
             GLES20.glDeleteTextures(1, texs, 0)
             0 to 0
@@ -1614,9 +872,7 @@ class ZeroEngineView(
             sceneFbo = sf; sceneColorTex = st
             lightFbo = lf; lightMapTex = lt
             fboReady = (lightProgram != 0 && postProgram != 0)
-        } else {
-            releaseFbos()
-        }
+        } else releaseFbos()
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
@@ -1656,12 +912,8 @@ class ZeroEngineView(
                 if (file.exists()) {
                     preloadedSceneCache[norm] = file.readText()
                     onConsoleLog("[ASYNC] 后台预加载完成: $norm")
-                } else {
-                    onConsoleLog("[ASYNC 警告] 预加载找不到文件: $norm")
                 }
-            } catch (e: Exception) {
-                onConsoleLog("[ASYNC 错误] ${e.message}")
-            }
+            } catch (_: Exception) {}
         }
     }
 
@@ -1681,9 +933,7 @@ class ZeroEngineView(
             pendingRemove.clear()
             activeTweens.removeAll { !it.node.persistent }
             debugRays.clear()
-            if (camTarget != null && camTarget?.persistent != true) {
-                camTarget = null
-            }
+            if (camTarget != null && camTarget?.persistent != true) camTarget = null
             camBoundsEnabled = false
         }
 
@@ -1691,10 +941,7 @@ class ZeroEngineView(
         parseSceneJson(rawJson, newNodes, groupName, applyCamera = !additive)
         if (additive && (offsetX != 0f || offsetY != 0f)) {
             for (n in newNodes) {
-                if (n.parent.isEmpty() && n.layer == "World") {
-                    n.x += offsetX
-                    n.y += offsetY
-                }
+                if (n.parent.isEmpty() && n.layer == "World") { n.x += offsetX; n.y += offsetY }
             }
         }
         nodes.addAll(newNodes)
@@ -1726,6 +973,16 @@ class ZeroEngineView(
         return ColliderBounds(cx, cy, hw, hh)
     }
 
+    private fun getFrameBoxWorldBounds(owner: GameNode, box: FrameBox): ColliderBounds {
+        val gt = getGlobalTransform(owner)
+        val dirX = if (gt.gSx < 0f) -1f else 1f
+        val scaleAbsX = abs(gt.gSx)
+        val scaleAbsY = abs(gt.gSy)
+        val cx = gt.gx + box.offsetX * scaleAbsX * dirX
+        val cy = gt.gy + box.offsetY * scaleAbsY
+        return ColliderBounds(cx, cy, box.width * scaleAbsX * 0.5f, box.height * scaleAbsY * 0.5f)
+    }
+
     private fun canCollideLayer(mover: GameNode, target: GameNode): Boolean =
         (mover.colMask and target.colLayer) != 0
 
@@ -1734,7 +991,8 @@ class ZeroEngineView(
         activeTileMaps.clear()
         for (n in nodes) {
             if (!n.visible || pendingRemove.contains(n)) continue
-            if (!n.collider && !n.isHitbox && !n.isHurtbox) continue
+            val hasFrameBox = n.animator.activeFrame?.boxes?.isNotEmpty() == true
+            if (!n.collider && !n.isHitbox && !n.isHurtbox && !hasFrameBox) continue
             if (n.nodeType == "TileMap") {
                 if (n.tiles.isNotEmpty()) activeTileMaps.add(n)
                 continue
@@ -1751,8 +1009,7 @@ class ZeroEngineView(
         val maxCy = floor((b.cy + b.hh) / spatialCellSize).toInt()
         for (cx in minCx..maxCx) {
             for (cy in minCy..maxCy) {
-                val key = packGridKey(cx, cy)
-                spatialGrid.getOrPut(key) { mutableListOf() }.add(n)
+                spatialGrid.getOrPut(packGridKey(cx, cy)) { mutableListOf() }.add(n)
             }
         }
     }
@@ -1775,11 +1032,7 @@ class ZeroEngineView(
     private fun updateFadeTransition(rawDt: Float) {
         if (fadeSpeed > 0f) {
             val step = fadeSpeed * rawDt
-            if (postFade < fadeTarget) {
-                postFade = min(fadeTarget, postFade + step)
-            } else if (postFade > fadeTarget) {
-                postFade = max(fadeTarget, postFade - step)
-            }
+            postFade = if (postFade < fadeTarget) min(fadeTarget, postFade + step) else max(fadeTarget, postFade - step)
             if (abs(postFade - fadeTarget) < 0.001f) {
                 postFade = fadeTarget
                 fadeSpeed = 0f
@@ -1798,8 +1051,7 @@ class ZeroEngineView(
         val now = System.nanoTime()
         val rawDt = ((now - lastFrameNs) / 1_000_000_000.0).toFloat().coerceIn(0.001f, 0.05f)
         lastFrameNs = now
-        val instFps = 1f / rawDt
-        smoothedFps = smoothedFps * 0.9f + instFps * 0.1f
+        smoothedFps = smoothedFps * 0.9f + (1f / rawDt) * 0.1f
 
         inputSystem.beginFrame()
         audioSystem.update(rawDt)
@@ -1812,9 +1064,7 @@ class ZeroEngineView(
             if (txt != null) {
                 onConsoleLog("[SCENE] 切换关卡场景 -> $norm")
                 loadSceneContent(txt, groupName = norm, additive = false)
-            } else {
-                onConsoleLog("[SCENE 错误] 找不到场景文件: $norm")
-            }
+            } else onConsoleLog("[SCENE 错误] 找不到场景文件: $norm")
         }
 
         if (pendingAdditiveLoads.isNotEmpty()) {
@@ -1824,10 +1074,7 @@ class ZeroEngineView(
                 val norm = normalizeSceneName(req.sceneFile)
                 val txt = readSceneText(norm)
                 if (txt != null) {
-                    onConsoleLog("[SCENE] 叠加加载场景 -> $norm")
                     loadSceneContent(txt, groupName = norm, additive = true, offsetX = req.offsetX, offsetY = req.offsetY)
-                } else {
-                    onConsoleLog("[SCENE 错误] 叠加加载找不到文件: $norm")
                 }
             }
         }
@@ -1886,10 +1133,13 @@ class ZeroEngineView(
                         if (left <= 0f) it.remove() else entry.setValue(left)
                     }
                 }
-                updateSpriteAnimation(n, dt)
-                if (n.nodeType == "ParticleEmitter") {
-                    updateParticleEmitter(n, dt)
+                // P7：优先驱动专业动画内核，未启用时自动回退旧序列帧
+                if (n.animator.clips.isNotEmpty() || n.animator.currentClip != null) {
+                    updateProAnimator(n, dt)
+                } else {
+                    updateSpriteAnimation(n, dt)
                 }
+                if (n.nodeType == "ParticleEmitter") updateParticleEmitter(n, dt)
                 callLifecycle(n, "onProcess", dt)
             }
         }
@@ -1906,6 +1156,42 @@ class ZeroEngineView(
         renderSceneFrame()
     }
 
+    // ==================== P7：专业动画更新（逐帧同步 + 2D骨骼轨道驱动） ====================
+    private fun updateProAnimator(n: GameNode, dt: Float) {
+        n.animator.update(
+            dt = dt,
+            onEvent = { clipName, evName -> callFrameEvent(n, clipName, evName) },
+            onFinished = { clipName -> callLifecycle(n, "onAnimFinished", clipName) }
+        )
+        val af = n.animator.activeFrame
+        if (af != null) {
+            n.currentFrame = af.frameIndex
+            if (af.atlasFrame.isNotEmpty()) n.atlasFrame = af.atlasFrame
+        }
+        if (n.animator.activeBonePoses.isNotEmpty()) {
+            for (pose in n.animator.activeBonePoses) {
+                val target = nodes.find { it.name == pose.targetNodeName && (it.parent == n.name || it === n) }
+                    ?: nodes.find { it.name == pose.targetNodeName }
+                    ?: continue
+                pose.x?.let { target.x = it }
+                pose.y?.let { target.y = it }
+                pose.rotation?.let { target.rotation = it }
+                pose.scaleX?.let { target.scaleX = it }
+                pose.scaleY?.let { target.scaleY = it }
+            }
+        }
+    }
+
+    private fun callFrameEvent(n: GameNode, clipName: String, evName: String) {
+        val scope = n.jsObj?.prototype ?: return
+        val fn = ScriptableObject.getProperty(scope, "onFrameEvent") as? Function ?: return
+        try {
+            fn.call(rhino, scope, n.jsObj, arrayOf(clipName, evName))
+        } catch (e: Exception) {
+            onConsoleLog("[JS 运行错误 @ ${n.name}.onFrameEvent] ${e.message}")
+        }
+    }
+
     private fun isBoxInView(minX: Float, maxX: Float, minY: Float, maxY: Float): Boolean =
         maxX >= viewMinX && minX <= viewMaxX && maxY >= viewMinY && minY <= viewMaxY
 
@@ -1917,10 +1203,8 @@ class ZeroEngineView(
         var hasClip = false
 
         if (n.clipW > 0f && n.clipH > 0f) {
-            left = max(left, n.clipX)
-            top = max(top, n.clipY)
-            right = min(right, n.clipX + n.clipW)
-            bottom = min(bottom, n.clipY + n.clipH)
+            left = max(left, n.clipX); top = max(top, n.clipY)
+            right = min(right, n.clipX + n.clipW); bottom = min(bottom, n.clipY + n.clipH)
             hasClip = true
         }
 
@@ -1933,15 +1217,12 @@ class ZeroEngineView(
                 val pgt = getGlobalTransform(p)
                 val pw = abs(p.width * pgt.gSx)
                 val ph = abs(p.height * pgt.gSy)
-                left = max(left, pgt.gx - pw * 0.5f)
-                top = max(top, pgt.gy - ph * 0.5f)
-                right = min(right, pgt.gx + pw * 0.5f)
-                bottom = min(bottom, pgt.gy + ph * 0.5f)
+                left = max(left, pgt.gx - pw * 0.5f); top = max(top, pgt.gy - ph * 0.5f)
+                right = min(right, pgt.gx + pw * 0.5f); bottom = min(bottom, pgt.gy + ph * 0.5f)
                 hasClip = true
             }
             parentName = p.parent
         }
-
         return if (hasClip) floatArrayOf(left, top, right, bottom) else null
     }
 
@@ -1950,10 +1231,8 @@ class ZeroEngineView(
         val ex = ((rect[2] / 1080f) * surfaceW).toInt().coerceIn(0, surfaceW)
         val sy = (((1920f - rect[3]) / 1920f) * surfaceH).toInt().coerceIn(0, surfaceH)
         val ey = (((1920f - rect[1]) / 1920f) * surfaceH).toInt().coerceIn(0, surfaceH)
-        val sw = max(0, ex - sx)
-        val sh = max(0, ey - sy)
         GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
-        GLES20.glScissor(sx, sy, sw, sh)
+        GLES20.glScissor(sx, sy, max(0, ex - sx), max(0, ey - sy))
     }
 
     private fun renderSceneFrame() {
@@ -2014,9 +1293,7 @@ class ZeroEngineView(
 
             if (particleNodes.isNotEmpty()) {
                 spriteBatch.begin(vpMatrix, false, ambientR, ambientG, ambientB, 0, null, null) { frameDrawCalls++ }
-                for (pNode in particleNodes) {
-                    submitParticlesToBatch(pNode, isWorld = true, fadeAlpha = 1f - postFade)
-                }
+                for (pNode in particleNodes) submitParticlesToBatch(pNode, isWorld = true, fadeAlpha = 1f - postFade)
                 spriteBatch.end()
             }
         } else {
@@ -2025,14 +1302,10 @@ class ZeroEngineView(
             val lightColArr = FloatArray(8 * 4)
             lights.forEachIndexed { idx, l ->
                 val gt = getGlobalTransform(l)
-                lightPosArr[idx * 4] = gt.gx
-                lightPosArr[idx * 4 + 1] = gt.gy
-                lightPosArr[idx * 4 + 2] = gt.gz
-                lightPosArr[idx * 4 + 3] = l.lightRadius
-                lightColArr[idx * 4] = l.r * l.lightIntensity
-                lightColArr[idx * 4 + 1] = l.g * l.lightIntensity
-                lightColArr[idx * 4 + 2] = l.b * l.lightIntensity
-                lightColArr[idx * 4 + 3] = 1f
+                lightPosArr[idx * 4] = gt.gx; lightPosArr[idx * 4 + 1] = gt.gy
+                lightPosArr[idx * 4 + 2] = gt.gz; lightPosArr[idx * 4 + 3] = l.lightRadius
+                lightColArr[idx * 4] = l.r * l.lightIntensity; lightColArr[idx * 4 + 1] = l.g * l.lightIntensity
+                lightColArr[idx * 4 + 2] = l.b * l.lightIntensity; lightColArr[idx * 4 + 3] = 1f
             }
 
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
@@ -2074,9 +1347,7 @@ class ZeroEngineView(
             spriteBatch.end()
         }
 
-        if (debugDrawEnabled) {
-            renderDebugOverlay(vpMatrix)
-        }
+        if (debugDrawEnabled) renderDebugOverlay(vpMatrix)
 
         val emptyUiArr = FloatArray(4)
         val uiNodes = nodes.filter { it.visible && it.layer == "UI" }.sortedBy { it.zIndex }
@@ -2084,10 +1355,7 @@ class ZeroEngineView(
             spriteBatch.begin(uiVpMatrix, false, 1f, 1f, 1f, 0, null, null) { frameDrawCalls++ }
             for (n in uiNodes) {
                 val clipRect = resolveUiClipRect(n)
-                if (clipRect != null) {
-                    spriteBatch.flush()
-                    applyUiScissor(clipRect)
-                }
+                if (clipRect != null) { spriteBatch.flush(); applyUiScissor(clipRect) }
                 when {
                     n.nodeType == "ParticleEmitter" -> submitParticlesToBatch(n, isWorld = false, fadeAlpha = 1f)
                     canBatchNode(n) -> submitNodeToBatch(n, isWorld = false)
@@ -2096,17 +1364,12 @@ class ZeroEngineView(
                         renderNodeSingle(n, uiVpMatrix, isWorld = false, enableInlineLight = false, 0, emptyUiArr, emptyUiArr)
                     }
                 }
-                if (clipRect != null) {
-                    spriteBatch.flush()
-                    GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
-                }
+                if (clipRect != null) { spriteBatch.flush(); GLES20.glDisable(GLES20.GL_SCISSOR_TEST) }
             }
             spriteBatch.end()
         }
 
-        if (debugDrawEnabled) {
-            renderTouchZonesDebugOverlay(uiVpMatrix)
-        }
+        if (debugDrawEnabled) renderTouchZonesDebugOverlay(uiVpMatrix)
 
         lastFrameDrawCalls = frameDrawCalls
         lastFrameCulled = frameCulled
@@ -2120,25 +1383,24 @@ class ZeroEngineView(
         val w = n.width * gt.gSx
         val h = n.height * gt.gSy
 
+        // P7：叠加当前动画帧的重心偏移（自动跟随 scaleX 镜像）
+        val af = n.animator.activeFrame
+        val renderX = gt.gx + (af?.offsetX ?: 0f) * gt.gSx
+        val renderY = gt.gy + (af?.offsetY ?: 0f) * abs(gt.gSy)
+
         if (isWorld) {
             val boundHalf = max(abs(w), abs(h)) * 0.75f + abs(gt.gz)
-            if (!isBoxInView(gt.gx - boundHalf, gt.gx + boundHalf, gt.gy - boundHalf, gt.gy + boundHalf)) {
+            if (!isBoxInView(renderX - boundHalf, renderX + boundHalf, renderY - boundHalf, renderY + boundHalf)) {
                 frameCulled++
                 return
             }
         }
 
-        // P6：优先检查纹理大图集（TextureAtlas）
         val atlasData = if (n.atlas.isNotEmpty()) loadAtlasData(n.atlas) else null
         val atlasFrame = atlasData?.frames?.get(n.atlasFrame)
 
-        val u0: Float
-        val u1: Float
-        val v0: Float
-        val v1: Float
-        val texId: Int
-        val subTexW: Float
-        val subTexH: Float
+        val u0: Float; val u1: Float; val v0: Float; val v1: Float
+        val texId: Int; val subTexW: Float; val subTexH: Float
 
         if (atlasData != null && atlasFrame != null && atlasFrame.w > 0f && atlasFrame.h > 0f) {
             texId = getImageTexture(atlasData.imageFile)
@@ -2159,8 +1421,7 @@ class ZeroEngineView(
             } else {
                 u0 = (fi % hf) * uScale; u1 = u0 + uScale
             }
-            v0 = (fi / hf) * vScale
-            v1 = v0 + vScale
+            v0 = (fi / hf) * vScale; v1 = v0 + vScale
             texId = when {
                 n.nodeType == "Label2D" -> getTextTexture(n.text, n.fontSize)
                 n.texture.isNotEmpty() -> getImageTexture(n.texture)
@@ -2172,21 +1433,18 @@ class ZeroEngineView(
         }
 
         val flashVal = if (n.flashTimer > 0f) (n.flashTimer * 8f).coerceIn(0f, 1f) else 0f
-
         val isNineSlice = n.nodeType == "Sprite2D" &&
             (n.sliceLeft > 0f || n.sliceRight > 0f || n.sliceTop > 0f || n.sliceBottom > 0f)
 
         if (!isNineSlice) {
             Matrix.setIdentityM(modelMatrix, 0)
-            Matrix.translateM(modelMatrix, 0, gt.gx, gt.gy, gt.gz)
+            Matrix.translateM(modelMatrix, 0, renderX, renderY, gt.gz)
             if (isWorld && camMode == "2.5D" && n.billboard) {
                 Matrix.rotateM(modelMatrix, 0, -90f + camPitch * 0.65f, 1f, 0f, 0f)
             } else if (isWorld && n.tiltX != 0f) {
                 Matrix.rotateM(modelMatrix, 0, n.tiltX, 1f, 0f, 0f)
             }
-            if (gt.gRot != 0f) {
-                Matrix.rotateM(modelMatrix, 0, gt.gRot, 0f, 0f, 1f)
-            }
+            if (gt.gRot != 0f) Matrix.rotateM(modelMatrix, 0, gt.gRot, 0f, 0f, 1f)
             Matrix.scaleM(modelMatrix, 0, w, h, 1f)
             spriteBatch.drawQuad(texId, modelMatrix, u0, v0, u1, v1, n.r, n.g, n.b, n.a, flashVal, additive = false)
             return
@@ -2197,40 +1455,25 @@ class ZeroEngineView(
         val signX = if (w < 0f) -1f else 1f
         val signY = if (h < 0f) -1f else 1f
 
-        val sl = max(0f, n.sliceLeft)
-        val sr = max(0f, n.sliceRight)
-        val st = max(0f, n.sliceTop)
-        val sb = max(0f, n.sliceBottom)
-
+        val sl = max(0f, n.sliceLeft); val sr = max(0f, n.sliceRight)
+        val st = max(0f, n.sliceTop); val sb = max(0f, n.sliceBottom)
         val scaleClampX = if (sl + sr > absW) absW / (sl + sr) else 1f
         val scaleClampY = if (st + sb > absH) absH / (st + sb) else 1f
-        val lPx = sl * scaleClampX
-        val rPx = sr * scaleClampX
-        val tPx = st * scaleClampY
-        val bPx = sb * scaleClampY
+        val xs = floatArrayOf(-absW * 0.5f, -absW * 0.5f + sl * scaleClampX, absW * 0.5f - sr * scaleClampX, absW * 0.5f)
+        val ys = floatArrayOf(-absH * 0.5f, -absH * 0.5f + st * scaleClampY, absH * 0.5f - sb * scaleClampY, absH * 0.5f)
 
-        val xs = floatArrayOf(-absW * 0.5f, -absW * 0.5f + lPx, absW * 0.5f - rPx, absW * 0.5f)
-        val ys = floatArrayOf(-absH * 0.5f, -absH * 0.5f + tPx, absH * 0.5f - bPx, absH * 0.5f)
-
-        val du = u1 - u0
-        val dv = v1 - v0
-        val uL = (sl / subTexW).coerceIn(0f, 0.49f) * du
-        val uR = (sr / subTexW).coerceIn(0f, 0.49f) * du
-        val vT = (st / subTexH).coerceIn(0f, 0.49f) * dv
-        val vB = (sb / subTexH).coerceIn(0f, 0.49f) * dv
-        val us = floatArrayOf(u0, u0 + uL, u1 - uR, u1)
-        val vs = floatArrayOf(v0, v0 + vT, v1 - vB, v1)
+        val du = u1 - u0; val dv = v1 - v0
+        val us = floatArrayOf(u0, u0 + (sl / subTexW).coerceIn(0f, 0.49f) * du, u1 - (sr / subTexW).coerceIn(0f, 0.49f) * du, u1)
+        val vs = floatArrayOf(v0, v0 + (st / subTexH).coerceIn(0f, 0.49f) * dv, v1 - (sb / subTexH).coerceIn(0f, 0.49f) * dv, v1)
 
         Matrix.setIdentityM(modelMatrix, 0)
-        Matrix.translateM(modelMatrix, 0, gt.gx, gt.gy, gt.gz)
+        Matrix.translateM(modelMatrix, 0, renderX, renderY, gt.gz)
         if (isWorld && camMode == "2.5D" && n.billboard) {
             Matrix.rotateM(modelMatrix, 0, -90f + camPitch * 0.65f, 1f, 0f, 0f)
         } else if (isWorld && n.tiltX != 0f) {
             Matrix.rotateM(modelMatrix, 0, n.tiltX, 1f, 0f, 0f)
         }
-        if (gt.gRot != 0f) {
-            Matrix.rotateM(modelMatrix, 0, gt.gRot, 0f, 0f, 1f)
-        }
+        if (gt.gRot != 0f) Matrix.rotateM(modelMatrix, 0, gt.gRot, 0f, 0f, 1f)
 
         for (row in 0..2) {
             val subH = ys[row + 1] - ys[row]
@@ -2240,15 +1483,10 @@ class ZeroEngineView(
                 val subW = xs[col + 1] - xs[col]
                 if (subW <= 0.01f) continue
                 val subCx = (xs[col] + xs[col + 1]) * 0.5f
-
                 System.arraycopy(modelMatrix, 0, subModelMatrix, 0, 16)
                 Matrix.translateM(subModelMatrix, 0, subCx * signX, subCy * signY, 0f)
                 Matrix.scaleM(subModelMatrix, 0, subW * signX, subH * signY, 1f)
-                spriteBatch.drawQuad(
-                    texId, subModelMatrix,
-                    us[col], vs[row], us[col + 1], vs[row + 1],
-                    n.r, n.g, n.b, n.a, flashVal, additive = false
-                )
+                spriteBatch.drawQuad(texId, subModelMatrix, us[col], vs[row], us[col + 1], vs[row + 1], n.r, n.g, n.b, n.a, flashVal, additive = false)
             }
         }
     }
@@ -2259,12 +1497,10 @@ class ZeroEngineView(
         val ch = caster.height * abs(cg.gSy)
         for (light in lights) {
             val lg = getGlobalTransform(light)
-            val dx = cg.gx - lg.gx
-            val dy = cg.gy - lg.gy
+            val dx = cg.gx - lg.gx; val dy = cg.gy - lg.gy
             val dist = hypot(dx, dy)
             if (dist < 1f || dist > light.lightRadius) continue
-            val nx = dx / dist
-            val ny = dy / dist
+            val nx = dx / dist; val ny = dy / dist
             val atten = (1f - dist / light.lightRadius).coerceIn(0f, 1f)
             val sLen = max(cw, ch) * 1.15f * atten
             val sx = cg.gx + nx * (sLen * 0.5f + cw * 0.35f)
@@ -2287,16 +1523,13 @@ class ZeroEngineView(
         for (p in n.particles) {
             if (!p.active) continue
             if (isWorld && !isBoxInView(p.x - p.size, p.x + p.size, p.y - p.size, p.y + p.size)) {
-                frameCulled++
-                continue
+                frameCulled++; continue
             }
             val ratio = (p.life / p.maxLife).coerceIn(0f, 1f)
             val curSize = p.size * (0.25f + 0.75f * ratio)
             Matrix.setIdentityM(modelMatrix, 0)
             Matrix.translateM(modelMatrix, 0, p.x, p.y, gt.gz + 4f)
-            if (isWorld && camMode == "2.5D") {
-                Matrix.rotateM(modelMatrix, 0, -90f + camPitch * 0.65f, 1f, 0f, 0f)
-            }
+            if (isWorld && camMode == "2.5D") Matrix.rotateM(modelMatrix, 0, -90f + camPitch * 0.65f, 1f, 0f, 0f)
             Matrix.scaleM(modelMatrix, 0, curSize, curSize, 1f)
             spriteBatch.drawQuad(texId, modelMatrix, 0f, 0f, 1f, 1f, n.r, n.g, n.b, p.alpha * ratio * fadeAlpha, 0f, additive = true)
         }
@@ -2307,7 +1540,6 @@ class ZeroEngineView(
         GLES20.glViewport(0, 0, lightW, lightH)
         GLES20.glClearColor(ambientR, ambientG, ambientB, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-
         if (lights.isEmpty()) return
 
         GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE)
@@ -2331,22 +1563,17 @@ class ZeroEngineView(
         for (l in lights) {
             val gt = getGlobalTransform(l)
             val rad = max(8f, l.lightRadius)
-            if (!isBoxInView(gt.gx - rad, gt.gx + rad, gt.gy - rad, gt.gy + rad)) {
-                frameCulled++
-                continue
-            }
+            if (!isBoxInView(gt.gx - rad, gt.gx + rad, gt.gy - rad, gt.gy + rad)) { frameCulled++; continue }
             Matrix.setIdentityM(modelMatrix, 0)
             Matrix.translateM(modelMatrix, 0, gt.gx, gt.gy, gt.gz)
             Matrix.scaleM(modelMatrix, 0, rad * 2f, rad * 2f, 1f)
             Matrix.multiplyMM(mvpMatrix, 0, vpMatrix, 0, modelMatrix, 0)
-
             GLES20.glUniformMatrix4fv(mvpLoc, 1, false, mvpMatrix, 0)
             GLES20.glUniformMatrix4fv(modelLoc, 1, false, modelMatrix, 0)
             GLES20.glUniform4f(colLoc, l.r * l.lightIntensity, l.g * l.lightIntensity, l.b * l.lightIntensity, 1f)
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
             frameDrawCalls++
         }
-
         GLES20.glDisableVertexAttribArray(posLoc)
         GLES20.glDisableVertexAttribArray(uvLoc)
         GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
@@ -2388,11 +1615,7 @@ class ZeroEngineView(
         GLES20.glEnable(GLES20.GL_BLEND)
     }
 
-    private fun drawDebugRect(
-        posLoc: Int, uvLoc: Int, colLoc: Int,
-        minX: Float, minY: Float, maxX: Float, maxY: Float, z: Float,
-        r: Float, g: Float, b: Float, a: Float
-    ) {
+    private fun drawDebugRect(posLoc: Int, uvLoc: Int, colLoc: Int, minX: Float, minY: Float, maxX: Float, maxY: Float, z: Float, r: Float, g: Float, b: Float, a: Float) {
         debugVertBuf.clear()
         debugVertBuf.put(minX); debugVertBuf.put(minY); debugVertBuf.put(z); debugVertBuf.put(0f); debugVertBuf.put(0f)
         debugVertBuf.put(maxX); debugVertBuf.put(minY); debugVertBuf.put(z); debugVertBuf.put(0f); debugVertBuf.put(0f)
@@ -2407,11 +1630,7 @@ class ZeroEngineView(
         frameDrawCalls++
     }
 
-    private fun drawDebugSlope(
-        posLoc: Int, uvLoc: Int, colLoc: Int,
-        minX: Float, minY: Float, maxX: Float, maxY: Float, z: Float,
-        leftUp: Boolean
-    ) {
+    private fun drawDebugSlope(posLoc: Int, uvLoc: Int, colLoc: Int, minX: Float, minY: Float, maxX: Float, maxY: Float, z: Float, leftUp: Boolean) {
         debugVertBuf.clear()
         if (leftUp) {
             debugVertBuf.put(maxX); debugVertBuf.put(minY); debugVertBuf.put(z); debugVertBuf.put(0f); debugVertBuf.put(0f)
@@ -2431,11 +1650,7 @@ class ZeroEngineView(
         frameDrawCalls++
     }
 
-    private fun drawDebugLine(
-        posLoc: Int, uvLoc: Int, colLoc: Int,
-        x1: Float, y1: Float, x2: Float, y2: Float, z: Float,
-        r: Float, g: Float, b: Float, a: Float
-    ) {
+    private fun drawDebugLine(posLoc: Int, uvLoc: Int, colLoc: Int, x1: Float, y1: Float, x2: Float, y2: Float, z: Float, r: Float, g: Float, b: Float, a: Float) {
         debugVertBuf.clear()
         debugVertBuf.put(x1); debugVertBuf.put(y1); debugVertBuf.put(z); debugVertBuf.put(0f); debugVertBuf.put(0f)
         debugVertBuf.put(x2); debugVertBuf.put(y2); debugVertBuf.put(z); debugVertBuf.put(0f); debugVertBuf.put(0f)
@@ -2470,27 +1685,35 @@ class ZeroEngineView(
 
         for (n in nodes) {
             if (!n.visible || n.layer != "World") continue
-            if (!n.collider && !n.isHitbox && !n.isHurtbox) continue
-
             val gt = getGlobalTransform(n)
+
+            // P7：绘制帧同步 Hitbox / Hurtbox 调试框
+            val activeBoxes = n.animator.activeFrame?.boxes
+            if (!activeBoxes.isNullOrEmpty()) {
+                for (box in activeBoxes) {
+                    val wb = getFrameBoxWorldBounds(n, box)
+                    if (box.type == "hitbox") {
+                        drawDebugRect(posLoc, uvLoc, colLoc, wb.cx - wb.hw, wb.cy - wb.hh, wb.cx + wb.hw, wb.cy + wb.hh, gt.gz + 9f, 1.0f, 0.15f, 0.15f, 0.95f)
+                    } else {
+                        drawDebugRect(posLoc, uvLoc, colLoc, wb.cx - wb.hw, wb.cy - wb.hh, wb.cx + wb.hw, wb.cy + wb.hh, gt.gz + 8f, 0.15f, 1.0f, 0.6f, 0.95f)
+                    }
+                }
+            }
+
+            if (!n.collider && !n.isHitbox && !n.isHurtbox) continue
             if (n.nodeType == "TileMap" && n.collider) {
                 val ts = max(8f, n.tileSize)
                 for (cell in n.tiles) {
-                    val x0 = gt.gx + cell.gx * ts
-                    val y0 = gt.gy + cell.gy * ts
-                    val x1 = x0 + ts
-                    val y1 = y0 + ts
-                    if (!isBoxInView(x0, x1, y0, y1)) continue
-                    drawDebugRect(posLoc, uvLoc, colLoc, x0, y0, x1, y1, gt.gz + 6f, 0.2f, 0.95f, 0.45f, 0.5f)
+                    val x0 = gt.gx + cell.gx * ts; val y0 = gt.gy + cell.gy * ts
+                    if (!isBoxInView(x0, x0 + ts, y0, y0 + ts)) continue
+                    drawDebugRect(posLoc, uvLoc, colLoc, x0, y0, x0 + ts, y0 + ts, gt.gz + 6f, 0.2f, 0.95f, 0.45f, 0.5f)
                 }
                 continue
             }
 
             val cb = getColliderBounds(n)
-            val minX = cb.cx - cb.hw
-            val maxX = cb.cx + cb.hw
-            val minY = cb.cy - cb.hh
-            val maxY = cb.cy + cb.hh
+            val minX = cb.cx - cb.hw; val maxX = cb.cx + cb.hw
+            val minY = cb.cy - cb.hh; val maxY = cb.cy + cb.hh
             if (!isBoxInView(minX, maxX, minY, maxY)) continue
 
             if (n.collider) {
@@ -2498,28 +1721,18 @@ class ZeroEngineView(
                     "left_up" -> drawDebugSlope(posLoc, uvLoc, colLoc, minX, minY, maxX, maxY, gt.gz + 6f, leftUp = true)
                     "right_up" -> drawDebugSlope(posLoc, uvLoc, colLoc, minX, minY, maxX, maxY, gt.gz + 6f, leftUp = false)
                     else -> {
-                        if (n.isTrigger) {
-                            drawDebugRect(posLoc, uvLoc, colLoc, minX, minY, maxX, maxY, gt.gz + 6f, 0.1f, 0.9f, 1.0f, 0.9f)
-                        } else {
-                            drawDebugRect(posLoc, uvLoc, colLoc, minX, minY, maxX, maxY, gt.gz + 6f, 0.2f, 1.0f, 0.35f, 0.9f)
-                        }
+                        if (n.isTrigger) drawDebugRect(posLoc, uvLoc, colLoc, minX, minY, maxX, maxY, gt.gz + 6f, 0.1f, 0.9f, 1.0f, 0.9f)
+                        else drawDebugRect(posLoc, uvLoc, colLoc, minX, minY, maxX, maxY, gt.gz + 6f, 0.2f, 1.0f, 0.35f, 0.9f)
                     }
                 }
             }
-            if (n.isHurtbox) {
-                drawDebugRect(posLoc, uvLoc, colLoc, minX + 3f, minY + 3f, maxX - 3f, maxY - 3f, gt.gz + 7f, 0.3f, 0.55f, 1.0f, 0.95f)
-            }
-            if (n.isHitbox) {
-                drawDebugRect(posLoc, uvLoc, colLoc, minX - 2f, minY - 2f, maxX + 2f, maxY + 2f, gt.gz + 8f, 1.0f, 0.2f, 0.2f, 0.95f)
-            }
+            if (n.isHurtbox) drawDebugRect(posLoc, uvLoc, colLoc, minX + 3f, minY + 3f, maxX - 3f, maxY - 3f, gt.gz + 7f, 0.3f, 0.55f, 1.0f, 0.95f)
+            if (n.isHitbox) drawDebugRect(posLoc, uvLoc, colLoc, minX - 2f, minY - 2f, maxX + 2f, maxY + 2f, gt.gz + 8f, 1.0f, 0.2f, 0.2f, 0.95f)
         }
 
         for (ray in debugRays) {
-            if (ray.hit) {
-                drawDebugLine(posLoc, uvLoc, colLoc, ray.x1, ray.y1, ray.x2, ray.y2, 10f, 1.0f, 0.25f, 0.85f, 0.95f)
-            } else {
-                drawDebugLine(posLoc, uvLoc, colLoc, ray.x1, ray.y1, ray.x2, ray.y2, 10f, 1.0f, 0.9f, 0.2f, 0.85f)
-            }
+            if (ray.hit) drawDebugLine(posLoc, uvLoc, colLoc, ray.x1, ray.y1, ray.x2, ray.y2, 10f, 1.0f, 0.25f, 0.85f, 0.95f)
+            else drawDebugLine(posLoc, uvLoc, colLoc, ray.x1, ray.y1, ray.x2, ray.y2, 10f, 1.0f, 0.9f, 0.2f, 0.85f)
         }
 
         GLES20.glDisableVertexAttribArray(posLoc)
@@ -2551,43 +1764,86 @@ class ZeroEngineView(
 
         for (z in zones) {
             val active = inputSystem.isActionPressed(z.action)
-            val hw = z.w * 0.5f
-            val hh = z.h * 0.5f
-            if (active) {
-                drawDebugRect(posLoc, uvLoc, colLoc, z.cx - hw, z.cy - hh, z.cx + hw, z.cy + hh, 20f, 1.0f, 0.85f, 0.1f, 0.95f)
-            } else {
-                drawDebugRect(posLoc, uvLoc, colLoc, z.cx - hw, z.cy - hh, z.cx + hw, z.cy + hh, 20f, 0.2f, 0.85f, 1.0f, 0.55f)
-            }
+            val hw = z.w * 0.5f; val hh = z.h * 0.5f
+            if (active) drawDebugRect(posLoc, uvLoc, colLoc, z.cx - hw, z.cy - hh, z.cx + hw, z.cy + hh, 20f, 1.0f, 0.85f, 0.1f, 0.95f)
+            else drawDebugRect(posLoc, uvLoc, colLoc, z.cx - hw, z.cy - hh, z.cx + hw, z.cy + hh, 20f, 0.2f, 0.85f, 1.0f, 0.55f)
         }
 
         GLES20.glDisableVertexAttribArray(posLoc)
         GLES20.glDisableVertexAttribArray(uvLoc)
     }
 
-    private fun processCombatOverlaps() {
-        val hitboxes = nodes.filter { it.visible && it.isHitbox && !pendingRemove.contains(it) }
-        if (hitboxes.isEmpty()) return
+    // ==================== P7 升级：节点 Hitbox + 帧同步 FrameBox 联合战斗判定 ====================
+    private fun overlapBounds(a: ColliderBounds, b: ColliderBounds): Boolean =
+        abs(a.cx - b.cx) < (a.hw + b.hw) && abs(a.cy - b.cy) < (a.hh + b.hh)
 
+    private fun triggerHurtCallback(attacker: GameNode, hurt: GameNode, dmg: Float, kbX: Float, kbY: Float) {
+        val scope = hurt.jsObj?.prototype ?: return
+        val fn = ScriptableObject.getProperty(scope, "onHurt") as? Function ?: return
+        try {
+            fn.call(rhino, scope, hurt.jsObj, arrayOf(attacker.jsObj, dmg.toDouble(), kbX.toDouble(), kbY.toDouble()))
+        } catch (e: Exception) {
+            onConsoleLog("[JS 运行错误 @ ${hurt.name}.onHurt] ${e.message}")
+        }
+    }
+
+    private fun processCombatOverlaps() {
+        // 1. 兼容旧版独立 Hitbox 节点
+        val hitboxes = nodes.filter { it.visible && it.isHitbox && !pendingRemove.contains(it) }
         for (hb in hitboxes) {
             val cb = getColliderBounds(hb)
             querySpatialCandidates(cb.cx - cb.hw, cb.cx + cb.hw, cb.cy - cb.hh, cb.cy + cb.hh, queryCandidates)
             for (hurt in queryCandidates) {
                 if (!hurt.visible || !hurt.isHurtbox || pendingRemove.contains(hurt)) continue
                 if (hb === hurt || hb.parent == hurt.name || hurt.parent == hb.name) continue
-                if (!canCollideLayer(hb, hurt)) continue
-                if (hurt.invulnTimer > 0f) continue
+                if (!canCollideLayer(hb, hurt) || hurt.invulnTimer > 0f) continue
                 if (hb.hitCooldownMap.containsKey(hurt.name)) continue
                 if (checkOverlap(hb, hurt)) {
                     hb.hitCooldownMap[hurt.name] = 0.25f
                     callLifecycle(hb, "onHit", hurt.jsObj)
-                    val scope = hurt.jsObj?.prototype
-                    val fn = if (scope != null) ScriptableObject.getProperty(scope, "onHurt") as? Function else null
-                    if (fn != null && scope != null) {
-                        try {
-                            fn.call(rhino, scope, hurt.jsObj, arrayOf(hb.jsObj, hb.damage.toDouble()))
-                        } catch (e: Exception) {
-                            onConsoleLog("[JS 运行错误 @ ${hurt.name}.onHurt] ${e.message}")
+                    triggerHurtCallback(hb, hurt, hb.damage, 0f, 0f)
+                }
+            }
+        }
+
+        // 2. P7 帧同步动画 FrameBox 判定（支持自动击退与顿帧）
+        for (attacker in nodes) {
+            if (!attacker.visible || pendingRemove.contains(attacker)) continue
+            val boxes = attacker.animator.activeFrame?.boxes ?: continue
+            if (boxes.isEmpty()) continue
+            val dirX = if (getGlobalTransform(attacker).gSx < 0f) -1f else 1f
+
+            for (box in boxes) {
+                if (box.type != "hitbox") continue
+                val hbBounds = getFrameBoxWorldBounds(attacker, box)
+                querySpatialCandidates(hbBounds.cx - hbBounds.hw, hbBounds.cx + hbBounds.hw, hbBounds.cy - hbBounds.hh, hbBounds.cy + hbBounds.hh, queryCandidates)
+                for (hurt in queryCandidates) {
+                    if (!hurt.visible || pendingRemove.contains(hurt)) continue
+                    if (attacker === hurt || attacker.parent == hurt.name || hurt.parent == attacker.name) continue
+                    if (!canCollideLayer(attacker, hurt) || hurt.invulnTimer > 0f) continue
+
+                    val cdKey = "${box.id}@${hurt.name}"
+                    if (attacker.hitCooldownMap.containsKey(cdKey)) continue
+
+                    val hurtBoxes = hurt.animator.activeFrame?.boxes?.filter { it.type == "hurtbox" }
+                    val isHit = if (!hurtBoxes.isNullOrEmpty()) {
+                        hurtBoxes.any { overlapBounds(hbBounds, getFrameBoxWorldBounds(hurt, it)) }
+                    } else if (hurt.isHurtbox) {
+                        overlapBounds(hbBounds, getColliderBounds(hurt))
+                    } else false
+
+                    if (isHit) {
+                        attacker.hitCooldownMap[cdKey] = 0.22f
+                        if (box.hitstop > 0f) hitstopTimer = max(hitstopTimer, box.hitstop.coerceIn(0f, 0.35f))
+                        val kbX = box.knockbackX * dirX
+                        val kbY = box.knockbackY
+                        if (hurt.bodyMode != "kinematic" && (kbX != 0f || kbY != 0f)) {
+                            hurt.vx = kbX
+                            hurt.vy = kbY
+                            hurt.isGrounded = false
                         }
+                        callLifecycle(attacker, "onHit", hurt.jsObj)
+                        triggerHurtCallback(attacker, hurt, box.damage, kbX, kbY)
                     }
                 }
             }
@@ -2595,48 +1851,29 @@ class ZeroEngineView(
     }
 
     private fun buildTileMapVbo(n: GameNode) {
-        if (n.tileVboId != 0) {
-            GLES20.glDeleteBuffers(1, intArrayOf(n.tileVboId), 0)
-            n.tileVboId = 0
-        }
+        if (n.tileVboId != 0) { GLES20.glDeleteBuffers(1, intArrayOf(n.tileVboId), 0); n.tileVboId = 0 }
         n.tileDirty = false
         n.tileLookup.clear()
-        if (n.tiles.isEmpty()) {
-            n.tileVertexCount = 0
-            return
-        }
+        if (n.tiles.isEmpty()) { n.tileVertexCount = 0; return }
 
         val ts = max(8f, n.tileSize)
-        val hf = max(1, n.hFrames)
-        val vf = max(1, n.vFrames)
-        val uScale = 1f / hf
-        val vScale = 1f / vf
-
-        val floatsPerTile = 6 * 5
-        val data = FloatArray(n.tiles.size * floatsPerTile)
+        val hf = max(1, n.hFrames); val vf = max(1, n.vFrames)
+        val uScale = 1f / hf; val vScale = 1f / vf
+        val data = FloatArray(n.tiles.size * 30)
         var offset = 0
-        var minX = Float.POSITIVE_INFINITY
-        var maxX = Float.NEGATIVE_INFINITY
-        var minY = Float.POSITIVE_INFINITY
-        var maxY = Float.NEGATIVE_INFINITY
+        var minX = Float.POSITIVE_INFINITY; var maxX = Float.NEGATIVE_INFINITY
+        var minY = Float.POSITIVE_INFINITY; var maxY = Float.NEGATIVE_INFINITY
 
         for (cell in n.tiles) {
             n.tileLookup[packGridKey(cell.gx, cell.gy)] = cell
-
-            val x0 = cell.gx * ts
-            val x1 = x0 + ts
-            val y0 = cell.gy * ts
-            val y1 = y0 + ts
-            if (x0 < minX) minX = x0
-            if (x1 > maxX) maxX = x1
-            if (y0 < minY) minY = y0
-            if (y1 > maxY) maxY = y1
+            val x0 = cell.gx * ts; val x1 = x0 + ts
+            val y0 = cell.gy * ts; val y1 = y0 + ts
+            if (x0 < minX) minX = x0; if (x1 > maxX) maxX = x1
+            if (y0 < minY) minY = y0; if (y1 > maxY) maxY = y1
 
             val fi = cell.frame.coerceIn(0, hf * vf - 1)
-            val u0 = (fi % hf) * uScale
-            val v0 = (fi / hf) * vScale
-            val u1 = u0 + uScale
-            val v1 = v0 + vScale
+            val u0 = (fi % hf) * uScale; val v0 = (fi / hf) * vScale
+            val u1 = u0 + uScale; val v1 = v0 + vScale
 
             data[offset++] = x0; data[offset++] = y0; data[offset++] = 0f; data[offset++] = u0; data[offset++] = v0
             data[offset++] = x1; data[offset++] = y0; data[offset++] = 0f; data[offset++] = u1; data[offset++] = v0
@@ -2646,18 +1883,11 @@ class ZeroEngineView(
             data[offset++] = x0; data[offset++] = y1; data[offset++] = 0f; data[offset++] = u0; data[offset++] = v1
         }
 
-        n.tileMinX = minX
-        n.tileMaxX = maxX
-        n.tileMinY = minY
-        n.tileMaxY = maxY
+        n.tileMinX = minX; n.tileMaxX = maxX; n.tileMinY = minY; n.tileMaxY = maxY
         n.tileVertexCount = n.tiles.size * 6
 
-        val buf = ByteBuffer.allocateDirect(data.size * 4)
-            .order(ByteOrder.nativeOrder())
-            .asFloatBuffer()
-        buf.put(data)
-        buf.position(0)
-
+        val buf = ByteBuffer.allocateDirect(data.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+        buf.put(data); buf.position(0)
         val ids = IntArray(1)
         GLES20.glGenBuffers(1, ids, 0)
         n.tileVboId = ids[0]
@@ -2666,30 +1896,18 @@ class ZeroEngineView(
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
     }
 
-    private fun renderTileMap(
-        n: GameNode,
-        activeVp: FloatArray,
-        isWorld: Boolean,
-        enableInlineLight: Boolean,
-        lightCount: Int,
-        lightPos: FloatArray,
-        lightCol: FloatArray
-    ) {
+    private fun renderTileMap(n: GameNode, activeVp: FloatArray, isWorld: Boolean, enableInlineLight: Boolean, lightCount: Int, lightPos: FloatArray, lightCol: FloatArray) {
         if (n.tiles.isEmpty()) return
-        if (n.tileDirty || n.tileVboId == 0) {
-            buildTileMapVbo(n)
-        }
+        if (n.tileDirty || n.tileVboId == 0) buildTileMapVbo(n)
         if (n.tileVboId == 0 || n.tileVertexCount == 0) return
 
         val gt = getGlobalTransform(n)
         if (isWorld && !isBoxInView(gt.gx + n.tileMinX, gt.gx + n.tileMaxX, gt.gy + n.tileMinY, gt.gy + n.tileMaxY)) {
-            frameCulled++
-            return
+            frameCulled++; return
         }
 
         val prog = getProgramForNode(n)
         GLES20.glUseProgram(prog)
-
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, n.tileVboId)
         val posLoc = GLES20.glGetAttribLocation(prog, "aPosition")
         val uvLoc = GLES20.glGetAttribLocation(prog, "aTexCoord")
@@ -2752,21 +1970,14 @@ class ZeroEngineView(
         val gt = getGlobalTransform(n)
         if (n.emitRate > 0f) {
             n.emitAccum += dt * n.emitRate
-            while (n.emitAccum >= 1f) {
-                n.emitAccum -= 1f
-                spawnSingleParticle(n, gt.gx, gt.gy)
-            }
+            while (n.emitAccum >= 1f) { n.emitAccum -= 1f; spawnSingleParticle(n, gt.gx, gt.gy) }
         }
         for (p in n.particles) {
             if (!p.active) continue
             p.life -= dt
-            if (p.life <= 0f) {
-                p.active = false
-                continue
-            }
+            if (p.life <= 0f) { p.active = false; continue }
             p.vy += n.particleGravity * dt
-            p.x += p.vx * dt
-            p.y += p.vy * dt
+            p.x += p.vx * dt; p.y += p.vy * dt
         }
     }
 
@@ -2782,51 +1993,34 @@ class ZeroEngineView(
                 "easeInOut" -> if (rawP < 0.5f) 2f * rawP * rawP else 1f - (-2f * rawP + 2f).pow(2) / 2f
                 else -> rawP
             }
-            val curVal = t.startVal + (t.targetVal - t.startVal) * easedP
-            applyTweenProperty(t.node, t.prop, curVal)
+            applyTweenProperty(t.node, t.prop, t.startVal + (t.targetVal - t.startVal) * easedP)
             if (rawP >= 1f) iter.remove()
         }
     }
 
     private fun applyTweenProperty(n: GameNode, prop: String, v: Float) {
         when (prop) {
-            "x" -> n.x = v
-            "y" -> n.y = v
-            "z" -> n.z = v
-            "scaleX" -> n.scaleX = v
-            "scaleY" -> n.scaleY = v
-            "rotation" -> n.rotation = v
-            "a" -> n.a = v.coerceIn(0f, 1f)
+            "x" -> n.x = v; "y" -> n.y = v; "z" -> n.z = v
+            "scaleX" -> n.scaleX = v; "scaleY" -> n.scaleY = v
+            "rotation" -> n.rotation = v; "a" -> n.a = v.coerceIn(0f, 1f)
             "lightIntensity" -> n.lightIntensity = v
         }
     }
 
-    private fun readTweenProperty(n: GameNode, prop: String): Float {
-        return when (prop) {
-            "x" -> n.x
-            "y" -> n.y
-            "z" -> n.z
-            "scaleX" -> n.scaleX
-            "scaleY" -> n.scaleY
-            "rotation" -> n.rotation
-            "a" -> n.a
-            "lightIntensity" -> n.lightIntensity
-            else -> 0f
-        }
+    private fun readTweenProperty(n: GameNode, prop: String): Float = when (prop) {
+        "x" -> n.x; "y" -> n.y; "z" -> n.z
+        "scaleX" -> n.scaleX; "scaleY" -> n.scaleY
+        "rotation" -> n.rotation; "a" -> n.a
+        "lightIntensity" -> n.lightIntensity
+        else -> 0f
     }
 
     private fun unprojectCornerZ0(ndcX: Float, ndcY: Float, outXY: FloatArray): Boolean {
-        val nearPt = floatArrayOf(ndcX, ndcY, -1f, 1f)
-        val farPt = floatArrayOf(ndcX, ndcY, 1f, 1f)
-        val nearW = FloatArray(4)
-        val farW = FloatArray(4)
-        Matrix.multiplyMV(nearW, 0, invVpMatrix, 0, nearPt, 0)
-        Matrix.multiplyMV(farW, 0, invVpMatrix, 0, farPt, 0)
+        val nearW = FloatArray(4); val farW = FloatArray(4)
+        Matrix.multiplyMV(nearW, 0, invVpMatrix, 0, floatArrayOf(ndcX, ndcY, -1f, 1f), 0)
+        Matrix.multiplyMV(farW, 0, invVpMatrix, 0, floatArrayOf(ndcX, ndcY, 1f, 1f), 0)
         if (abs(nearW[3]) < 1e-5f || abs(farW[3]) < 1e-5f) return false
-        for (i in 0..2) {
-            nearW[i] /= nearW[3]
-            farW[i] /= farW[3]
-        }
+        for (i in 0..2) { nearW[i] /= nearW[3]; farW[i] /= farW[3] }
         val dz = farW[2] - nearW[2]
         if (abs(dz) < 1e-5f) return false
         val t = -nearW[2] / dz
@@ -2839,28 +2033,16 @@ class ZeroEngineView(
         camTarget?.let { target ->
             val gt = getGlobalTransform(target)
             val lookX = if (target.scaleX < 0f) -camLookAheadX else camLookAheadX
-            val desiredX = gt.gx + lookX
-            val desiredY = gt.gy + camLookAheadY
-
-            val dx = desiredX - camX
-            val dy = desiredY - camY
-            if (abs(dx) > camDeadzoneX) {
-                val moveX = dx - sign(dx) * camDeadzoneX
-                camX += moveX * min(1f, camSmoothSpeed * dt)
-            }
-            if (abs(dy) > camDeadzoneY) {
-                val moveY = dy - sign(dy) * camDeadzoneY
-                camY += moveY * min(1f, camSmoothSpeed * dt)
-            }
+            val dx = (gt.gx + lookX) - camX
+            val dy = (gt.gy + camLookAheadY) - camY
+            if (abs(dx) > camDeadzoneX) camX += (dx - sign(dx) * camDeadzoneX) * min(1f, camSmoothSpeed * dt)
+            if (abs(dy) > camDeadzoneY) camY += (dy - sign(dy) * camDeadzoneY) * min(1f, camSmoothSpeed * dt)
         }
-
         if (camBoundsEnabled) {
             camX = camX.coerceIn(camMinX, max(camMinX, camMaxX))
             camY = camY.coerceIn(camMinY, max(camMinY, camMaxY))
         }
-
-        var sx = 0f
-        var sy = 0f
+        var sx = 0f; var sy = 0f
         if (shakeTimer > 0f) {
             shakeTimer -= dt
             sx = ((Math.random() - 0.5) * 2.0 * shakeIntensity).toFloat()
@@ -2873,56 +2055,35 @@ class ZeroEngineView(
             val rad = Math.toRadians(camPitch.toDouble())
             val eyeY = camY + sin(rad).toFloat() * camDistance + sy
             val eyeZ = cos(rad).toFloat() * camDistance
-            Matrix.setLookAtM(
-                viewMatrix, 0,
-                camX + sx, eyeY, eyeZ,
-                camX + sx, camY + sy, 0f,
-                0f, -1f, 0f
-            )
+            Matrix.setLookAtM(viewMatrix, 0, camX + sx, eyeY, eyeZ, camX + sx, camY + sy, 0f, 0f, -1f, 0f)
             Matrix.multiplyMM(vpMatrix, 0, projMatrix, 0, viewMatrix, 0)
             Matrix.invertM(invVpMatrix, 0, vpMatrix, 0)
 
-            var minX = Float.POSITIVE_INFINITY
-            var maxX = Float.NEGATIVE_INFINITY
-            var minY = Float.POSITIVE_INFINITY
-            var maxY = Float.NEGATIVE_INFINITY
+            var minX = Float.POSITIVE_INFINITY; var maxX = Float.NEGATIVE_INFINITY
+            var minY = Float.POSITIVE_INFINITY; var maxY = Float.NEGATIVE_INFINITY
             val pt = FloatArray(2)
-            val corners = arrayOf(-1f to -1f, 1f to -1f, -1f to 1f, 1f to 1f)
             var valid = 0
-            for ((cx, cy) in corners) {
+            for ((cx, cy) in arrayOf(-1f to -1f, 1f to -1f, -1f to 1f, 1f to 1f)) {
                 if (unprojectCornerZ0(cx, cy, pt)) {
-                    if (pt[0] < minX) minX = pt[0]
-                    if (pt[0] > maxX) maxX = pt[0]
-                    if (pt[1] < minY) minY = pt[1]
-                    if (pt[1] > maxY) maxY = pt[1]
+                    if (pt[0] < minX) minX = pt[0]; if (pt[0] > maxX) maxX = pt[0]
+                    if (pt[1] < minY) minY = pt[1]; if (pt[1] > maxY) maxY = pt[1]
                     valid++
                 }
             }
             if (valid == 4) {
-                viewMinX = minX - 400f
-                viewMaxX = maxX + 400f
-                viewMinY = minY - 400f
-                viewMaxY = maxY + 400f
+                viewMinX = minX - 400f; viewMaxX = maxX + 400f
+                viewMinY = minY - 400f; viewMaxY = maxY + 400f
             } else {
                 viewMinX = -999999f; viewMaxX = 999999f; viewMinY = -999999f; viewMaxY = 999999f
             }
         } else {
-            val halfH = 960f
-            val halfW = halfH * aspect
+            val halfH = 960f; val halfW = halfH * aspect
             Matrix.orthoM(projMatrix, 0, -halfW, halfW, halfH, -halfH, -2000f, 2000f)
-            Matrix.setLookAtM(
-                viewMatrix, 0,
-                camX + sx, camY + sy, 500f,
-                camX + sx, camY + sy, 0f,
-                0f, 1f, 0f
-            )
+            Matrix.setLookAtM(viewMatrix, 0, camX + sx, camY + sy, 500f, camX + sx, camY + sy, 0f, 0f, 1f, 0f)
             Matrix.multiplyMM(vpMatrix, 0, projMatrix, 0, viewMatrix, 0)
             Matrix.invertM(invVpMatrix, 0, vpMatrix, 0)
-
-            viewMinX = camX + sx - halfW - 250f
-            viewMaxX = camX + sx + halfW + 250f
-            viewMinY = camY + sy - halfH - 250f
-            viewMaxY = camY + sy + halfH + 250f
+            viewMinX = camX + sx - halfW - 250f; viewMaxX = camX + sx + halfW + 250f
+            viewMinY = camY + sy - halfH - 250f; viewMaxY = camY + sy + halfH + 250f
         }
     }
 
@@ -2930,45 +2091,28 @@ class ZeroEngineView(
         val ndcX = (touchScreenX / 1080f) * 2f - 1f
         val ndcY = 1f - (touchScreenY / 1920f) * 2f
         val pt = FloatArray(2)
-        if (unprojectCornerZ0(ndcX, ndcY, pt)) {
-            touchWorldX = pt[0]
-            touchWorldY = pt[1]
-        }
+        if (unprojectCornerZ0(ndcX, ndcY, pt)) { touchWorldX = pt[0]; touchWorldY = pt[1] }
     }
 
-    private fun renderNodeSingle(
-        n: GameNode,
-        activeVp: FloatArray,
-        isWorld: Boolean,
-        enableInlineLight: Boolean,
-        lightCount: Int,
-        lightPos: FloatArray,
-        lightCol: FloatArray
-    ) {
+    private fun renderNodeSingle(n: GameNode, activeVp: FloatArray, isWorld: Boolean, enableInlineLight: Boolean, lightCount: Int, lightPos: FloatArray, lightCol: FloatArray) {
         val gt = getGlobalTransform(n)
-        val w = n.width * gt.gSx
-        val h = n.height * gt.gSy
+        val w = n.width * gt.gSx; val h = n.height * gt.gSy
+        val af = n.animator.activeFrame
+        val renderX = gt.gx + (af?.offsetX ?: 0f) * gt.gSx
+        val renderY = gt.gy + (af?.offsetY ?: 0f) * abs(gt.gSy)
 
         if (isWorld) {
             val boundHalf = max(abs(w), abs(h)) * 0.75f + abs(gt.gz)
-            if (!isBoxInView(gt.gx - boundHalf, gt.gx + boundHalf, gt.gy - boundHalf, gt.gy + boundHalf)) {
-                frameCulled++
-                return
+            if (!isBoxInView(renderX - boundHalf, renderX + boundHalf, renderY - boundHalf, renderY + boundHalf)) {
+                frameCulled++; return
             }
         }
 
         Matrix.setIdentityM(modelMatrix, 0)
-        Matrix.translateM(modelMatrix, 0, gt.gx, gt.gy, gt.gz)
-
-        if (isWorld && camMode == "2.5D" && n.billboard) {
-            Matrix.rotateM(modelMatrix, 0, -90f + camPitch * 0.65f, 1f, 0f, 0f)
-        } else if (isWorld && n.tiltX != 0f) {
-            Matrix.rotateM(modelMatrix, 0, n.tiltX, 1f, 0f, 0f)
-        }
-
-        if (gt.gRot != 0f) {
-            Matrix.rotateM(modelMatrix, 0, gt.gRot, 0f, 0f, 1f)
-        }
+        Matrix.translateM(modelMatrix, 0, renderX, renderY, gt.gz)
+        if (isWorld && camMode == "2.5D" && n.billboard) Matrix.rotateM(modelMatrix, 0, -90f + camPitch * 0.65f, 1f, 0f, 0f)
+        else if (isWorld && n.tiltX != 0f) Matrix.rotateM(modelMatrix, 0, n.tiltX, 1f, 0f, 0f)
+        if (gt.gRot != 0f) Matrix.rotateM(modelMatrix, 0, gt.gRot, 0f, 0f, 1f)
         Matrix.scaleM(modelMatrix, 0, w, h, 1f)
         Matrix.multiplyMM(mvpMatrix, 0, activeVp, 0, modelMatrix, 0)
 
@@ -2976,9 +2120,7 @@ class ZeroEngineView(
         GLES20.glUseProgram(prog)
 
         val activeBuf = when (n.slopeType) {
-            "left_up" -> slopeLeftUpBuffer
-            "right_up" -> slopeRightUpBuffer
-            else -> quadBuffer
+            "left_up" -> slopeLeftUpBuffer; "right_up" -> slopeRightUpBuffer; else -> quadBuffer
         }
         val vertCount = if (n.slopeType == "left_up" || n.slopeType == "right_up") 3 else 4
         val drawMode = if (vertCount == 3) GLES20.GL_TRIANGLES else GLES20.GL_TRIANGLE_STRIP
@@ -3004,21 +2146,14 @@ class ZeroEngineView(
         val texId: Int
         if (atlasData != null && atlasFrame != null && atlasFrame.w > 0f && atlasFrame.h > 0f) {
             texId = getImageTexture(atlasData.imageFile)
-            GLES20.glUniform4f(
-                GLES20.glGetUniformLocation(prog, "uUvRect"),
-                atlasFrame.x / atlasData.atlasW,
-                atlasFrame.y / atlasData.atlasH,
-                atlasFrame.w / atlasData.atlasW,
-                atlasFrame.h / atlasData.atlasH
-            )
+            GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uUvRect"),
+                atlasFrame.x / atlasData.atlasW, atlasFrame.y / atlasData.atlasH,
+                atlasFrame.w / atlasData.atlasW, atlasFrame.h / atlasData.atlasH)
         } else {
-            val hf = max(1, n.hFrames)
-            val vf = max(1, n.vFrames)
+            val hf = max(1, n.hFrames); val vf = max(1, n.vFrames)
             val fi = n.currentFrame.coerceIn(0, hf * vf - 1)
-            val uScale = 1f / hf
-            val vScale = 1f / vf
-            val uOffset = (fi % hf) * uScale
-            val vOffset = (fi / hf) * vScale
+            val uScale = 1f / hf; val vScale = 1f / vf
+            val uOffset = (fi % hf) * uScale; val vOffset = (fi / hf) * vScale
             if (isWorld && camMode == "2.5D" && n.nodeType == "Label2D") {
                 GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uUvRect"), 1f, vOffset, -1f, vScale)
             } else {
@@ -3068,46 +2203,26 @@ class ZeroEngineView(
             n.animTimer -= frameDur
             n.currentFrame++
             val clip = n.clips[n.currentClipName]
-            val evName = clip?.events?.get(n.currentFrame)
-            if (!evName.isNullOrEmpty()) {
-                val scope = n.jsObj?.prototype
-                val fn = if (scope != null) ScriptableObject.getProperty(scope, "onFrameEvent") as? Function else null
-                if (fn != null && scope != null) {
-                    try {
-                        fn.call(rhino, scope, n.jsObj, arrayOf(n.currentClipName, evName))
-                    } catch (_: Exception) {}
-                }
-            }
+            clip?.events?.get(n.currentFrame)?.takeIf { it.isNotEmpty() }?.let { callFrameEvent(n, n.currentClipName, it) }
             if (n.currentFrame > n.animEnd) {
-                if (n.animLoop) {
-                    n.currentFrame = n.animStart
-                } else {
-                    n.currentFrame = n.animEnd
-                    n.animPlaying = false
-                    val finishedClip = n.currentClipName
-                    n.currentClipName = ""
-                    if (finishedClip.isNotEmpty()) {
-                        callLifecycle(n, "onAnimFinished", finishedClip)
-                    }
+                if (n.animLoop) n.currentFrame = n.animStart
+                else {
+                    n.currentFrame = n.animEnd; n.animPlaying = false
+                    val finishedClip = n.currentClipName; n.currentClipName = ""
+                    if (finishedClip.isNotEmpty()) callLifecycle(n, "onAnimFinished", finishedClip)
                 }
             }
         }
     }
 
-    // ==================== 空间加速射线检测 ====================
     private fun performRaycast(x1: Float, y1: Float, x2: Float, y2: Float, ignoreTag: String, mask: Int): Scriptable {
         var closestT = 1.0f
         var hitNode: GameNode? = null
-
-        val dx = x2 - x1
-        val dy = y2 - y1
-        val rMinX = min(x1, x2)
-        val rMaxX = max(x1, x2)
-        val rMinY = min(y1, y2)
-        val rMaxY = max(y1, y2)
+        val dx = x2 - x1; val dy = y2 - y1
+        val rMinX = min(x1, x2); val rMaxX = max(x1, x2)
+        val rMinY = min(y1, y2); val rMaxY = max(y1, y2)
 
         querySpatialCandidates(rMinX, rMaxX, rMinY, rMaxY, queryCandidates)
-
         for (other in queryCandidates) {
             if (!other.visible || !other.collider || other.isTrigger || other.layer != "World") continue
             if (ignoreTag.isNotEmpty() && other.tag == ignoreTag) continue
@@ -3116,42 +2231,29 @@ class ZeroEngineView(
             if (other.nodeType == "TileMap") {
                 val gb = getGlobalTransform(other)
                 val ts = max(8f, other.tileSize)
-                val gx0 = floor((rMinX - gb.gx) / ts).toInt()
-                val gx1 = floor((rMaxX - gb.gx) / ts).toInt()
-                val gy0 = floor((rMinY - gb.gy) / ts).toInt()
-                val gy1 = floor((rMaxY - gb.gy) / ts).toInt()
-                for (gx in gx0..gx1) {
-                    for (gy in gy0..gy1) {
+                for (gx in floor((rMinX - gb.gx) / ts).toInt()..floor((rMaxX - gb.gx) / ts).toInt()) {
+                    for (gy in floor((rMinY - gb.gy) / ts).toInt()..floor((rMaxY - gb.gy) / ts).toInt()) {
                         if (!other.tileLookup.containsKey(packGridKey(gx, gy))) continue
-                        val minX = gb.gx + gx * ts
-                        val minY = gb.gy + gy * ts
+                        val minX = gb.gx + gx * ts; val minY = gb.gy + gy * ts
                         val t = intersectSegmentAABB(x1, y1, dx, dy, minX, minY, minX + ts, minY + ts)
-                        if (t != null && t < closestT) {
-                            closestT = t
-                            hitNode = other
-                        }
+                        if (t != null && t < closestT) { closestT = t; hitNode = other }
                     }
                 }
             } else {
                 val cb = getColliderBounds(other)
                 val t = intersectSegmentAABB(x1, y1, dx, dy, cb.cx - cb.hw, cb.cy - cb.hh, cb.cx + cb.hw, cb.cy + cb.hh)
-                if (t != null && t < closestT) {
-                    closestT = t
-                    hitNode = other
-                }
+                if (t != null && t < closestT) { closestT = t; hitNode = other }
             }
         }
 
         val res = rhino.newObject(globalScope)
         if (hitNode != null) {
-            val hx = x1 + dx * closestT
-            val hy = y1 + dy * closestT
-            val dist = hypot(hx - x1, hy - y1)
+            val hx = x1 + dx * closestT; val hy = y1 + dy * closestT
             if (debugDrawEnabled) debugRays.add(DebugRay(x1, y1, hx, hy, hit = true))
             ScriptableObject.putProperty(res, "hit", true)
             ScriptableObject.putProperty(res, "x", hx.toDouble())
             ScriptableObject.putProperty(res, "y", hy.toDouble())
-            ScriptableObject.putProperty(res, "distance", dist.toDouble())
+            ScriptableObject.putProperty(res, "distance", hypot(hx - x1, hy - y1).toDouble())
             ScriptableObject.putProperty(res, "node", hitNode.jsObj)
         } else {
             if (debugDrawEnabled) debugRays.add(DebugRay(x1, y1, x2, y2, hit = false))
@@ -3164,179 +2266,101 @@ class ZeroEngineView(
         return res
     }
 
-    private fun intersectSegmentAABB(
-        x1: Float, y1: Float, dx: Float, dy: Float,
-        minX: Float, minY: Float, maxX: Float, maxY: Float
-    ): Float? {
-        var t0 = 0f
-        var t1 = 1f
+    private fun intersectSegmentAABB(x1: Float, y1: Float, dx: Float, dy: Float, minX: Float, minY: Float, maxX: Float, maxY: Float): Float? {
+        var t0 = 0f; var t1 = 1f
         val p = floatArrayOf(-dx, dx, -dy, dy)
         val q = floatArrayOf(x1 - minX, maxX - x1, y1 - minY, maxY - y1)
         for (i in 0..3) {
-            if (abs(p[i]) < 1e-6f) {
-                if (q[i] < 0f) return null
-            } else {
+            if (abs(p[i]) < 1e-6f) { if (q[i] < 0f) return null }
+            else {
                 val r = q[i] / p[i]
-                if (p[i] < 0f) {
-                    if (r > t1) return null
-                    if (r > t0) t0 = r
-                } else {
-                    if (r < t0) return null
-                    if (r < t1) t1 = r
-                }
+                if (p[i] < 0f) { if (r > t1) return null; if (r > t0) t0 = r }
+                else { if (r < t0) return null; if (r < t1) t1 = r }
             }
         }
         return if (t0 <= t1) t0 else null
     }
 
-    // ==================== 本地磁盘永久存档 ====================
-    private fun saveDiskSlot(slotName: String, dataObj: Any?): Boolean {
-        return try {
-            val safeName = slotName.replace(Regex("[^a-zA-Z0-9_\\-\\u4e00-\\u9fa5]"), "_")
-            val savesDir = File(projectDir, "saves").apply { mkdirs() }
-            val jsonStr = when (dataObj) {
-                is String -> dataObj
-                null -> "{}"
-                else -> RhinoContext.toString(NativeJSON.stringify(rhino, globalScope, dataObj, null, null))
-            }
-            File(savesDir, "$safeName.json").writeText(jsonStr)
-            true
-        } catch (e: Exception) {
-            onConsoleLog("[SAVE 磁盘存档失败] ${e.message}")
-            false
+    private fun saveDiskSlot(slotName: String, dataObj: Any?): Boolean = try {
+        val safeName = slotName.replace(Regex("[^a-zA-Z0-9_\\-\\u4e00-\\u9fa5]"), "_")
+        val savesDir = File(projectDir, "saves").apply { mkdirs() }
+        val jsonStr = when (dataObj) {
+            is String -> dataObj; null -> "{}"
+            else -> RhinoContext.toString(NativeJSON.stringify(rhino, globalScope, dataObj, null, null))
         }
-    }
+        File(savesDir, "$safeName.json").writeText(jsonStr)
+        true
+    } catch (_: Exception) { false }
 
-    private fun loadDiskSlot(slotName: String): Any? {
-        return try {
-            val safeName = slotName.replace(Regex("[^a-zA-Z0-9_\\-\\u4e00-\\u9fa5]"), "_")
-            val file = File(File(projectDir, "saves"), "$safeName.json")
-            if (!file.exists()) return null
-            parseJsonStringToJs(file.readText())
-        } catch (e: Exception) {
-            onConsoleLog("[LOAD 磁盘读档失败] ${e.message}")
-            null
-        }
-    }
+    private fun loadDiskSlot(slotName: String): Any? = try {
+        val safeName = slotName.replace(Regex("[^a-zA-Z0-9_\\-\\u4e00-\\u9fa5]"), "_")
+        val file = File(File(projectDir, "saves"), "$safeName.json")
+        if (file.exists()) parseJsonStringToJs(file.readText()) else null
+    } catch (_: Exception) { null }
 
-    private fun deleteDiskSlot(slotName: String): Boolean {
-        return try {
-            val safeName = slotName.replace(Regex("[^a-zA-Z0-9_\\-\\u4e00-\\u9fa5]"), "_")
-            val file = File(File(projectDir, "saves"), "$safeName.json")
-            if (file.exists()) file.delete() else false
-        } catch (_: Exception) {
-            false
-        }
-    }
+    private fun deleteDiskSlot(slotName: String): Boolean = try {
+        val safeName = slotName.replace(Regex("[^a-zA-Z0-9_\\-\\u4e00-\\u9fa5]"), "_")
+        val file = File(File(projectDir, "saves"), "$safeName.json")
+        file.exists() && file.delete()
+    } catch (_: Exception) { false }
 
-    // ==================== Rhino JS SDK 绑定（P0～P6） ====================
+    // ==================== Rhino JS SDK 绑定（P0～P7） ====================
     private fun initRhinoVM() {
         rhino = RhinoContext.enter()
         rhino.optimizationLevel = -1
         globalScope = rhino.initStandardObjects()
-        moduleCache.clear()
-        dataTableCache.clear()
-        atlasCache.clear()
+        moduleCache.clear(); dataTableCache.clear(); atlasCache.clear()
 
         ScriptableObject.putProperty(globalScope, "require", jsFunc { args ->
-            val path = RhinoContext.toString(args.getOrNull(0) ?: "")
-            requireScriptModule(path)
+            requireScriptModule(RhinoContext.toString(args.getOrNull(0) ?: ""))
         })
 
         val engineApi = rhino.newObject(globalScope)
         ScriptableObject.putProperty(engineApi, "log", jsFunc { args ->
-            val msg = args.joinToString(" ") { RhinoContext.toString(it) }
-            onConsoleLog("[LOG] $msg")
-            null
+            onConsoleLog("[LOG] ${args.joinToString(" ") { RhinoContext.toString(it) }}"); null
         })
-        ScriptableObject.putProperty(engineApi, "unloadUnusedTextures", jsFunc {
-            unloadUnusedTextures()
-        })
-        ScriptableObject.putProperty(engineApi, "clearModuleCache", jsFunc {
-            moduleCache.clear()
-            null
-        })
-
-        // P6：纹理大图集（TextureAtlas）API
+        ScriptableObject.putProperty(engineApi, "unloadUnusedTextures", jsFunc { unloadUnusedTextures() })
+        ScriptableObject.putProperty(engineApi, "clearModuleCache", jsFunc { moduleCache.clear(); null })
         ScriptableObject.putProperty(engineApi, "loadAtlas", jsFunc { args ->
-            val name = RhinoContext.toString(args.getOrNull(0) ?: "")
-            val data = loadAtlasData(name) ?: return@jsFunc null
+            val data = loadAtlasData(RhinoContext.toString(args.getOrNull(0) ?: "")) ?: return@jsFunc null
             val obj = rhino.newObject(globalScope)
             ScriptableObject.putProperty(obj, "image", data.imageFile)
             ScriptableObject.putProperty(obj, "width", data.atlasW.toDouble())
             ScriptableObject.putProperty(obj, "height", data.atlasH.toDouble())
-            val frameNames = data.frames.keys.sorted().toTypedArray()
-            ScriptableObject.putProperty(obj, "frames", rhino.newArray(globalScope, frameNames))
+            ScriptableObject.putProperty(obj, "frames", rhino.newArray(globalScope, data.frames.keys.sorted().toTypedArray()))
             obj
         })
-
-        // P5：大世界状态标志 API（WorldFlags）
         ScriptableObject.putProperty(engineApi, "setFlag", jsFunc { args ->
             val key = RhinoContext.toString(args.getOrNull(0) ?: "")
             if (key.isEmpty()) return@jsFunc null
             val rawVal = if (args.size >= 2) args[1] else true
-            val stored: Any = when (rawVal) {
-                is Boolean -> rawVal
-                is Number -> rawVal.toDouble()
-                null -> false
-                else -> RhinoContext.toString(rawVal)
+            worldFlags[key] = when (rawVal) {
+                is Boolean -> rawVal; is Number -> rawVal.toDouble(); null -> false; else -> RhinoContext.toString(rawVal)
             }
-            worldFlags[key] = stored
             null
         })
         ScriptableObject.putProperty(engineApi, "getFlag", jsFunc { args ->
-            val key = RhinoContext.toString(args.getOrNull(0) ?: "")
-            val def = if (args.size >= 2) args[1] else false
-            worldFlags[key] ?: def
+            worldFlags[RhinoContext.toString(args.getOrNull(0) ?: "")] ?: if (args.size >= 2) args[1] else false
         })
         ScriptableObject.putProperty(engineApi, "hasFlag", jsFunc { args ->
-            val key = RhinoContext.toString(args.getOrNull(0) ?: "")
-            val v = worldFlags[key] ?: return@jsFunc false
-            when (v) {
-                is Boolean -> v
-                is Number -> v.toDouble() != 0.0
-                is String -> v.isNotEmpty()
-                else -> true
+            when (val v = worldFlags[RhinoContext.toString(args.getOrNull(0) ?: "")]) {
+                null -> false; is Boolean -> v; is Number -> v.toDouble() != 0.0; is String -> v.isNotEmpty(); else -> true
             }
         })
-        ScriptableObject.putProperty(engineApi, "clearFlag", jsFunc { args ->
-            val key = RhinoContext.toString(args.getOrNull(0) ?: "")
-            worldFlags.remove(key)
-            null
-        })
-        ScriptableObject.putProperty(engineApi, "clearAllFlags", jsFunc {
-            worldFlags.clear()
-            null
-        })
+        ScriptableObject.putProperty(engineApi, "clearFlag", jsFunc { args -> worldFlags.remove(RhinoContext.toString(args.getOrNull(0) ?: "")); null })
+        ScriptableObject.putProperty(engineApi, "clearAllFlags", jsFunc { worldFlags.clear(); null })
         ScriptableObject.putProperty(engineApi, "getAllFlags", jsFunc {
             val obj = rhino.newObject(globalScope)
             for ((k, v) in worldFlags) ScriptableObject.putProperty(obj, k, v)
             obj
         })
-        ScriptableObject.putProperty(engineApi, "saveWorldFlags", jsFunc { args ->
-            val slot = RhinoContext.toString(args.getOrNull(0) ?: "world_flags")
-            saveWorldFlagsToDisk(slot)
-        })
-        ScriptableObject.putProperty(engineApi, "loadWorldFlags", jsFunc { args ->
-            val slot = RhinoContext.toString(args.getOrNull(0) ?: "world_flags")
-            loadWorldFlagsFromDisk(slot)
-        })
-
-        // P5：数据表与多语言 API（DataTable / i18n）
-        ScriptableObject.putProperty(engineApi, "loadTable", jsFunc { args ->
-            val name = RhinoContext.toString(args.getOrNull(0) ?: "")
-            loadDataTable(name)
-        })
-        ScriptableObject.putProperty(engineApi, "reloadTables", jsFunc {
-            dataTableCache.clear()
-            null
-        })
+        ScriptableObject.putProperty(engineApi, "saveWorldFlags", jsFunc { args -> saveWorldFlagsToDisk(RhinoContext.toString(args.getOrNull(0) ?: "world_flags")) })
+        ScriptableObject.putProperty(engineApi, "loadWorldFlags", jsFunc { args -> loadWorldFlagsFromDisk(RhinoContext.toString(args.getOrNull(0) ?: "world_flags")) })
+        ScriptableObject.putProperty(engineApi, "loadTable", jsFunc { args -> loadDataTable(RhinoContext.toString(args.getOrNull(0) ?: "")) })
+        ScriptableObject.putProperty(engineApi, "reloadTables", jsFunc { dataTableCache.clear(); null })
         ScriptableObject.putProperty(engineApi, "setLanguage", jsFunc { args ->
             val lang = RhinoContext.toString(args.getOrNull(0) ?: "zh").trim().lowercase()
-            if (lang.isNotEmpty()) {
-                currentLang = lang
-                loadI18nFromDiskIfNeeded(lang)
-            }
+            if (lang.isNotEmpty()) { currentLang = lang; loadI18nFromDiskIfNeeded(lang) }
             currentLang
         })
         ScriptableObject.putProperty(engineApi, "getLanguage", jsFunc { currentLang })
@@ -3347,22 +2371,14 @@ class ZeroEngineView(
             for (id in obj.ids) {
                 val k = id.toString()
                 val v = ScriptableObject.getProperty(obj, k)
-                if (v != null && v !== Scriptable.NOT_FOUND) {
-                    dict[k] = RhinoContext.toString(v)
-                }
+                if (v != null && v !== Scriptable.NOT_FOUND) dict[k] = RhinoContext.toString(v)
             }
             null
         })
         ScriptableObject.putProperty(engineApi, "t", jsFunc { args ->
-            val key = RhinoContext.toString(args.getOrNull(0) ?: "")
-            val fallback = if (args.size >= 2 && args[1] != null) RhinoContext.toString(args[1]) else ""
-            translateKey(key, fallback)
+            translateKey(RhinoContext.toString(args.getOrNull(0) ?: ""), if (args.size >= 2 && args[1] != null) RhinoContext.toString(args[1]) else "")
         })
-
-        ScriptableObject.putProperty(engineApi, "setDebugDraw", jsFunc { args ->
-            debugDrawEnabled = (args.getOrNull(0) as? Boolean) ?: false
-            null
-        })
+        ScriptableObject.putProperty(engineApi, "setDebugDraw", jsFunc { args -> debugDrawEnabled = (args.getOrNull(0) as? Boolean) ?: false; null })
         ScriptableObject.putProperty(engineApi, "isDebugDraw", jsFunc { debugDrawEnabled })
         ScriptableObject.putProperty(engineApi, "setPostFX", jsFunc { args ->
             val cfg = args.getOrNull(0) as? Scriptable ?: return@jsFunc null
@@ -3377,48 +2393,33 @@ class ZeroEngineView(
             val target = ((args.getOrNull(0) as? Number)?.toFloat() ?: 0f).coerceIn(0f, 1f)
             val dur = (args.getOrNull(1) as? Number)?.toFloat() ?: 0.3f
             pendingFadeScene = null
-            if (dur <= 0.01f) {
-                postFade = target; fadeTarget = target; fadeSpeed = 0f
-            } else {
-                fadeTarget = target; fadeSpeed = abs(target - postFade) / dur
-            }
+            if (dur <= 0.01f) { postFade = target; fadeTarget = target; fadeSpeed = 0f }
+            else { fadeTarget = target; fadeSpeed = abs(target - postFade) / dur }
             null
         })
         ScriptableObject.putProperty(engineApi, "fadeToScene", jsFunc { args ->
             val sName = RhinoContext.toString(args.getOrNull(0) ?: "")
             val dur = ((args.getOrNull(1) as? Number)?.toFloat() ?: 0.35f).coerceAtLeast(0.05f)
             if (sName.isNotEmpty()) {
-                preloadSceneAsync(sName)
-                pendingFadeScene = normalizeSceneName(sName)
-                fadeSceneDur = dur
-                fadeTarget = 1f
-                fadeSpeed = 1f / dur
+                preloadSceneAsync(sName); pendingFadeScene = normalizeSceneName(sName)
+                fadeSceneDur = dur; fadeTarget = 1f; fadeSpeed = 1f / dur
             }
             null
         })
         ScriptableObject.putProperty(engineApi, "preloadScene", jsFunc { args ->
             val sName = RhinoContext.toString(args.getOrNull(0) ?: "")
-            if (sName.isNotEmpty()) preloadSceneAsync(sName)
-            null
+            if (sName.isNotEmpty()) preloadSceneAsync(sName); null
         })
         ScriptableObject.putProperty(engineApi, "loadSceneAdditive", jsFunc { args ->
             val sName = RhinoContext.toString(args.getOrNull(0) ?: "")
-            val ox = (args.getOrNull(1) as? Number)?.toFloat() ?: 0f
-            val oy = (args.getOrNull(2) as? Number)?.toFloat() ?: 0f
-            if (sName.isNotEmpty()) {
-                pendingAdditiveLoads.add(AdditiveLoadReq(normalizeSceneName(sName), ox, oy))
-            }
+            if (sName.isNotEmpty()) pendingAdditiveLoads.add(AdditiveLoadReq(normalizeSceneName(sName), (args.getOrNull(1) as? Number)?.toFloat() ?: 0f, (args.getOrNull(2) as? Number)?.toFloat() ?: 0f))
             null
         })
         ScriptableObject.putProperty(engineApi, "unloadScene", jsFunc { args ->
             val sName = RhinoContext.toString(args.getOrNull(0) ?: "")
-            if (sName.isNotEmpty()) pendingUnloadScenes.add(normalizeSceneName(sName))
-            null
+            if (sName.isNotEmpty()) pendingUnloadScenes.add(normalizeSceneName(sName)); null
         })
-        ScriptableObject.putProperty(engineApi, "clearSceneCache", jsFunc {
-            preloadedSceneCache.clear()
-            null
-        })
+        ScriptableObject.putProperty(engineApi, "clearSceneCache", jsFunc { preloadedSceneCache.clear(); null })
         ScriptableObject.putProperty(engineApi, "getStats", jsFunc {
             val obj = rhino.newObject(globalScope)
             ScriptableObject.putProperty(obj, "fps", smoothedFps.toDouble())
@@ -3427,7 +2428,6 @@ class ZeroEngineView(
             ScriptableObject.putProperty(obj, "nodes", nodes.size)
             ScriptableObject.putProperty(obj, "lights", lastFrameLights)
             ScriptableObject.putProperty(obj, "spatialCells", spatialGrid.size)
-            ScriptableObject.putProperty(obj, "cachedScenes", preloadedSceneCache.size)
             ScriptableObject.putProperty(obj, "modules", moduleCache.size)
             ScriptableObject.putProperty(obj, "atlases", atlasCache.size)
             ScriptableObject.putProperty(obj, "flags", worldFlags.size)
@@ -3436,108 +2436,77 @@ class ZeroEngineView(
             ScriptableObject.putProperty(obj, "fbo", postFxEnabled && fboReady)
             ScriptableObject.putProperty(obj, "touches", inputSystem.getTouchCount())
             ScriptableObject.putProperty(obj, "textures", textureCache.size)
-            ScriptableObject.putProperty(obj, "textTextures", textTextureCache.size)
             obj
         })
         ScriptableObject.putProperty(engineApi, "loadScene", jsFunc { args ->
             val sName = RhinoContext.toString(args.getOrNull(0) ?: "")
-            if (sName.isNotEmpty()) pendingSceneLoad = normalizeSceneName(sName)
-            null
+            if (sName.isNotEmpty()) pendingSceneLoad = normalizeSceneName(sName); null
         })
         ScriptableObject.putProperty(engineApi, "setGlobal", jsFunc { args ->
             val k = RhinoContext.toString(args.getOrNull(0) ?: "")
-            if (k.isNotEmpty()) globalDataStore[k] = args.getOrNull(1)
-            null
+            if (k.isNotEmpty()) globalDataStore[k] = args.getOrNull(1); null
         })
         ScriptableObject.putProperty(engineApi, "getGlobal", jsFunc { args ->
-            val k = RhinoContext.toString(args.getOrNull(0) ?: "")
-            globalDataStore[k] ?: args.getOrNull(1)
+            globalDataStore[RhinoContext.toString(args.getOrNull(0) ?: "")] ?: args.getOrNull(1)
         })
-        ScriptableObject.putProperty(engineApi, "saveDisk", jsFunc { args ->
-            val slot = RhinoContext.toString(args.getOrNull(0) ?: "slot_1")
-            saveDiskSlot(slot, args.getOrNull(1))
-        })
-        ScriptableObject.putProperty(engineApi, "loadDisk", jsFunc { args ->
-            val slot = RhinoContext.toString(args.getOrNull(0) ?: "slot_1")
-            loadDiskSlot(slot)
-        })
-        ScriptableObject.putProperty(engineApi, "deleteDisk", jsFunc { args ->
-            val slot = RhinoContext.toString(args.getOrNull(0) ?: "slot_1")
-            deleteDiskSlot(slot)
-        })
+        ScriptableObject.putProperty(engineApi, "saveDisk", jsFunc { args -> saveDiskSlot(RhinoContext.toString(args.getOrNull(0) ?: "slot_1"), args.getOrNull(1)) })
+        ScriptableObject.putProperty(engineApi, "loadDisk", jsFunc { args -> loadDiskSlot(RhinoContext.toString(args.getOrNull(0) ?: "slot_1")) })
+        ScriptableObject.putProperty(engineApi, "deleteDisk", jsFunc { args -> deleteDiskSlot(RhinoContext.toString(args.getOrNull(0) ?: "slot_1")) })
         ScriptableObject.putProperty(engineApi, "raycast", jsFunc { args ->
-            val x1 = (args.getOrNull(0) as? Number)?.toFloat() ?: 0f
-            val y1 = (args.getOrNull(1) as? Number)?.toFloat() ?: 0f
-            val x2 = (args.getOrNull(2) as? Number)?.toFloat() ?: 0f
-            val y2 = (args.getOrNull(3) as? Number)?.toFloat() ?: 0f
-            val ignoreTag = args.getOrNull(4)?.takeIf { it !== Scriptable.NOT_FOUND }?.toString() ?: ""
-            val mask = (args.getOrNull(5) as? Number)?.toInt() ?: 0xFFFF
-            performRaycast(x1, y1, x2, y2, ignoreTag, mask)
+            performRaycast(
+                (args.getOrNull(0) as? Number)?.toFloat() ?: 0f,
+                (args.getOrNull(1) as? Number)?.toFloat() ?: 0f,
+                (args.getOrNull(2) as? Number)?.toFloat() ?: 0f,
+                (args.getOrNull(3) as? Number)?.toFloat() ?: 0f,
+                args.getOrNull(4)?.takeIf { it !== Scriptable.NOT_FOUND }?.toString() ?: "",
+                (args.getOrNull(5) as? Number)?.toInt() ?: 0xFFFF
+            )
         })
         ScriptableObject.putProperty(engineApi, "hitstop", jsFunc { args ->
-            val sec = (args.getOrNull(0) as? Number)?.toFloat() ?: 0.05f
-            hitstopTimer = max(hitstopTimer, sec.coerceIn(0f, 0.5f))
-            null
+            hitstopTimer = max(hitstopTimer, ((args.getOrNull(0) as? Number)?.toFloat() ?: 0.05f).coerceIn(0f, 0.5f)); null
         })
         ScriptableObject.putProperty(engineApi, "setTimeScale", jsFunc { args ->
-            timeScale = ((args.getOrNull(0) as? Number)?.toFloat() ?: 1f).coerceIn(0.05f, 4f)
-            null
+            timeScale = ((args.getOrNull(0) as? Number)?.toFloat() ?: 1f).coerceIn(0.05f, 4f); null
         })
-        ScriptableObject.putProperty(engineApi, "setCameraMode", jsFunc { args ->
-            camMode = RhinoContext.toString(args.getOrNull(0) ?: "2.5D")
-            null
-        })
+        ScriptableObject.putProperty(engineApi, "setCameraMode", jsFunc { args -> camMode = RhinoContext.toString(args.getOrNull(0) ?: "2.5D"); null })
         ScriptableObject.putProperty(engineApi, "setCameraTilt", jsFunc { args ->
             camPitch = (args.getOrNull(0) as? Number)?.toFloat() ?: camPitch
             camDistance = (args.getOrNull(1) as? Number)?.toFloat() ?: camDistance
-            camFov = (args.getOrNull(2) as? Number)?.toFloat() ?: camFov
-            null
+            camFov = (args.getOrNull(2) as? Number)?.toFloat() ?: camFov; null
         })
         ScriptableObject.putProperty(engineApi, "setCameraTarget", jsFunc { args ->
             val targetObj = args.getOrNull(0) as? Scriptable
-            camTarget = (targetObj as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === targetObj }
-            null
+            camTarget = (targetObj as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === targetObj }; null
         })
         ScriptableObject.putProperty(engineApi, "setCameraDeadzone", jsFunc { args ->
             camDeadzoneX = (args.getOrNull(0) as? Number)?.toFloat() ?: 0f
-            camDeadzoneY = (args.getOrNull(1) as? Number)?.toFloat() ?: 0f
-            null
+            camDeadzoneY = (args.getOrNull(1) as? Number)?.toFloat() ?: 0f; null
         })
         ScriptableObject.putProperty(engineApi, "setCameraLookAhead", jsFunc { args ->
             camLookAheadX = (args.getOrNull(0) as? Number)?.toFloat() ?: 0f
-            camLookAheadY = (args.getOrNull(1) as? Number)?.toFloat() ?: 0f
-            null
+            camLookAheadY = (args.getOrNull(1) as? Number)?.toFloat() ?: 0f; null
         })
         ScriptableObject.putProperty(engineApi, "setCameraBounds", jsFunc { args ->
             camBoundsEnabled = true
             camMinX = (args.getOrNull(0) as? Number)?.toFloat() ?: -99999f
             camMinY = (args.getOrNull(1) as? Number)?.toFloat() ?: -99999f
             camMaxX = (args.getOrNull(2) as? Number)?.toFloat() ?: 99999f
-            camMaxY = (args.getOrNull(3) as? Number)?.toFloat() ?: 99999f
-            null
+            camMaxY = (args.getOrNull(3) as? Number)?.toFloat() ?: 99999f; null
         })
-        ScriptableObject.putProperty(engineApi, "clearCameraBounds", jsFunc {
-            camBoundsEnabled = false
-            null
-        })
+        ScriptableObject.putProperty(engineApi, "clearCameraBounds", jsFunc { camBoundsEnabled = false; null })
         ScriptableObject.putProperty(engineApi, "getCamera", jsFunc {
             val obj = rhino.newObject(globalScope)
-            ScriptableObject.putProperty(obj, "x", camX.toDouble())
-            ScriptableObject.putProperty(obj, "y", camY.toDouble())
-            ScriptableObject.putProperty(obj, "pitch", camPitch.toDouble())
-            ScriptableObject.putProperty(obj, "mode", camMode)
-            obj
+            ScriptableObject.putProperty(obj, "x", camX.toDouble()); ScriptableObject.putProperty(obj, "y", camY.toDouble())
+            ScriptableObject.putProperty(obj, "pitch", camPitch.toDouble()); ScriptableObject.putProperty(obj, "mode", camMode); obj
         })
         ScriptableObject.putProperty(engineApi, "setAmbientLight", jsFunc { args ->
             ambientR = (args.getOrNull(0) as? Number)?.toFloat() ?: 0.52f
             ambientG = (args.getOrNull(1) as? Number)?.toFloat() ?: 0.56f
-            ambientB = (args.getOrNull(2) as? Number)?.toFloat() ?: 0.68f
-            null
+            ambientB = (args.getOrNull(2) as? Number)?.toFloat() ?: 0.68f; null
         })
         ScriptableObject.putProperty(engineApi, "shake", jsFunc { args ->
             shakeIntensity = (args.getOrNull(0) as? Number)?.toFloat() ?: 12f
-            shakeTimer = (args.getOrNull(1) as? Number)?.toFloat() ?: 0.15f
-            null
+            shakeTimer = (args.getOrNull(1) as? Number)?.toFloat() ?: 0.15f; null
         })
         ScriptableObject.putProperty(engineApi, "tween", jsFunc { args ->
             val targetObj = args.getOrNull(0) as? Scriptable ?: return@jsFunc null
@@ -3546,227 +2515,127 @@ class ZeroEngineView(
             val dur = (args.getOrNull(3) as? Number)?.toFloat() ?: 0.25f
             val ease = RhinoContext.toString(args.getOrNull(4) ?: "easeOut")
             val n = (targetObj as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === targetObj } ?: return@jsFunc null
-            val startVal = readTweenProperty(n, prop)
             activeTweens.removeAll { it.node === n && it.prop == prop }
-            activeTweens.add(TweenTask(n, prop, startVal, toVal, dur, ease))
-            null
+            activeTweens.add(TweenTask(n, prop, readTweenProperty(n, prop), toVal, dur, ease)); null
         })
-        ScriptableObject.putProperty(engineApi, "playTone", jsFunc { args ->
-            val hz = (args.getOrNull(0) as? Number)?.toInt() ?: 440
-            val ms = (args.getOrNull(1) as? Number)?.toInt() ?: 80
-            audioSystem.playToneAsync(hz, ms)
-            null
-        })
+        ScriptableObject.putProperty(engineApi, "playTone", jsFunc { args -> audioSystem.playToneAsync((args.getOrNull(0) as? Number)?.toInt() ?: 440, (args.getOrNull(1) as? Number)?.toInt() ?: 80); null })
         ScriptableObject.putProperty(engineApi, "playBGM", jsFunc { args ->
-            val fileName = RhinoContext.toString(args.getOrNull(0) ?: "")
-            val loop = (args.getOrNull(1) as? Boolean) ?: true
-            val vol = (args.getOrNull(2) as? Number)?.toFloat() ?: 0.8f
-            if (fileName.isNotEmpty()) audioSystem.playBGM(fileName, loop, vol)
-            null
+            val f = RhinoContext.toString(args.getOrNull(0) ?: "")
+            if (f.isNotEmpty()) audioSystem.playBGM(f, (args.getOrNull(1) as? Boolean) ?: true, (args.getOrNull(2) as? Number)?.toFloat() ?: 0.8f); null
         })
         ScriptableObject.putProperty(engineApi, "crossfadeBGM", jsFunc { args ->
-            val fileName = RhinoContext.toString(args.getOrNull(0) ?: "")
-            val dur = (args.getOrNull(1) as? Number)?.toFloat() ?: 1.2f
-            val loop = (args.getOrNull(2) as? Boolean) ?: true
-            val vol = (args.getOrNull(3) as? Number)?.toFloat() ?: 0.8f
-            if (fileName.isNotEmpty()) audioSystem.crossfadeBGM(fileName, dur, loop, vol)
-            null
+            val f = RhinoContext.toString(args.getOrNull(0) ?: "")
+            if (f.isNotEmpty()) audioSystem.crossfadeBGM(f, (args.getOrNull(1) as? Number)?.toFloat() ?: 1.2f, (args.getOrNull(2) as? Boolean) ?: true, (args.getOrNull(3) as? Number)?.toFloat() ?: 0.8f); null
         })
-        ScriptableObject.putProperty(engineApi, "stopBGM", jsFunc { args ->
-            val fadeOut = (args.getOrNull(0) as? Number)?.toFloat() ?: 0f
-            audioSystem.stopBGM(fadeOut)
-            null
-        })
+        ScriptableObject.putProperty(engineApi, "stopBGM", jsFunc { args -> audioSystem.stopBGM((args.getOrNull(0) as? Number)?.toFloat() ?: 0f); null })
         ScriptableObject.putProperty(engineApi, "playSFX", jsFunc { args ->
-            val fileName = RhinoContext.toString(args.getOrNull(0) ?: "")
-            val vol = (args.getOrNull(1) as? Number)?.toFloat() ?: 1.0f
-            val pitchMin = (args.getOrNull(2) as? Number)?.toFloat() ?: 1.0f
-            val pitchMax = (args.getOrNull(3) as? Number)?.toFloat() ?: pitchMin
-            if (fileName.isNotEmpty()) audioSystem.playSFX(fileName, vol, pitchMin, pitchMax)
-            null
+            val f = RhinoContext.toString(args.getOrNull(0) ?: "")
+            val pMin = (args.getOrNull(2) as? Number)?.toFloat() ?: 1.0f
+            if (f.isNotEmpty()) audioSystem.playSFX(f, (args.getOrNull(1) as? Number)?.toFloat() ?: 1.0f, pMin, (args.getOrNull(3) as? Number)?.toFloat() ?: pMin); null
         })
-        ScriptableObject.putProperty(engineApi, "setVolume", jsFunc { args ->
-            val bus = RhinoContext.toString(args.getOrNull(0) ?: "master")
-            val vol = (args.getOrNull(1) as? Number)?.toFloat() ?: 1.0f
-            audioSystem.setVolume(bus, vol)
-            null
-        })
-        ScriptableObject.putProperty(engineApi, "getVolume", jsFunc { args ->
-            val bus = RhinoContext.toString(args.getOrNull(0) ?: "master")
-            audioSystem.getVolume(bus).toDouble()
-        })
+        ScriptableObject.putProperty(engineApi, "setVolume", jsFunc { args -> audioSystem.setVolume(RhinoContext.toString(args.getOrNull(0) ?: "master"), (args.getOrNull(1) as? Number)?.toFloat() ?: 1.0f); null })
+        ScriptableObject.putProperty(engineApi, "getVolume", jsFunc { args -> audioSystem.getVolume(RhinoContext.toString(args.getOrNull(0) ?: "master")).toDouble() })
         ScriptableObject.putProperty(engineApi, "moveAndSlide", jsFunc { args ->
             val selfObj = args.getOrNull(0) as? Scriptable ?: return@jsFunc null
-            val dt = (args.getOrNull(1) as? Number)?.toFloat() ?: 0.016f
             val n = (selfObj as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === selfObj } ?: return@jsFunc null
-            moveAndSlideNode(n, dt)
-            null
+            moveAndSlideNode(n, (args.getOrNull(1) as? Number)?.toFloat() ?: 0.016f); null
         })
         ScriptableObject.putProperty(engineApi, "distance", jsFunc { args ->
-            val a = (args.getOrNull(0) as? GameNodeJsProxy)?.n
-                ?: nodes.find { it.jsObj === (args.getOrNull(0) as? Scriptable) }
-            val b = (args.getOrNull(1) as? GameNodeJsProxy)?.n
-                ?: nodes.find { it.jsObj === (args.getOrNull(1) as? Scriptable) }
-            if (a != null && b != null) {
-                val ga = getGlobalTransform(a)
-                val gb = getGlobalTransform(b)
-                hypot(ga.gx - gb.gx, ga.gy - gb.gy).toDouble()
-            } else 999999.0
+            val a = (args.getOrNull(0) as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === (args.getOrNull(0) as? Scriptable) }
+            val b = (args.getOrNull(1) as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === (args.getOrNull(1) as? Scriptable) }
+            if (a != null && b != null) { val ga = getGlobalTransform(a); val gb = getGlobalTransform(b); hypot(ga.gx - gb.gx, ga.gy - gb.gy).toDouble() } else 999999.0
         })
         ScriptableObject.putProperty(engineApi, "angleTo", jsFunc { args ->
-            val a = (args.getOrNull(0) as? GameNodeJsProxy)?.n
-                ?: nodes.find { it.jsObj === (args.getOrNull(0) as? Scriptable) }
-            val b = (args.getOrNull(1) as? GameNodeJsProxy)?.n
-                ?: nodes.find { it.jsObj === (args.getOrNull(1) as? Scriptable) }
-            if (a != null && b != null) {
-                val ga = getGlobalTransform(a)
-                val gb = getGlobalTransform(b)
-                Math.toDegrees(atan2((gb.gy - ga.gy).toDouble(), (gb.gx - ga.gx).toDouble()))
-            } else 0.0
+            val a = (args.getOrNull(0) as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === (args.getOrNull(0) as? Scriptable) }
+            val b = (args.getOrNull(1) as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === (args.getOrNull(1) as? Scriptable) }
+            if (a != null && b != null) { val ga = getGlobalTransform(a); val gb = getGlobalTransform(b); Math.toDegrees(atan2((gb.gy - ga.gy).toDouble(), (gb.gx - ga.gx).toDouble())) } else 0.0
         })
         ScriptableObject.putProperty(engineApi, "spawn", jsFunc { args ->
             val cfg = args.getOrNull(0) as? Scriptable ?: return@jsFunc null
-            val parentName = RhinoContext.toString(args.getOrNull(1) ?: "")
             val rawLayer = getJsStr(cfg, "layer", "World")
-            val rawScript = getJsStr(cfg, "script", "")
-            val scriptFile = getJsStr(cfg, "scriptFile", "")
             val spawned = GameNode(
                 name = getJsStr(cfg, "name", "Spawn_${System.nanoTime() % 10000}"),
                 nodeType = getJsStr(cfg, "nodeType", "Sprite2D"),
                 layer = if (rawLayer.startsWith("UI", ignoreCase = true)) "UI" else "World",
-                parent = parentName,
+                parent = RhinoContext.toString(args.getOrNull(1) ?: ""),
                 tag = getJsStr(cfg, "tag", "default"),
                 persistent = getJsBool(cfg, "persistent", false),
-                x = getJsFloat(cfg, "x", 0f),
-                y = getJsFloat(cfg, "y", 0f),
-                z = getJsFloat(cfg, "z", 0f),
-                width = getJsFloat(cfg, "width", 64f),
-                height = getJsFloat(cfg, "height", 64f),
-                tiltX = getJsFloat(cfg, "tiltX", 0f),
-                billboard = getJsBool(cfg, "billboard", false),
-                zIndex = getJsInt(cfg, "zIndex", 0),
-                texture = getJsStr(cfg, "texture", ""),
-                atlas = getJsStr(cfg, "atlas", ""),
-                atlasFrame = getJsStr(cfg, "atlasFrame", ""),
-                text = getJsStr(cfg, "text", ""),
-                fontSize = getJsFloat(cfg, "fontSize", 44f),
-                r = getJsFloat(cfg, "r", 1f),
-                g = getJsFloat(cfg, "g", 1f),
-                b = getJsFloat(cfg, "b", 1f),
-                a = getJsFloat(cfg, "a", 1f),
-                sliceLeft = getJsFloat(cfg, "sliceLeft", 0f),
-                sliceRight = getJsFloat(cfg, "sliceRight", 0f),
-                sliceTop = getJsFloat(cfg, "sliceTop", 0f),
-                sliceBottom = getJsFloat(cfg, "sliceBottom", 0f),
+                x = getJsFloat(cfg, "x", 0f), y = getJsFloat(cfg, "y", 0f), z = getJsFloat(cfg, "z", 0f),
+                width = getJsFloat(cfg, "width", 64f), height = getJsFloat(cfg, "height", 64f),
+                tiltX = getJsFloat(cfg, "tiltX", 0f), billboard = getJsBool(cfg, "billboard", false),
+                zIndex = getJsInt(cfg, "zIndex", 0), texture = getJsStr(cfg, "texture", ""),
+                atlas = getJsStr(cfg, "atlas", ""), atlasFrame = getJsStr(cfg, "atlasFrame", ""),
+                text = getJsStr(cfg, "text", ""), fontSize = getJsFloat(cfg, "fontSize", 44f),
+                r = getJsFloat(cfg, "r", 1f), g = getJsFloat(cfg, "g", 1f), b = getJsFloat(cfg, "b", 1f), a = getJsFloat(cfg, "a", 1f),
+                sliceLeft = getJsFloat(cfg, "sliceLeft", 0f), sliceRight = getJsFloat(cfg, "sliceRight", 0f),
+                sliceTop = getJsFloat(cfg, "sliceTop", 0f), sliceBottom = getJsFloat(cfg, "sliceBottom", 0f),
                 clipChildren = getJsBool(cfg, "clipChildren", false),
-                clipX = getJsFloat(cfg, "clipX", 0f),
-                clipY = getJsFloat(cfg, "clipY", 0f),
-                clipW = getJsFloat(cfg, "clipW", 0f),
-                clipH = getJsFloat(cfg, "clipH", 0f),
-                collider = getJsBool(cfg, "collider", false),
-                isTrigger = getJsBool(cfg, "isTrigger", false),
-                oneWay = getJsBool(cfg, "oneWay", false),
-                slopeType = getJsStr(cfg, "slopeType", "none"),
-                colOffsetX = getJsFloat(cfg, "colOffsetX", 0f),
-                colOffsetY = getJsFloat(cfg, "colOffsetY", 0f),
-                colWidth = getJsFloat(cfg, "colWidth", 0f),
-                colHeight = getJsFloat(cfg, "colHeight", 0f),
-                colLayer = getJsInt(cfg, "colLayer", 1),
-                colMask = getJsInt(cfg, "colMask", 0xFFFF),
+                clipX = getJsFloat(cfg, "clipX", 0f), clipY = getJsFloat(cfg, "clipY", 0f),
+                clipW = getJsFloat(cfg, "clipW", 0f), clipH = getJsFloat(cfg, "clipH", 0f),
+                collider = getJsBool(cfg, "collider", false), isTrigger = getJsBool(cfg, "isTrigger", false),
+                oneWay = getJsBool(cfg, "oneWay", false), slopeType = getJsStr(cfg, "slopeType", "none"),
+                colOffsetX = getJsFloat(cfg, "colOffsetX", 0f), colOffsetY = getJsFloat(cfg, "colOffsetY", 0f),
+                colWidth = getJsFloat(cfg, "colWidth", 0f), colHeight = getJsFloat(cfg, "colHeight", 0f),
+                colLayer = getJsInt(cfg, "colLayer", 1), colMask = getJsInt(cfg, "colMask", 0xFFFF),
                 bodyMode = getJsStr(cfg, "bodyMode", "kinematic"),
-                isHitbox = getJsBool(cfg, "isHitbox", false),
-                isHurtbox = getJsBool(cfg, "isHurtbox", false),
-                damage = getJsFloat(cfg, "damage", 10f),
-                shadowCaster = getJsBool(cfg, "shadowCaster", false),
-                lightRadius = getJsFloat(cfg, "lightRadius", 400f),
-                lightIntensity = getJsFloat(cfg, "lightIntensity", 1.5f),
-                script = resolveNodeScriptText(rawScript, scriptFile)
+                isHitbox = getJsBool(cfg, "isHitbox", false), isHurtbox = getJsBool(cfg, "isHurtbox", false),
+                damage = getJsFloat(cfg, "damage", 10f), shadowCaster = getJsBool(cfg, "shadowCaster", false),
+                lightRadius = getJsFloat(cfg, "lightRadius", 400f), lightIntensity = getJsFloat(cfg, "lightIntensity", 1.5f),
+                script = resolveNodeScriptText(getJsStr(cfg, "script", ""), getJsStr(cfg, "scriptFile", ""))
             )
-            pendingAdd.add(spawned)
-            bindNodeScript(spawned)
-            spawned.jsObj
+            pendingAdd.add(spawned); bindNodeScript(spawned); spawned.jsObj
         })
         ScriptableObject.putProperty(engineApi, "instantiate", jsFunc { args ->
             val sceneFile = RhinoContext.toString(args.getOrNull(0) ?: "")
+            val txt = readSceneText(sceneFile) ?: return@jsFunc null
+            val loaded = mutableListOf<GameNode>()
+            parseSceneJson(txt, loaded, groupName = normalizeSceneName(sceneFile), applyCamera = false)
             val sx = (args.getOrNull(1) as? Number)?.toFloat() ?: 0f
             val sy = (args.getOrNull(2) as? Number)?.toFloat() ?: 0f
             val sz = (args.getOrNull(3) as? Number)?.toFloat() ?: 0f
-            val txt = readSceneText(sceneFile)
-            if (txt != null) {
-                val loaded = mutableListOf<GameNode>()
-                parseSceneJson(txt, loaded, groupName = normalizeSceneName(sceneFile), applyCamera = false)
-                loaded.forEach {
-                    if (it.parent.isEmpty()) { it.x += sx; it.y += sy; it.z += sz }
-                    pendingAdd.add(it)
-                    bindNodeScript(it)
-                }
-                loaded.firstOrNull()?.jsObj
-            } else null
+            loaded.forEach {
+                if (it.parent.isEmpty()) { it.x += sx; it.y += sy; it.z += sz }
+                pendingAdd.add(it); bindNodeScript(it)
+            }
+            loaded.firstOrNull()?.jsObj
         })
         ScriptableObject.putProperty(engineApi, "destroy", jsFunc { args ->
             val targetObj = args.getOrNull(0) as? Scriptable
-            val target = (targetObj as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === targetObj }
-            target?.let { pendingRemove.add(it) }
-            null
+            ((targetObj as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === targetObj })?.let { pendingRemove.add(it) }; null
         })
-        ScriptableObject.putProperty(engineApi, "findNode", jsFunc { args ->
-            val name = RhinoContext.toString(args.getOrNull(0) ?: "")
-            nodes.find { it.name == name }?.jsObj
-        })
+        ScriptableObject.putProperty(engineApi, "findNode", jsFunc { args -> nodes.find { it.name == RhinoContext.toString(args.getOrNull(0) ?: "") }?.jsObj })
         ScriptableObject.putProperty(engineApi, "findNodesByTag", jsFunc { args ->
             val t = RhinoContext.toString(args.getOrNull(0) ?: "")
-            val matched = nodes.filter { it.tag == t && !pendingRemove.contains(it) }.mapNotNull { it.jsObj }.toTypedArray()
-            rhino.newArray(globalScope, matched)
+            rhino.newArray(globalScope, nodes.filter { it.tag == t && !pendingRemove.contains(it) }.mapNotNull { it.jsObj }.toTypedArray())
         })
         ScriptableObject.putProperty(engineApi, "on", jsFunc { args ->
             val ev = RhinoContext.toString(args.getOrNull(0) ?: "")
             val fn = args.getOrNull(1) as? Function
-            if (ev.isNotEmpty() && fn != null) {
-                eventListeners.getOrPut(ev) { mutableListOf() }.add(fn)
-            }
-            null
+            if (ev.isNotEmpty() && fn != null) eventListeners.getOrPut(ev) { mutableListOf() }.add(fn); null
         })
         ScriptableObject.putProperty(engineApi, "emit", jsFunc { args ->
-            val ev = RhinoContext.toString(args.getOrNull(0) ?: "")
-            val payload = args.getOrNull(1)
-            eventListeners[ev]?.toList()?.forEach { fn ->
-                try { fn.call(rhino, globalScope, globalScope, arrayOf(payload)) } catch (_: Exception) {}
-            }
-            null
+            eventListeners[RhinoContext.toString(args.getOrNull(0) ?: "")]?.toList()?.forEach { fn ->
+                try { fn.call(rhino, globalScope, globalScope, arrayOf(args.getOrNull(1))) } catch (_: Exception) {}
+            }; null
         })
         ScriptableObject.putProperty(globalScope, "Engine", engineApi)
 
         val inputApi = object : ScriptableObject() {
             override fun getClassName() = "Input"
-            override fun get(name: String?, start: Scriptable?): Any? {
-                return when (name) {
-                    "isTouching" -> isTouching || inputSystem.getTouchCount() > 0
-                    "touchCount" -> inputSystem.getTouchCount()
-                    "screenX", "touchX" -> touchScreenX.toDouble()
-                    "screenY", "touchY" -> touchScreenY.toDouble()
-                    "worldX" -> touchWorldX.toDouble()
-                    "worldY" -> touchWorldY.toDouble()
-                    else -> super.get(name, start)
-                }
+            override fun get(name: String?, start: Scriptable?): Any? = when (name) {
+                "isTouching" -> isTouching || inputSystem.getTouchCount() > 0
+                "touchCount" -> inputSystem.getTouchCount()
+                "screenX", "touchX" -> touchScreenX.toDouble()
+                "screenY", "touchY" -> touchScreenY.toDouble()
+                "worldX" -> touchWorldX.toDouble()
+                "worldY" -> touchWorldY.toDouble()
+                else -> super.get(name, start)
             }
         }
-        ScriptableObject.putProperty(inputApi, "isActionPressed", jsFunc { args ->
-            val act = RhinoContext.toString(args.getOrNull(0) ?: "")
-            inputSystem.isActionPressed(act)
-        })
-        ScriptableObject.putProperty(inputApi, "isActionJustPressed", jsFunc { args ->
-            val act = RhinoContext.toString(args.getOrNull(0) ?: "")
-            inputSystem.isActionJustPressed(act)
-        })
-        ScriptableObject.putProperty(inputApi, "isActionJustReleased", jsFunc { args ->
-            val act = RhinoContext.toString(args.getOrNull(0) ?: "")
-            inputSystem.isActionJustReleased(act)
-        })
-        ScriptableObject.putProperty(inputApi, "getAxis", jsFunc { args ->
-            val neg = RhinoContext.toString(args.getOrNull(0) ?: "move_left")
-            val pos = RhinoContext.toString(args.getOrNull(1) ?: "move_right")
-            inputSystem.getAxis(neg, pos).toDouble()
-        })
+        ScriptableObject.putProperty(inputApi, "isActionPressed", jsFunc { args -> inputSystem.isActionPressed(RhinoContext.toString(args.getOrNull(0) ?: "")) })
+        ScriptableObject.putProperty(inputApi, "isActionJustPressed", jsFunc { args -> inputSystem.isActionJustPressed(RhinoContext.toString(args.getOrNull(0) ?: "")) })
+        ScriptableObject.putProperty(inputApi, "isActionJustReleased", jsFunc { args -> inputSystem.isActionJustReleased(RhinoContext.toString(args.getOrNull(0) ?: "")) })
+        ScriptableObject.putProperty(inputApi, "getAxis", jsFunc { args -> inputSystem.getAxis(RhinoContext.toString(args.getOrNull(0) ?: "move_left"), RhinoContext.toString(args.getOrNull(1) ?: "move_right")).toDouble() })
         ScriptableObject.putProperty(inputApi, "bindAction", jsFunc { args ->
             val act = RhinoContext.toString(args.getOrNull(0) ?: "")
             val rawKeys = args.getOrNull(1)
@@ -3777,195 +2646,169 @@ class ZeroEngineView(
                     val v = ScriptableObject.getProperty(rawKeys, i)
                     if (v != null && v !== Scriptable.NOT_FOUND) list.add(RhinoContext.toString(v))
                 }
-            } else if (rawKeys != null) {
-                list.add(RhinoContext.toString(rawKeys))
-            }
-            if (act.isNotEmpty() && list.isNotEmpty()) inputSystem.bindAction(act, list)
-            null
+            } else if (rawKeys != null) list.add(RhinoContext.toString(rawKeys))
+            if (act.isNotEmpty() && list.isNotEmpty()) inputSystem.bindAction(act, list); null
         })
         ScriptableObject.putProperty(inputApi, "setVirtualAction", jsFunc { args ->
             val act = RhinoContext.toString(args.getOrNull(0) ?: "")
-            val down = (args.getOrNull(1) as? Boolean) ?: false
-            if (act.isNotEmpty()) inputSystem.setVirtualAction(act, down)
-            null
+            if (act.isNotEmpty()) inputSystem.setVirtualAction(act, (args.getOrNull(1) as? Boolean) ?: false); null
         })
         ScriptableObject.putProperty(inputApi, "bindTouchZone", jsFunc { args ->
             val act = RhinoContext.toString(args.getOrNull(0) ?: "")
-            val cx = (args.getOrNull(1) as? Number)?.toFloat() ?: 0f
-            val cy = (args.getOrNull(2) as? Number)?.toFloat() ?: 0f
-            val w = (args.getOrNull(3) as? Number)?.toFloat() ?: 160f
-            val h = (args.getOrNull(4) as? Number)?.toFloat() ?: 160f
-            if (act.isNotEmpty()) inputSystem.bindTouchZone(act, cx, cy, w, h)
-            null
+            if (act.isNotEmpty()) inputSystem.bindTouchZone(act, (args.getOrNull(1) as? Number)?.toFloat() ?: 0f, (args.getOrNull(2) as? Number)?.toFloat() ?: 0f, (args.getOrNull(3) as? Number)?.toFloat() ?: 160f, (args.getOrNull(4) as? Number)?.toFloat() ?: 160f); null
         })
-        ScriptableObject.putProperty(inputApi, "clearTouchZones", jsFunc {
-            inputSystem.clearTouchZones()
-            null
-        })
+        ScriptableObject.putProperty(inputApi, "clearTouchZones", jsFunc { inputSystem.clearTouchZones(); null })
         ScriptableObject.putProperty(globalScope, "Input", inputApi)
     }
 
     private fun bindNodeScript(n: GameNode) {
         val nodeScope = rhino.newObject(globalScope)
         nodeScope.prototype = globalScope
-        val selfObj = GameNodeJsProxy(n).apply {
-            parentScope = nodeScope
-            prototype = nodeScope
-        }
+        val selfObj = GameNodeJsProxy(n).apply { parentScope = nodeScope; prototype = nodeScope }
         n.jsObj = selfObj
 
-        // P6：便捷切换大图集帧
-        ScriptableObject.putProperty(selfObj, "setAtlas", jsFunc { args ->
-            val atlasName = RhinoContext.toString(args.getOrNull(0) ?: n.atlas)
-            val frameName = RhinoContext.toString(args.getOrNull(1) ?: "")
-            n.atlas = atlasName
-            n.atlasFrame = frameName
-            loadAtlasData(atlasName)
+        // P7：专业动画与状态机（FSM）JS API
+        ScriptableObject.putProperty(selfObj, "setAnimFloat", jsFunc { args ->
+            n.animator.fsm.setFloat(RhinoContext.toString(args.getOrNull(0) ?: ""), (args.getOrNull(1) as? Number)?.toFloat() ?: 0f); null
+        })
+        ScriptableObject.putProperty(selfObj, "setAnimBool", jsFunc { args ->
+            n.animator.fsm.setBool(RhinoContext.toString(args.getOrNull(0) ?: ""), (args.getOrNull(1) as? Boolean) ?: false); null
+        })
+        ScriptableObject.putProperty(selfObj, "triggerAnim", jsFunc { args ->
+            n.animator.fsm.setTrigger(RhinoContext.toString(args.getOrNull(0) ?: "")); null
+        })
+        ScriptableObject.putProperty(selfObj, "setAnimSpeed", jsFunc { args ->
+            n.animator.speedScale = ((args.getOrNull(0) as? Number)?.toFloat() ?: 1f).coerceIn(0.05f, 8f); null
+        })
+        ScriptableObject.putProperty(selfObj, "getAnimState", jsFunc {
+            n.animator.fsm.currentState.ifEmpty { n.currentClipName }
+        })
+        ScriptableObject.putProperty(selfObj, "isAnimCancelable", jsFunc {
+            n.animator.activeFrame?.cancelable == true
+        })
+        ScriptableObject.putProperty(selfObj, "addAnimTransition", jsFunc { args ->
+            val from = RhinoContext.toString(args.getOrNull(0) ?: "*")
+            val to = RhinoContext.toString(args.getOrNull(1) ?: "")
+            val param = RhinoContext.toString(args.getOrNull(2) ?: "")
+            val op = RhinoContext.toString(args.getOrNull(3) ?: "trigger")
+            val valArg = args.getOrNull(4)
+            val priority = (args.getOrNull(5) as? Number)?.toInt() ?: 0
+            val reqExit = (args.getOrNull(6) as? Boolean) ?: false
+            val reqCancel = (args.getOrNull(7) as? Boolean) ?: false
+            val conds = if (param.isNotEmpty()) listOf(StateCondition(param, op, valArg)) else emptyList()
+            if (to.isNotEmpty()) n.animator.fsm.addTransition(StateTransition(from, to, priority, reqExit, reqCancel, conds))
             null
+        })
+        ScriptableObject.putProperty(selfObj, "registerProClip", jsFunc { args ->
+            val raw = args.getOrNull(0) ?: return@jsFunc false
+            val jsonStr = if (raw is String) raw else RhinoContext.toString(NativeJSON.stringify(rhino, globalScope, raw, null, null))
+            try {
+                val wrapper = JSONObject().put("proClips", JSONArray().put(JSONObject(jsonStr)))
+                ZeroAnimator.parseInto(n.animator, wrapper)
+                true
+            } catch (e: Exception) {
+                onConsoleLog("[ANIM 注册错误 @ ${n.name}] ${e.message}")
+                false
+            }
+        })
+
+        ScriptableObject.putProperty(selfObj, "setAtlas", jsFunc { args ->
+            n.atlas = RhinoContext.toString(args.getOrNull(0) ?: n.atlas)
+            n.atlasFrame = RhinoContext.toString(args.getOrNull(1) ?: "")
+            loadAtlasData(n.atlas); null
         })
         ScriptableObject.putProperty(selfObj, "setNineSlice", jsFunc { args ->
             n.sliceLeft = (args.getOrNull(0) as? Number)?.toFloat() ?: 0f
             n.sliceRight = (args.getOrNull(1) as? Number)?.toFloat() ?: n.sliceLeft
             n.sliceTop = (args.getOrNull(2) as? Number)?.toFloat() ?: n.sliceLeft
-            n.sliceBottom = (args.getOrNull(3) as? Number)?.toFloat() ?: n.sliceTop
-            null
+            n.sliceBottom = (args.getOrNull(3) as? Number)?.toFloat() ?: n.sliceTop; null
         })
         ScriptableObject.putProperty(selfObj, "setClipRect", jsFunc { args ->
             n.clipX = (args.getOrNull(0) as? Number)?.toFloat() ?: 0f
             n.clipY = (args.getOrNull(1) as? Number)?.toFloat() ?: 0f
             n.clipW = (args.getOrNull(2) as? Number)?.toFloat() ?: 0f
-            n.clipH = (args.getOrNull(3) as? Number)?.toFloat() ?: 0f
-            null
+            n.clipH = (args.getOrNull(3) as? Number)?.toFloat() ?: 0f; null
         })
         ScriptableObject.putProperty(selfObj, "jump", jsFunc { args ->
             val jumpForce = (args.getOrNull(0) as? Number)?.toFloat() ?: 920f
             if (n.isGrounded || n.coyoteTimer > 0f) {
-                n.vy = -abs(jumpForce)
-                n.isGrounded = false
-                n.coyoteTimer = 0f
-                n.jumpCount = 1
-                return@jsFunc true
+                n.vy = -abs(jumpForce); n.isGrounded = false; n.coyoteTimer = 0f; n.jumpCount = 1; return@jsFunc true
             } else if (n.jumpCount < n.maxJumps) {
-                n.vy = -abs(jumpForce) * 0.9f
-                n.jumpCount++
-                return@jsFunc true
+                n.vy = -abs(jumpForce) * 0.9f; n.jumpCount++; return@jsFunc true
             }
             false
         })
         ScriptableObject.putProperty(selfObj, "dropThrough", jsFunc { args ->
-            val dur = (args.getOrNull(0) as? Number)?.toFloat() ?: 0.22f
-            n.dropThroughTimer = dur
-            n.isGrounded = false
-            null
+            n.dropThroughTimer = (args.getOrNull(0) as? Number)?.toFloat() ?: 0.22f; n.isGrounded = false; null
         })
         ScriptableObject.putProperty(selfObj, "bounce", jsFunc { args ->
-            val bvx = (args.getOrNull(0) as? Number)?.toFloat()
-            val bvy = (args.getOrNull(1) as? Number)?.toFloat() ?: -760f
-            if (bvx != null) n.vx = bvx
-            n.vy = bvy
-            n.isGrounded = false
-            n.jumpCount = 1
-            null
+            (args.getOrNull(0) as? Number)?.toFloat()?.let { n.vx = it }
+            n.vy = (args.getOrNull(1) as? Number)?.toFloat() ?: -760f
+            n.isGrounded = false; n.jumpCount = 1; null
         })
         ScriptableObject.putProperty(selfObj, "play", jsFunc { args ->
             val clipName = RhinoContext.toString(args.getOrNull(0) ?: "")
             val forceRestart = (args.getOrNull(1) as? Boolean) ?: false
+            // P7：优先走专业动画库
+            if (n.animator.play(clipName, forceRestart)) {
+                n.currentClipName = clipName
+                return@jsFunc null
+            }
             val clip = n.clips[clipName]
             if (clip != null) {
-                if (!forceRestart && n.animPlaying && n.currentClipName == clipName) {
-                    return@jsFunc null
-                }
-                n.currentClipName = clipName
-                n.animStart = clip.start
-                n.animEnd = clip.end
-                n.animFps = clip.fps
-                n.animLoop = clip.loop
-                n.currentFrame = clip.start
-                n.animTimer = 0f
-                n.animPlaying = true
-            } else {
-                onConsoleLog("[ANIM 警告 @ ${n.name}] 未找到动画片段: $clipName")
-            }
+                if (!forceRestart && n.animPlaying && n.currentClipName == clipName) return@jsFunc null
+                n.currentClipName = clipName; n.animStart = clip.start; n.animEnd = clip.end
+                n.animFps = clip.fps; n.animLoop = clip.loop; n.currentFrame = clip.start
+                n.animTimer = 0f; n.animPlaying = true
+            } else onConsoleLog("[ANIM 警告 @ ${n.name}] 未找到动画片段: $clipName")
             null
         })
         ScriptableObject.putProperty(selfObj, "playAnim", jsFunc { args ->
+            n.animator.stop()
             n.currentClipName = ""
             n.animStart = (args.getOrNull(0) as? Number)?.toInt() ?: 0
             n.animEnd = (args.getOrNull(1) as? Number)?.toInt() ?: 0
             n.animFps = (args.getOrNull(2) as? Number)?.toFloat() ?: 12f
             n.animLoop = (args.getOrNull(3) as? Boolean) ?: true
-            n.currentFrame = n.animStart
-            n.animTimer = 0f
-            n.animPlaying = true
-            null
+            n.currentFrame = n.animStart; n.animTimer = 0f; n.animPlaying = true; null
         })
-        ScriptableObject.putProperty(selfObj, "stopAnim", jsFunc {
-            n.animPlaying = false
-            n.currentClipName = ""
-            null
-        })
-        ScriptableObject.putProperty(selfObj, "flash", jsFunc { args ->
-            n.flashTimer = (args.getOrNull(0) as? Number)?.toFloat() ?: 0.12f
-            null
-        })
+        ScriptableObject.putProperty(selfObj, "stopAnim", jsFunc { n.animator.stop(); n.animPlaying = false; n.currentClipName = ""; null })
+        ScriptableObject.putProperty(selfObj, "flash", jsFunc { args -> n.flashTimer = (args.getOrNull(0) as? Number)?.toFloat() ?: 0.12f; null })
         ScriptableObject.putProperty(selfObj, "emitBurst", jsFunc { args ->
             val count = ((args.getOrNull(0) as? Number)?.toInt() ?: 24).coerceIn(1, 120)
-            val gt = getGlobalTransform(n)
-            repeat(count) { spawnSingleParticle(n, gt.gx, gt.gy) }
-            null
+            val gt = getGlobalTransform(n); repeat(count) { spawnSingleParticle(n, gt.gx, gt.gy) }; null
         })
         ScriptableObject.putProperty(nodeScope, "self", selfObj)
 
         if (n.script.isNotBlank()) {
-            try {
-                rhino.evaluateString(nodeScope, n.script, n.name, 1, null)
-            } catch (e: Exception) {
-                onConsoleLog("[JS 编译错误 @ ${n.name}] ${e.message}")
-            }
+            try { rhino.evaluateString(nodeScope, n.script, n.name, 1, null) }
+            catch (e: Exception) { onConsoleLog("[JS 编译错误 @ ${n.name}] ${e.message}") }
         }
     }
 
     private fun callLifecycle(n: GameNode, fnName: String, arg: Any? = null) {
         val scope = n.jsObj?.prototype ?: return
         val fn = ScriptableObject.getProperty(scope, fnName) as? Function ?: return
-        try {
-            val args = if (arg != null) arrayOf(arg) else emptyArray()
-            fn.call(rhino, scope, n.jsObj, args)
-        } catch (e: Exception) {
-            onConsoleLog("[JS 运行错误 @ ${n.name}.$fnName] ${e.message}")
-        }
+        try { fn.call(rhino, scope, n.jsObj, if (arg != null) arrayOf(arg) else emptyArray()) }
+        catch (e: Exception) { onConsoleLog("[JS 运行错误 @ ${n.name}.$fnName] ${e.message}") }
     }
 
-    // ==================== 空间哈希加速 + 独立 Collider 的 moveAndSlide ====================
     private fun computeSlopeSurfaceY(slope: GameNode, footX: Float): Float {
         val sb = getColliderBounds(slope)
-        val sw = sb.hw * 2f
-        val sh = sb.hh * 2f
-        val left = sb.cx - sb.hw
-        val top = sb.cy - sb.hh
-        val bottom = sb.cy + sb.hh
-        val t = ((footX - left) / max(1f, sw)).coerceIn(0f, 1f)
-        return if (slope.slopeType == "left_up") {
-            bottom - t * sh
-        } else {
-            top + t * sh
-        }
+        val t = ((footX - (sb.cx - sb.hw)) / max(1f, sb.hw * 2f)).coerceIn(0f, 1f)
+        return if (slope.slopeType == "left_up") (sb.cy + sb.hh) - t * (sb.hh * 2f) else (sb.cy - sb.hh) + t * (sb.hh * 2f)
     }
 
     private fun moveAndSlideNode(n: GameNode, dt: Float) {
         val collidedSolids = mutableSetOf<GameNode>()
-
         if (n.bodyMode == "platformer" || n.bodyMode == "rigid") {
             val gMul = if (n.vy > 0f) n.fallMultiplier else 1f
             n.vy = min(n.maxFallSpeed, n.vy + n.gravity * gMul * dt)
-            if (n.drag > 0f) {
-                n.vx *= max(0f, 1f - n.drag * dt)
-            }
+            if (n.drag > 0f) n.vx *= max(0f, 1f - n.drag * dt)
         }
 
         val startBounds = getColliderBounds(n)
         val prevBottom = startBounds.cy + startBounds.hh
-
         val sweepMinX = min(startBounds.cx, startBounds.cx + n.vx * dt) - startBounds.hw - 32f
         val sweepMaxX = max(startBounds.cx, startBounds.cx + n.vx * dt) + startBounds.hw + 32f
         val sweepMinY = min(startBounds.cy, startBounds.cy + n.vy * dt) - startBounds.hh - 32f
@@ -3985,13 +2828,8 @@ class ZeroEngineView(
                         val surfY = computeSlopeSurfaceY(other, cb.cx)
                         val footY = cb.cy + cb.hh
                         if (footY >= surfY - 18f && n.vy >= -40f) {
-                            n.y += (surfY - footY)
-                            n.vy = 0f
-                            n.isGrounded = true
-                            n.jumpCount = 0
-                            n.coyoteTimer = n.coyoteTimeMax
-                            climbedSlope = true
-                            collidedSolids.add(other)
+                            n.y += (surfY - footY); n.vy = 0f; n.isGrounded = true; n.jumpCount = 0; n.coyoteTimer = n.coyoteTimeMax
+                            climbedSlope = true; collidedSolids.add(other)
                         }
                     }
                 } else if (checkOverlap(n, other)) {
@@ -4014,78 +2852,49 @@ class ZeroEngineView(
                     val surfY = computeSlopeSurfaceY(other, cb.cx)
                     val footY = cb.cy + cb.hh
                     if (checkOverlap(n, other) && footY >= surfY && n.vy >= 0f) {
-                        n.y += (surfY - footY)
-                        n.vy = 0f
-                        n.isGrounded = true
-                        n.jumpCount = 0
-                        n.coyoteTimer = n.coyoteTimeMax
+                        n.y += (surfY - footY); n.vy = 0f; n.isGrounded = true; n.jumpCount = 0; n.coyoteTimer = n.coyoteTimeMax
                         collidedSolids.add(other)
                     } else if (wasGrounded && n.vy >= 0f && !n.isGrounded) {
                         val sb = getColliderBounds(other)
                         if (abs(cb.cx - sb.cx) <= sb.hw && surfY - footY in 0f..24f) {
-                            n.y += (surfY - footY)
-                            n.vy = 0f
-                            n.isGrounded = true
-                            n.jumpCount = 0
-                            n.coyoteTimer = n.coyoteTimeMax
+                            n.y += (surfY - footY); n.vy = 0f; n.isGrounded = true; n.jumpCount = 0; n.coyoteTimer = n.coyoteTimeMax
                             collidedSolids.add(other)
                         }
                     }
                 } else if (other.oneWay) {
                     if (n.vy >= 0f && n.dropThroughTimer <= 0f) {
-                        val ob = getColliderBounds(other)
-                        val otherTop = ob.cy - ob.hh
+                        val otherTop = getColliderBounds(other).let { it.cy - it.hh }
                         if (prevBottom <= otherTop + 14f && checkOverlap(n, other)) {
-                            n.y -= n.vy * dt
-                            n.vy = 0f
-                            n.isGrounded = true
-                            n.jumpCount = 0
-                            n.coyoteTimer = n.coyoteTimeMax
+                            n.y -= n.vy * dt; n.vy = 0f; n.isGrounded = true; n.jumpCount = 0; n.coyoteTimer = n.coyoteTimeMax
                             collidedSolids.add(other)
                         }
                     }
                 } else if (checkOverlap(n, other)) {
                     val fallingDown = n.vy > 0f
                     n.y -= n.vy * dt
-                    if (fallingDown) {
-                        n.isGrounded = true
-                        n.jumpCount = 0
-                        n.coyoteTimer = n.coyoteTimeMax
-                    }
-                    if (n.bodyMode == "rigid" && abs(n.vy) > 90f) {
-                        n.vy = -n.vy * n.bounciness
-                    } else {
-                        n.vy = 0f
-                    }
+                    if (fallingDown) { n.isGrounded = true; n.jumpCount = 0; n.coyoteTimer = n.coyoteTimeMax }
+                    if (n.bodyMode == "rigid" && abs(n.vy) > 90f) n.vy = -n.vy * n.bounciness else n.vy = 0f
                     collidedSolids.add(other)
                 }
             }
         }
 
         if (!n.isGrounded) {
-            if (wasGrounded) n.coyoteTimer = n.coyoteTimeMax
-            else n.coyoteTimer = max(0f, n.coyoteTimer - dt)
+            if (wasGrounded) n.coyoteTimer = n.coyoteTimeMax else n.coyoteTimer = max(0f, n.coyoteTimer - dt)
         }
-
         n.z += n.vz * dt
 
         for (other in collidedSolids) {
             if (!pendingRemove.contains(n) && !pendingRemove.contains(other)) {
-                callLifecycle(n, "onCollision", other.jsObj)
-                callLifecycle(other, "onCollision", n.jsObj)
+                callLifecycle(n, "onCollision", other.jsObj); callLifecycle(other, "onCollision", n.jsObj)
             }
         }
-
         if (n.collider) {
             for (other in nearby) {
-                if (other !== n && other.visible && other.collider && other.layer == n.layer) {
-                    if (!canCollideLayer(n, other)) continue
-                    if (n.isTrigger || other.isTrigger) {
-                        if (checkOverlap(n, other)) {
-                            if (!pendingRemove.contains(n) && !pendingRemove.contains(other)) {
-                                callLifecycle(n, "onTriggerEnter", other.jsObj)
-                                callLifecycle(other, "onTriggerEnter", n.jsObj)
-                            }
+                if (other !== n && other.visible && other.collider && other.layer == n.layer && canCollideLayer(n, other)) {
+                    if ((n.isTrigger || other.isTrigger) && checkOverlap(n, other)) {
+                        if (!pendingRemove.contains(n) && !pendingRemove.contains(other)) {
+                            callLifecycle(n, "onTriggerEnter", other.jsObj); callLifecycle(other, "onTriggerEnter", n.jsObj)
                         }
                     }
                 }
@@ -4095,25 +2904,18 @@ class ZeroEngineView(
 
     private fun checkOverlap(a: GameNode, b: GameNode): Boolean {
         val ba = getColliderBounds(a)
-
         if (b.nodeType == "TileMap") {
             val gb = getGlobalTransform(b)
             val ts = max(8f, b.tileSize)
-            val minGx = floor((ba.cx - ba.hw - gb.gx) / ts).toInt()
-            val maxGx = floor((ba.cx + ba.hw - gb.gx) / ts).toInt()
-            val minGy = floor((ba.cy - ba.hh - gb.gy) / ts).toInt()
-            val maxGy = floor((ba.cy + ba.hh - gb.gy) / ts).toInt()
-            for (gx in minGx..maxGx) {
-                for (gy in minGy..maxGy) {
+            for (gx in floor((ba.cx - ba.hw - gb.gx) / ts).toInt()..floor((ba.cx + ba.hw - gb.gx) / ts).toInt()) {
+                for (gy in floor((ba.cy - ba.hh - gb.gy) / ts).toInt()..floor((ba.cy + ba.hh - gb.gy) / ts).toInt()) {
                     if (b.tileLookup.containsKey(packGridKey(gx, gy))) return true
                 }
             }
             return false
         }
-
         val bb = getColliderBounds(b)
-        return abs(ba.cx - bb.cx) < (ba.hw + bb.hw) &&
-               abs(ba.cy - bb.cy) < (ba.hh + bb.hh)
+        return abs(ba.cx - bb.cx) < (ba.hw + bb.hw) && abs(ba.cy - bb.cy) < (ba.hh + bb.hh)
     }
 
     data class GlobalTransform(val gx: Float, val gy: Float, val gz: Float, val gRot: Float, val gSx: Float, val gSy: Float)
@@ -4121,91 +2923,61 @@ class ZeroEngineView(
     private fun getGlobalTransform(n: GameNode, visited: MutableSet<String> = mutableSetOf()): GlobalTransform {
         val pxOffset = if (n.layer == "World" && n.parallaxX != 1f) (camX - 540f) * (1f - n.parallaxX) else 0f
         val pyOffset = if (n.layer == "World" && n.parallaxY != 1f) (camY - 960f) * (1f - n.parallaxY) else 0f
-
         if (n.parent.isEmpty() || visited.contains(n.name)) {
             return GlobalTransform(n.x + pxOffset, n.y + pyOffset, n.z, n.rotation, n.scaleX, n.scaleY)
         }
         visited.add(n.name)
-        val p = nodes.find { it.name == n.parent }
-            ?: return GlobalTransform(n.x + pxOffset, n.y + pyOffset, n.z, n.rotation, n.scaleX, n.scaleY)
+        val p = nodes.find { it.name == n.parent } ?: return GlobalTransform(n.x + pxOffset, n.y + pyOffset, n.z, n.rotation, n.scaleX, n.scaleY)
         val pt = getGlobalTransform(p, visited)
         val rad = Math.toRadians(pt.gRot.toDouble())
-        val sx = n.x * pt.gSx
-        val sy = n.y * pt.gSy
+        val sx = n.x * pt.gSx; val sy = n.y * pt.gSy
         return GlobalTransform(
             pt.gx + (sx * cos(rad) - sy * sin(rad)).toFloat(),
             pt.gy + (sx * sin(rad) + sy * cos(rad)).toFloat(),
-            pt.gz + n.z,
-            pt.gRot + n.rotation,
-            pt.gSx * n.scaleX,
-            pt.gSy * n.scaleY
+            pt.gz + n.z, pt.gRot + n.rotation, pt.gSx * n.scaleX, pt.gSy * n.scaleY
         )
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         inputSystem.onMultiTouch(event, width, height)
-
         val idx = event.actionIndex
         val sx = (event.getX(idx) / max(1, width)) * 1080f
         val sy = (event.getY(idx) / max(1, height)) * 1920f
-        touchScreenX = sx
-        touchScreenY = sy
+        touchScreenX = sx; touchScreenY = sy
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
-                isTouching = true
-                synchronized(pendingTouchEvents) { pendingTouchEvents.add(Triple("down", sx, sy)) }
+                isTouching = true; synchronized(pendingTouchEvents) { pendingTouchEvents.add(Triple("down", sx, sy)) }
             }
-            MotionEvent.ACTION_MOVE -> {
-                synchronized(pendingTouchEvents) { pendingTouchEvents.add(Triple("move", sx, sy)) }
-            }
+            MotionEvent.ACTION_MOVE -> synchronized(pendingTouchEvents) { pendingTouchEvents.add(Triple("move", sx, sy)) }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_CANCEL -> {
-                if (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL) {
-                    isTouching = false
-                }
+                if (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL) isTouching = false
                 synchronized(pendingTouchEvents) { pendingTouchEvents.add(Triple("up", sx, sy)) }
             }
         }
         return true
     }
 
-    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if (inputSystem.onKeyEvent(keyCode, isDown = true)) return true
-        return super.onKeyDown(keyCode, event)
-    }
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean =
+        if (inputSystem.onKeyEvent(keyCode, true)) true else super.onKeyDown(keyCode, event)
 
-    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
-        if (inputSystem.onKeyEvent(keyCode, isDown = false)) return true
-        return super.onKeyUp(keyCode, event)
-    }
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean =
+        if (inputSystem.onKeyEvent(keyCode, false)) true else super.onKeyUp(keyCode, event)
 
-    override fun onGenericMotionEvent(event: MotionEvent?): Boolean {
-        if (event != null && inputSystem.onGamepadMotion(event)) return true
-        return super.onGenericMotionEvent(event)
-    }
+    override fun onGenericMotionEvent(event: MotionEvent?): Boolean =
+        if (event != null && inputSystem.onGamepadMotion(event)) true else super.onGenericMotionEvent(event)
 
     private fun flushTouchEvents() {
-        val list = synchronized(pendingTouchEvents) {
-            val copy = pendingTouchEvents.toList()
-            pendingTouchEvents.clear()
-            copy
-        }
+        val list = synchronized(pendingTouchEvents) { val c = pendingTouchEvents.toList(); pendingTouchEvents.clear(); c }
         for ((type, sx, sy) in list) {
             val evObj = rhino.newObject(globalScope)
             ScriptableObject.putProperty(evObj, "type", type)
-            ScriptableObject.putProperty(evObj, "screenX", sx.toDouble())
-            ScriptableObject.putProperty(evObj, "screenY", sy.toDouble())
-            ScriptableObject.putProperty(evObj, "worldX", touchWorldX.toDouble())
-            ScriptableObject.putProperty(evObj, "worldY", touchWorldY.toDouble())
+            ScriptableObject.putProperty(evObj, "screenX", sx.toDouble()); ScriptableObject.putProperty(evObj, "screenY", sy.toDouble())
+            ScriptableObject.putProperty(evObj, "worldX", touchWorldX.toDouble()); ScriptableObject.putProperty(evObj, "worldY", touchWorldY.toDouble())
             nodes.toList().forEach { callLifecycle(it, "onInput", evObj) }
         }
     }
 
-    private fun parseSceneJson(
-        raw: String,
-        outList: MutableList<GameNode>,
-        groupName: String = "main",
-        applyCamera: Boolean = true
-    ) {
+    private fun parseSceneJson(raw: String, outList: MutableList<GameNode>, groupName: String = "main", applyCamera: Boolean = true) {
         try {
             val root = JSONObject(raw)
             val camObj = root.optJSONObject("camera")
@@ -4228,19 +3000,9 @@ class ZeroEngineView(
                             val evObj = co.optJSONObject("events")
                             if (evObj != null) {
                                 val keys = evObj.keys()
-                                while (keys.hasNext()) {
-                                    val k = keys.next()
-                                    k.toIntOrNull()?.let { fIdx -> evMap[fIdx] = evObj.optString(k, "") }
-                                }
+                                while (keys.hasNext()) { val k = keys.next(); k.toIntOrNull()?.let { evMap[it] = evObj.optString(k, "") } }
                             }
-                            clipMap[cName] = AnimClip(
-                                name = cName,
-                                start = co.optInt("start", 0),
-                                end = co.optInt("end", 0),
-                                fps = co.optDouble("fps", 12.0).toFloat(),
-                                loop = co.optBoolean("loop", true),
-                                events = evMap
-                            )
+                            clipMap[cName] = AnimClip(cName, co.optInt("start", 0), co.optInt("end", 0), co.optDouble("fps", 12.0).toFloat(), co.optBoolean("loop", true), evMap)
                         }
                     }
                 }
@@ -4250,19 +3012,12 @@ class ZeroEngineView(
                 if (tilesArr != null) {
                     for (tIdx in 0 until tilesArr.length()) {
                         val to = tilesArr.getJSONObject(tIdx)
-                        val cell = TileCell(
-                            gx = to.optInt("gx", 0),
-                            gy = to.optInt("gy", 0),
-                            frame = to.optInt("frame", 0)
-                        )
-                        tileList.add(cell)
-                        tileMapLookup[packGridKey(cell.gx, cell.gy)] = cell
+                        val cell = TileCell(to.optInt("gx", 0), to.optInt("gy", 0), to.optInt("frame", 0))
+                        tileList.add(cell); tileMapLookup[packGridKey(cell.gx, cell.gy)] = cell
                     }
                 }
                 val defaultClipName = o.optString("defaultClip", "")
                 val rawLayer = o.optString("layer", "World")
-                val rawScript = o.optString("script", "")
-                val scriptFile = o.optString("scriptFile", "")
                 val node = GameNode(
                     name = o.optString("name", "Node_$i"),
                     nodeType = o.optString("nodeType", "Sprite2D"),
@@ -4271,86 +3026,54 @@ class ZeroEngineView(
                     tag = o.optString("tag", "default"),
                     sceneGroup = groupName,
                     persistent = o.optBoolean("persistent", false),
-                    x = o.optDouble("x", 0.0).toFloat(),
-                    y = o.optDouble("y", 0.0).toFloat(),
-                    z = o.optDouble("z", 0.0).toFloat(),
-                    width = o.optDouble("width", 120.0).toFloat(),
-                    height = o.optDouble("height", 120.0).toFloat(),
-                    rotation = o.optDouble("rotation", 0.0).toFloat(),
-                    tiltX = o.optDouble("tiltX", 0.0).toFloat(),
+                    x = o.optDouble("x", 0.0).toFloat(), y = o.optDouble("y", 0.0).toFloat(), z = o.optDouble("z", 0.0).toFloat(),
+                    width = o.optDouble("width", 120.0).toFloat(), height = o.optDouble("height", 120.0).toFloat(),
+                    rotation = o.optDouble("rotation", 0.0).toFloat(), tiltX = o.optDouble("tiltX", 0.0).toFloat(),
                     billboard = o.optBoolean("billboard", false),
-                    scaleX = o.optDouble("scaleX", 1.0).toFloat(),
-                    scaleY = o.optDouble("scaleY", 1.0).toFloat(),
-                    zIndex = o.optInt("zIndex", 0),
-                    visible = o.optBoolean("visible", true),
-                    parallaxX = o.optDouble("parallaxX", 1.0).toFloat(),
-                    parallaxY = o.optDouble("parallaxY", 1.0).toFloat(),
-                    texture = o.optString("texture", ""),
-                    atlas = o.optString("atlas", ""),
-                    atlasFrame = o.optString("atlasFrame", ""),
-                    text = o.optString("text", ""),
-                    fontSize = o.optDouble("fontSize", 44.0).toFloat(),
-                    r = o.optDouble("r", 1.0).toFloat(),
-                    g = o.optDouble("g", 1.0).toFloat(),
-                    b = o.optDouble("b", 1.0).toFloat(),
-                    a = o.optDouble("a", 1.0).toFloat(),
-                    lightRadius = o.optDouble("lightRadius", 450.0).toFloat(),
-                    lightIntensity = o.optDouble("lightIntensity", 1.4).toFloat(),
+                    scaleX = o.optDouble("scaleX", 1.0).toFloat(), scaleY = o.optDouble("scaleY", 1.0).toFloat(),
+                    zIndex = o.optInt("zIndex", 0), visible = o.optBoolean("visible", true),
+                    parallaxX = o.optDouble("parallaxX", 1.0).toFloat(), parallaxY = o.optDouble("parallaxY", 1.0).toFloat(),
+                    texture = o.optString("texture", ""), atlas = o.optString("atlas", ""), atlasFrame = o.optString("atlasFrame", ""),
+                    text = o.optString("text", ""), fontSize = o.optDouble("fontSize", 44.0).toFloat(),
+                    r = o.optDouble("r", 1.0).toFloat(), g = o.optDouble("g", 1.0).toFloat(), b = o.optDouble("b", 1.0).toFloat(), a = o.optDouble("a", 1.0).toFloat(),
+                    lightRadius = o.optDouble("lightRadius", 450.0).toFloat(), lightIntensity = o.optDouble("lightIntensity", 1.4).toFloat(),
                     shadowCaster = o.optBoolean("shadowCaster", false),
-                    sliceLeft = o.optDouble("sliceLeft", 0.0).toFloat(),
-                    sliceRight = o.optDouble("sliceRight", 0.0).toFloat(),
-                    sliceTop = o.optDouble("sliceTop", 0.0).toFloat(),
-                    sliceBottom = o.optDouble("sliceBottom", 0.0).toFloat(),
+                    sliceLeft = o.optDouble("sliceLeft", 0.0).toFloat(), sliceRight = o.optDouble("sliceRight", 0.0).toFloat(),
+                    sliceTop = o.optDouble("sliceTop", 0.0).toFloat(), sliceBottom = o.optDouble("sliceBottom", 0.0).toFloat(),
                     clipChildren = o.optBoolean("clipChildren", false),
-                    clipX = o.optDouble("clipX", 0.0).toFloat(),
-                    clipY = o.optDouble("clipY", 0.0).toFloat(),
-                    clipW = o.optDouble("clipW", 0.0).toFloat(),
-                    clipH = o.optDouble("clipH", 0.0).toFloat(),
-                    collider = o.optBoolean("collider", false),
-                    isTrigger = o.optBoolean("isTrigger", false),
-                    oneWay = o.optBoolean("oneWay", false),
-                    slopeType = o.optString("slopeType", "none"),
-                    colOffsetX = o.optDouble("colOffsetX", 0.0).toFloat(),
-                    colOffsetY = o.optDouble("colOffsetY", 0.0).toFloat(),
-                    colWidth = o.optDouble("colWidth", 0.0).toFloat(),
-                    colHeight = o.optDouble("colHeight", 0.0).toFloat(),
-                    colLayer = o.optInt("colLayer", 1),
-                    colMask = o.optInt("colMask", 0xFFFF),
+                    clipX = o.optDouble("clipX", 0.0).toFloat(), clipY = o.optDouble("clipY", 0.0).toFloat(),
+                    clipW = o.optDouble("clipW", 0.0).toFloat(), clipH = o.optDouble("clipH", 0.0).toFloat(),
+                    collider = o.optBoolean("collider", false), isTrigger = o.optBoolean("isTrigger", false),
+                    oneWay = o.optBoolean("oneWay", false), slopeType = o.optString("slopeType", "none"),
+                    colOffsetX = o.optDouble("colOffsetX", 0.0).toFloat(), colOffsetY = o.optDouble("colOffsetY", 0.0).toFloat(),
+                    colWidth = o.optDouble("colWidth", 0.0).toFloat(), colHeight = o.optDouble("colHeight", 0.0).toFloat(),
+                    colLayer = o.optInt("colLayer", 1), colMask = o.optInt("colMask", 0xFFFF),
                     bodyMode = o.optString("bodyMode", "kinematic"),
-                    gravity = o.optDouble("gravity", 2200.0).toFloat(),
-                    fallMultiplier = o.optDouble("fallMultiplier", 1.55).toFloat(),
-                    maxFallSpeed = o.optDouble("maxFallSpeed", 1450.0).toFloat(),
-                    bounciness = o.optDouble("bounciness", 0.5).toFloat(),
-                    drag = o.optDouble("drag", 0.0).toFloat(),
-                    maxJumps = o.optInt("maxJumps", 2),
-                    isHitbox = o.optBoolean("isHitbox", false),
-                    isHurtbox = o.optBoolean("isHurtbox", false),
+                    gravity = o.optDouble("gravity", 2200.0).toFloat(), fallMultiplier = o.optDouble("fallMultiplier", 1.55).toFloat(),
+                    maxFallSpeed = o.optDouble("maxFallSpeed", 1450.0).toFloat(), bounciness = o.optDouble("bounciness", 0.5).toFloat(),
+                    drag = o.optDouble("drag", 0.0).toFloat(), maxJumps = o.optInt("maxJumps", 2),
+                    isHitbox = o.optBoolean("isHitbox", false), isHurtbox = o.optBoolean("isHurtbox", false),
                     damage = o.optDouble("damage", 10.0).toFloat(),
-                    hFrames = o.optInt("hFrames", 1),
-                    vFrames = o.optInt("vFrames", 1),
-                    currentFrame = o.optInt("currentFrame", 0),
-                    animFps = o.optDouble("animFps", 12.0).toFloat(),
-                    clips = clipMap,
-                    tileSize = o.optDouble("tileSize", 90.0).toFloat(),
-                    tiles = tileList,
-                    tileLookup = tileMapLookup,
-                    emitRate = o.optDouble("emitRate", 24.0).toFloat(),
-                    particleLife = o.optDouble("particleLife", 1.1).toFloat(),
-                    particleSpeed = o.optDouble("particleSpeed", 160.0).toFloat(),
-                    particleSize = o.optDouble("particleSize", 16.0).toFloat(),
+                    hFrames = o.optInt("hFrames", 1), vFrames = o.optInt("vFrames", 1),
+                    currentFrame = o.optInt("currentFrame", 0), animFps = o.optDouble("animFps", 12.0).toFloat(),
+                    clips = clipMap, tileSize = o.optDouble("tileSize", 90.0).toFloat(),
+                    tiles = tileList, tileLookup = tileMapLookup,
+                    emitRate = o.optDouble("emitRate", 24.0).toFloat(), particleLife = o.optDouble("particleLife", 1.1).toFloat(),
+                    particleSpeed = o.optDouble("particleSpeed", 160.0).toFloat(), particleSize = o.optDouble("particleSize", 16.0).toFloat(),
                     particleGravity = o.optDouble("particleGravity", -60.0).toFloat(),
                     shader = o.optString("shader", ""),
-                    script = resolveNodeScriptText(rawScript, scriptFile)
+                    script = resolveNodeScriptText(o.optString("script", ""), o.optString("scriptFile", ""))
                 )
-                if (defaultClipName.isNotEmpty() && clipMap.containsKey(defaultClipName)) {
-                    val dc = clipMap[defaultClipName]!!
-                    node.currentClipName = defaultClipName
-                    node.animStart = dc.start
-                    node.animEnd = dc.end
-                    node.animFps = dc.fps
-                    node.animLoop = dc.loop
-                    node.currentFrame = dc.start
-                    node.animPlaying = true
+                // P7：解析专业动画库与状态机
+                ZeroAnimator.parseInto(node.animator, o)
+                if (defaultClipName.isNotEmpty()) {
+                    if (node.animator.play(defaultClipName, true)) {
+                        node.currentClipName = defaultClipName
+                    } else if (clipMap.containsKey(defaultClipName)) {
+                        val dc = clipMap[defaultClipName]!!
+                        node.currentClipName = defaultClipName; node.animStart = dc.start; node.animEnd = dc.end
+                        node.animFps = dc.fps; node.animLoop = dc.loop; node.currentFrame = dc.start; node.animPlaying = true
+                    }
                 }
                 outList.add(node)
             }
@@ -4374,11 +3097,7 @@ class ZeroEngineView(
     private fun getTextTexture(text: String, size: Float): Int {
         val key = "$text|$size"
         textTextureCache[key]?.let { return it }
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            textSize = size
-            isFakeBoldText = true
-        }
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; textSize = size; isFakeBoldText = true }
         val w = max(64, (paint.measureText(text) + 24).toInt())
         val h = max(64, (size * 1.5f).toInt())
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
@@ -4391,9 +3110,7 @@ class ZeroEngineView(
 
     private fun createSolidWhiteTexture(): Int {
         val bmp = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.WHITE) }
-        val id = uploadBitmapToGL(bmp)
-        bmp.recycle()
-        return id
+        val id = uploadBitmapToGL(bmp); bmp.recycle(); return id
     }
 
     private fun uploadBitmapToGL(bmp: Bitmap): Int {
@@ -4413,59 +3130,46 @@ class ZeroEngineView(
         val fs = compileShader(GLES20.GL_FRAGMENT_SHADER, fsSrc)
         if (vs == 0 || fs == 0) return 0
         val prog = GLES20.glCreateProgram()
-        GLES20.glAttachShader(prog, vs)
-        GLES20.glAttachShader(prog, fs)
-        GLES20.glLinkProgram(prog)
-        GLES20.glDeleteShader(vs)
-        GLES20.glDeleteShader(fs)
+        GLES20.glAttachShader(prog, vs); GLES20.glAttachShader(prog, fs); GLES20.glLinkProgram(prog)
+        GLES20.glDeleteShader(vs); GLES20.glDeleteShader(fs)
         return prog
     }
 
     private fun compileShader(type: Int, src: String): Int {
         val shader = GLES20.glCreateShader(type)
-        GLES20.glShaderSource(shader, src)
-        GLES20.glCompileShader(shader)
+        GLES20.glShaderSource(shader, src); GLES20.glCompileShader(shader)
         val compiled = IntArray(1)
         GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, compiled, 0)
         if (compiled[0] == 0) {
             onConsoleLog("[GLSL 错误] ${GLES20.glGetShaderInfoLog(shader)}")
-            GLES20.glDeleteShader(shader)
-            return 0
+            GLES20.glDeleteShader(shader); return 0
         }
         return shader
     }
 
-    private fun jsFunc(block: (Array<out Any?>) -> Any?): org.mozilla.javascript.BaseFunction {
-        return object : org.mozilla.javascript.BaseFunction() {
+    private fun jsFunc(block: (Array<out Any?>) -> Any?): org.mozilla.javascript.BaseFunction =
+        object : org.mozilla.javascript.BaseFunction() {
             override fun call(cx: RhinoContext?, scope: Scriptable?, thisObj: Scriptable?, args: Array<out Any?>): Any? = block(args)
         }
-    }
 
     private fun toJsFloat(v: Any?, def: Float): Float = (v as? Number)?.toFloat() ?: def
     private fun toJsInt(v: Any?, def: Int): Int = (v as? Number)?.toInt() ?: def
     private fun toJsStr(v: Any?, def: String): String = v?.takeIf { it !== Scriptable.NOT_FOUND }?.toString() ?: def
     private fun toJsBool(v: Any?, def: Boolean): Boolean = (v as? Boolean) ?: def
-
-    private fun getJsFloat(s: Scriptable, k: String, def: Float): Float =
-        (ScriptableObject.getProperty(s, k) as? Number)?.toFloat() ?: def
-    private fun getJsInt(s: Scriptable, k: String, def: Int): Int =
-        (ScriptableObject.getProperty(s, k) as? Number)?.toInt() ?: def
-    private fun getJsStr(s: Scriptable, k: String, def: String): String =
-        ScriptableObject.getProperty(s, k)?.takeIf { it !== Scriptable.NOT_FOUND }?.toString() ?: def
-    private fun getJsBool(s: Scriptable, k: String, def: Boolean): Boolean =
-        (ScriptableObject.getProperty(s, k) as? Boolean) ?: def
+    private fun getJsFloat(s: Scriptable, k: String, def: Float): Float = (ScriptableObject.getProperty(s, k) as? Number)?.toFloat() ?: def
+    private fun getJsInt(s: Scriptable, k: String, def: Int): Int = (ScriptableObject.getProperty(s, k) as? Number)?.toInt() ?: def
+    private fun getJsStr(s: Scriptable, k: String, def: String): String = ScriptableObject.getProperty(s, k)?.takeIf { it !== Scriptable.NOT_FOUND }?.toString() ?: def
+    private fun getJsBool(s: Scriptable, k: String, def: Boolean): Boolean = (ScriptableObject.getProperty(s, k) as? Boolean) ?: def
 
     companion object {
         private val BRIDGED_PROPS = setOf(
             "name", "tag", "sceneGroup", "persistent",
             "x", "y", "z", "vx", "vy", "vz",
             "width", "height", "rotation", "tiltX", "scaleX", "scaleY",
-            "parallaxX", "parallaxY",
-            "atlas", "atlasFrame",
+            "parallaxX", "parallaxY", "atlas", "atlasFrame",
             "sliceLeft", "sliceRight", "sliceTop", "sliceBottom",
             "clipChildren", "clipX", "clipY", "clipW", "clipH",
-            "slopeType",
-            "colOffsetX", "colOffsetY", "colWidth", "colHeight", "colLayer", "colMask",
+            "slopeType", "colOffsetX", "colOffsetY", "colWidth", "colHeight", "colLayer", "colMask",
             "bodyMode", "gravity", "fallMultiplier", "maxJumps", "isGrounded",
             "isHitbox", "isHurtbox", "damage", "invulnTimer",
             "r", "g", "b", "a", "visible", "text", "currentClip",
