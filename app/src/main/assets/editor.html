@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>ZeroEngine Pro IDE v1.3</title>
+<title>ZeroEngine Pro IDE v1.4</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, sans-serif; }
   body { background: #0b0e14; color: #e2e8f0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; user-select: none; }
@@ -15,6 +15,7 @@
   button.active-toggle { background: #1d4ed8; border-color: #3b82f6; color: #fff; }
   button.save-btn { background: #0284c7; border-color: #0369a1; color: #fff; }
   button.export-btn { background: #7c3aed; border-color: #6d28d9; color: #fff; }
+  button.anim-btn { background: #be185d; border-color: #9d174d; color: #fff; }
   button.play { background: #10b981; border-color: #059669; color: #042f2e; font-weight: 800; margin-left: auto; }
   button.danger { background: #dc2626; border-color: #b91c1c; color: #fff; }
 
@@ -85,6 +86,7 @@
     <button id="snapBtn" class="active-toggle" onclick="toggleSnap()">吸附</button>
     <button onclick="resetView()">居中</button>
     <button class="export-btn" onclick="exportBundle()">📦导出</button>
+    <button class="anim-btn" onclick="AnimStudio.open()">🎬动画</button>
     <button class="play" onclick="playScene()">▶ 运行</button>
   </div>
 </header>
@@ -105,7 +107,7 @@
   </div>
   <div class="viewport" id="vpBox">
     <canvas id="stage"></canvas>
-    <div class="vp-hud" id="vpHud">v1.3 | 2.5D</div>
+    <div class="vp-hud" id="vpHud">v1.4 | 2.5D</div>
   </div>
 </div>
 
@@ -207,6 +209,8 @@ function escHtml(s) {
 
 function normalizeNode(n) {
   if (!Array.isArray(n.clips)) n.clips = [];
+  if (!Array.isArray(n.proClips)) n.proClips = [];
+  if (!Array.isArray(n.fsmTransitions)) n.fsmTransitions = [];
   if (!Array.isArray(n.tiles)) n.tiles = [];
   if (n.parallaxX === undefined) n.parallaxX = 1;
   if (n.parallaxY === undefined) n.parallaxY = 1;
@@ -229,7 +233,6 @@ function normalizeNode(n) {
   if (n.colMask === undefined) n.colMask = 65535;
   if (n.persistent === undefined) n.persistent = false;
   if (n.scriptFile === undefined) n.scriptFile = '';
-  // P5: 9-Slice & Scissor
   if (n.sliceLeft === undefined) n.sliceLeft = 0;
   if (n.sliceRight === undefined) n.sliceRight = 0;
   if (n.sliceTop === undefined) n.sliceTop = 0;
@@ -644,7 +647,7 @@ function onReady() {
   Engine.setCameraMode("2.5D");
   Engine.setCameraTarget(self);
   self.play("idle");
-  Engine.log("ZeroEngine v1.3 通用引擎已就绪");
+  Engine.log("ZeroEngine v1.4 P7 动画引擎已就绪");
 }
 function onProcess(dt) {
   if (Input.isTouching && Input.screenY < 1550) {
@@ -1327,7 +1330,7 @@ function hexToRgb(hex) {
 function draw() {
   const brushHint = (selectedIndex >= 0 && nodes[selectedIndex]?.nodeType === 'TileMap' && tileBrushMode !== 'off')
     ? ` | 🖌️${tileBrushMode === 'paint' ? '刷瓦片(#' + brushFrame + ')' : '橡皮擦'}` : '';
-  document.getElementById('vpHud').textContent = `v1.3 | ${cameraCfg.mode} | ${Math.round(camZoom * 100)}% | ${currentScene}${brushHint}`;
+  document.getElementById('vpHud').textContent = `v1.4 | ${cameraCfg.mode} | ${Math.round(camZoom * 100)}% | ${currentScene}${brushHint}`;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.save();
   ctx.translate(canvas.width / 2, canvas.height / 2);
@@ -1456,7 +1459,8 @@ function renderTree() {
       : (n.isHitbox ? '⚔️'
       : (n.layer === 'UI' ? '📱' : (n.billboard ? '🧍' : ''))))));
     const hasScript = (n.script && n.script.trim()) || (n.scriptFile && n.scriptFile.trim());
-    const badges = (hasScript ? '📜' : '') + (n.shader && n.shader.trim() ? '✨' : '');
+    const hasProAnim = Array.isArray(n.proClips) && n.proClips.length > 0;
+    const badges = (hasProAnim ? '🎬' : '') + (hasScript ? '📜' : '') + (n.shader && n.shader.trim() ? '✨' : '');
     return `<div class="tree-item ${i === selectedIndex ? 'active' : ''}" onclick="selectNode(${i})">${indent}${icon}${n.name} ${badges}</div>`;
   }).join('');
 }
@@ -1559,16 +1563,15 @@ function renderDock() {
     body.innerHTML = `<div class="doc-box">
 <b>📂 当前工程 Save 文件夹位置：</b> <button style="padding:2px 6px;font-size:10px;" onclick="chooseSaveFolderNative()">更改目录</button><br>
 <span style="color:#34d399;">${escHtml(getSaveFolderPath())}</span><br><br>
-<b>ZeroEngine SDK v1.3 商业版手册 (P0~P5)</b><br>
+<b>ZeroEngine SDK v1.4 商业版手册 (P0~P7)</b><br>
+• <b>P7 专业动画与状态机</b>: 点击顶部 <b>🎬动画</b> 打开工作台；脚本支持 self.setAnimFloat("speed", vx) / self.triggerAnim("attack") / self.isAnimCancelable()<br>
 • <b>外部 JS 模块 (scripts/)</b>: ${escHtml(scriptStr)}<br>
 • <b>数值数据表 (data/)</b>: ${escHtml(dataStr)}<br>
-• <b>大世界状态标志 (P5)</b>: Engine.setFlag("door_1", true) / hasFlag("door_1") / saveWorldFlags("main") / loadWorldFlags("main")<br>
+• <b>大世界状态标志 (P5)</b>: Engine.setFlag("door_1", true) / hasFlag("door_1") / saveWorldFlags("main")<br>
 • <b>数据表与多语言 (P5)</b>: var w = Engine.loadTable("weapons.json") / Engine.setLanguage("en") / Engine.t("boss_clear")<br>
-• <b>多轨 BGM 混音 (P5)</b>: Engine.crossfadeBGM("boss.mp3", 1.5, true, 0.8) / Engine.setVolume("bgm", 0.6) / Engine.playSFX("hit.wav", 1, 0.9, 1.1)<br>
+• <b>多轨 BGM 混音 (P5)</b>: Engine.crossfadeBGM("boss.mp3", 1.5, true, 0.8) / Engine.playSFX("hit.wav", 1, 0.9, 1.1)<br>
 • <b>UI 九宫格与裁剪 (P5)</b>: self.setNineSlice(16,16,16,16) / self.setClipRect(x,y,w,h) / self.clipChildren = true<br>
 • <b>模块化与合批 (P4)</b>: require("combat_config.js") / Engine.getStats() / Engine.unloadUnusedTextures()<br>
-• <b>FBO 后处理与转场</b>: Engine.setPostFX({bloom:0.4, vignette:0.35, chromatic:0}) / Engine.fadeToScene("room2.scene", 0.35)<br>
-• <b>三端统一输入</b>: Input.bindTouchZone("jump", 920, 1680, 200, 200) / Input.getAxis("move_left","move_right")<br>
 • <b>已导入音频</b>: ${escHtml(audioStr)}
 </div>`;
     return;
@@ -1585,7 +1588,6 @@ function renderDock() {
     return;
   }
 
-  // ==================== P4/P5 升级：脚本/数据 面板支持 [节点脚本] | [模块库 scripts/] | [数据表 data/] ====================
   if (activeTab === 'script') {
     const selNode = (selectedIndex >= 0 && nodes[selectedIndex]) ? nodes[selectedIndex] : null;
     const modeBar = `
@@ -1650,15 +1652,14 @@ function renderDock() {
       : '';
     body.innerHTML = modeBar + mountHint + `
       <div class="script-toolbar">
+        <button onclick="insertCode('scriptEditor','self.triggerAnim(\\'attack\\');\\n')">triggerAnim</button>
+        <button onclick="insertCode('scriptEditor','self.setAnimFloat(\\'speed\\', Math.abs(self.vx));\\n')">setAnimFloat</button>
+        <button onclick="insertCode('scriptEditor','Engine.setDebugDraw(true);\\n')">DebugDraw</button>
         <button onclick="insertCode('scriptEditor','var cfg = require(\\'combat_config.js\\');\\n')">require</button>
         <button onclick="insertCode('scriptEditor','var tbl = Engine.loadTable(\\'weapons.json\\');\\n')">loadTable</button>
         <button onclick="insertCode('scriptEditor','Engine.setFlag(\\'boss_1\\', true);\\n')">setFlag</button>
         <button onclick="insertCode('scriptEditor','Engine.crossfadeBGM(\\'boss.mp3\\', 1.2, true, 0.8);\\n')">crossfadeBGM</button>
-        <button onclick="insertCode('scriptEditor','var txt = Engine.t(\\'title\\');\\n')">i18n</button>
         <button onclick="insertCode('scriptEditor','var s = Engine.getStats();\\n')">getStats</button>
-        <button onclick="insertCode('scriptEditor','Engine.setPostFX({ bloom: 0.4, vignette: 0.35 });\\n')">PostFX</button>
-        <button onclick="insertCode('scriptEditor','Input.bindTouchZone(\\'jump\\', 920, 1680, 200, 200);\\n')">TouchZone</button>
-        <button onclick="insertCode('scriptEditor','Engine.setDebugDraw(true);\\n')">DebugDraw</button>
       </div>
       <textarea id="scriptEditor" class="code-box" spellcheck="false" oninput="updateProp('script', this.value, true)">${escHtml(selNode.script || '')}</textarea>`;
     return;
@@ -1762,6 +1763,7 @@ function renderDock() {
   body.innerHTML = `
     <div style="display:flex;gap:6px;align-items:center;margin-bottom:7px;">
       <input style="background:#090c12;border:1px solid #334155;color:#fbbf24;font-weight:700;padding:4px 6px;border-radius:4px;font-size:12px;flex:1;" value="${escHtml(n.name)}" onchange="updateProp('name', this.value)">
+      <button class="anim-btn" onclick="AnimStudio.open()">🎬动画工作台</button>
       <button onclick="duplicateSelected()">复制</button>
       <button class="danger" onclick="deleteSelected()">删除</button>
     </div>
@@ -1834,14 +1836,15 @@ function renderDock() {
     ${n.nodeType === 'Sprite2D' ? `
       <div class="clip-box">
         <div style="display:flex;justify-content:space-between;align-items:center;">
-          <span style="font-size:11px;font-weight:700;color:#38bdf8;">🎬 动画片段库 (名 / 起 / 止 / FPS / 帧事件)</span>
+          <span style="font-size:11px;font-weight:700;color:#38bdf8;">🎬 动画片段库 (旧版快捷列表)</span>
           <button style="padding:2px 6px;font-size:10px;" onclick="addClip()">+新增动画</button>
         </div>
-        ${clipsHtml || '<div style="font-size:10px;color:#64748b;margin-top:4px;">暂无片段，点击右上角添加如 idle / run / attack</div>'}
+        ${clipsHtml || '<div style="font-size:10px;color:#64748b;margin-top:4px;">建议使用上方 <b>🎬动画工作台</b> 编辑专业时间轴、洋葱皮与帧判定框</div>'}
       </div>` : ''}`;
 }
 
 function refreshAll() { renderTree(); renderDock(); draw(); }
 </script>
+<script src="anim_studio.js"></script>
 </body>
 </html>
