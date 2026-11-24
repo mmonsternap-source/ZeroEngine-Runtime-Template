@@ -1,4 +1,4 @@
-// ==================== ZeroEngine 左侧节点树与底部检查器/脚本/着色器/控制台面板 ====================
+// ==================== ZeroEngine 左侧节点树与底部检查器/脚本/着色器/控制台面板 (P0~P8) ====================
 
 function renderTree() {
   document.getElementById('treeList').innerHTML = nodes.map((n, i) => {
@@ -11,7 +11,7 @@ function renderTree() {
       : (n.layer === 'UI' ? '📱' : (n.billboard ? '🧍' : ''))))));
     const hasScript = (n.script && n.script.trim()) || (n.scriptFile && n.scriptFile.trim());
     const hasProAnim = Array.isArray(n.proClips) && n.proClips.length > 0;
-    const badges = (hasProAnim ? '🎬' : '') + (hasScript ? '📜' : '') + (n.shader && n.shader.trim() ? '✨' : '');
+    const badges = (hasProAnim ? '🎬' : '') + (n.normalMap ? '💎' : '') + (hasScript ? '📜' : '') + (n.shader && n.shader.trim() ? '✨' : '');
     return `<div class="tree-item ${i === selectedIndex ? 'active' : ''}" onclick="selectNode(${i})">${indent}${icon}${n.name} ${badges}</div>`;
   }).join('');
 }
@@ -48,9 +48,22 @@ function updateProp(key, val, isTyping = false) {
     nodes.forEach(item => { if (item.parent === oldName) item.parent = val; });
   }
   nodes[selectedIndex][key] = val;
-  if (key === 'texture' && val) preloadLocalImage(val);
-  autoSave(); renderTree(); draw();
-  if (key === 'texture' || key === 'hFrames' || key === 'vFrames' || key === 'bodyMode' || key === 'isHitbox' || key === 'slopeType' || key === 'scriptFile') renderDock();
+  if ((key === 'texture' || key === 'normalMap') && val) preloadLocalImage(val);
+  autoSave();
+  renderTree();
+  draw();
+  if (
+    key === 'texture' ||
+    key === 'normalMap' ||
+    key === 'hFrames' ||
+    key === 'vFrames' ||
+    key === 'bodyMode' ||
+    key === 'isHitbox' ||
+    key === 'slopeType' ||
+    key === 'scriptFile'
+  ) {
+    renderDock();
+  }
 }
 
 function updateColor(hex) {
@@ -59,14 +72,35 @@ function updateColor(hex) {
   clearTimeout(inputDebounceTimer);
   inputDebounceTimer = setTimeout(() => { inputDebounceTimer = null; }, 600);
   const c = hexToRgb(hex);
-  nodes[selectedIndex].r = c.r; nodes[selectedIndex].g = c.g; nodes[selectedIndex].b = c.b;
-  autoSave(); draw();
+  nodes[selectedIndex].r = c.r;
+  nodes[selectedIndex].g = c.g;
+  nodes[selectedIndex].b = c.b;
+  autoSave();
+  draw();
+}
+
+function applyDefaultShaderTemplate() {
+  if (selectedIndex < 0) return;
+  const tpl = [
+    'precision mediump float;',
+    'uniform sampler2D uTexture;',
+    'uniform vec4 uColor;',
+    'uniform float uTime;',
+    'varying vec2 vTexCoord;',
+    'void main() {',
+    '  vec4 c = texture2D(uTexture, vTexCoord) * uColor;',
+    '  gl_FragColor = c;',
+    '}'
+  ].join('\n');
+  updateProp('shader', tpl);
+  renderDock();
 }
 
 function insertCode(id, snip) {
   const ta = document.getElementById(id);
   if (!ta) return;
-  const s = ta.selectionStart, e = ta.selectionEnd;
+  const s = ta.selectionStart;
+  const e = ta.selectionEnd;
   ta.value = ta.value.substring(0, s) + snip + ta.value.substring(e);
   ta.selectionStart = ta.selectionEnd = s + snip.length;
   ta.focus();
@@ -74,21 +108,26 @@ function insertCode(id, snip) {
   if (id === 'dataEditor') { activeDataContent = ta.value; return; }
   recordUndoPoint();
   nodes[selectedIndex][id === 'shaderEditor' ? 'shader' : 'script'] = ta.value;
-  autoSave(); renderTree();
+  autoSave();
+  renderTree();
 }
 
-function refreshConsoleFromNative() { if (activeTab === 'console') renderDock(); }
+function refreshConsoleFromNative() {
+  if (activeTab === 'console') renderDock();
+}
 
 function buildTilePaletteHtml(n) {
   if (!n.texture || !imageCache[n.texture]) {
     return `<div style="font-size:10px;color:#64748b;margin-top:5px;">未绑定图集时将使用纯色方块绘制；选中本节点后点左上角 <b>+图</b> 可直接导入并绑定图集。</div>`;
   }
   const img = imageCache[n.texture];
-  const hf = Math.max(1, n.hFrames || 1), vf = Math.max(1, n.vFrames || 1);
+  const hf = Math.max(1, n.hFrames || 1);
+  const vf = Math.max(1, n.vFrames || 1);
   const total = Math.min(64, hf * vf);
   let cells = '';
   for (let i = 0; i < total; i++) {
-    const col = i % hf, row = Math.floor(i / hf);
+    const col = i % hf;
+    const row = Math.floor(i / hf);
     const posX = hf > 1 ? (col / (hf - 1)) * 100 : 0;
     const posY = vf > 1 ? (row / (vf - 1)) * 100 : 0;
     cells += `<div class="palette-cell ${brushFrame === i ? 'selected' : ''}"
@@ -103,15 +142,18 @@ function buildTilePaletteHtml(n) {
 function renderDock() {
   const body = document.getElementById('dockBody');
   if (activeTab === 'docs') {
-    refreshAudioList(); refreshScriptList(); refreshDataList();
+    refreshAudioList();
+    refreshScriptList();
+    refreshDataList();
     const audioStr = audioAssets.length ? audioAssets.join(', ') : '(暂无导入音频，点击左上角 +音 导入)';
     const scriptStr = scriptAssets.length ? scriptAssets.join(', ') : '(暂无外部模块，切到 脚本/数据 -> 模块库 新建)';
     const dataStr = dataAssets.length ? dataAssets.join(', ') : '(暂无数据表，切到 脚本/数据 -> 数据表 新建)';
     body.innerHTML = `<div class="doc-box">
 <b>📂 当前工程 Save 文件夹位置：</b> <button style="padding:2px 6px;font-size:10px;" onclick="chooseSaveFolderNative()">更改目录</button><br>
 <span style="color:#34d399;">${escHtml(getSaveFolderPath())}</span><br><br>
-<b>ZeroEngine SDK v1.4 商业版手册 (P0~P7)</b><br>
-• <b>P7 专业动画与状态机</b>: 点击顶部 <b>🎬动画</b> 打开工作台；脚本支持 self.setAnimFloat("speed", vx) / self.triggerAnim("attack") / self.isAnimCancelable()<br>
+<b>ZeroEngine SDK v1.4 商业版手册 (P0~P8)</b><br>
+• <b>P8 2D法线光照与SDF软阴影</b>: 勾选节点「SDF 投射软阴影」即生成实时软阴影；Engine.setSdfShadow(true, 10, 0.08) / self.setNormalMap("hero_n.png", 1.2, 0.4)<br>
+• <b>P7 专业动画与状态机</b>: 点击顶部 <b>🎬动画</b> 打开工作台；self.setAnimFloat("speed", vx) / self.triggerAnim("attack") / self.isAnimCancelable()<br>
 • <b>外部 JS 模块 (scripts/)</b>: ${escHtml(scriptStr)}<br>
 • <b>数值数据表 (data/)</b>: ${escHtml(dataStr)}<br>
 • <b>大世界状态标志 (P5)</b>: Engine.setFlag("door_1", true) / hasFlag("door_1") / saveWorldFlags("main")<br>
@@ -190,13 +232,14 @@ function renderDock() {
       : '';
     body.innerHTML = modeBar + mountHint + `
       <div class="script-toolbar">
+        <button onclick="insertCode('scriptEditor','Engine.setSdfShadow(true, 10, 0.08);\\n')">setSdfShadow</button>
+        <button onclick="insertCode('scriptEditor','self.setNormalMap(\\'hero_n.png\\', 1.2, 0.4);\\n')">setNormalMap</button>
         <button onclick="insertCode('scriptEditor','self.triggerAnim(\\'attack\\');\\n')">triggerAnim</button>
         <button onclick="insertCode('scriptEditor','self.setAnimFloat(\\'speed\\', Math.abs(self.vx));\\n')">setAnimFloat</button>
         <button onclick="insertCode('scriptEditor','Engine.setDebugDraw(true);\\n')">DebugDraw</button>
         <button onclick="insertCode('scriptEditor','var cfg = require(\\'combat_config.js\\');\\n')">require</button>
         <button onclick="insertCode('scriptEditor','var tbl = Engine.loadTable(\\'weapons.json\\');\\n')">loadTable</button>
         <button onclick="insertCode('scriptEditor','Engine.setFlag(\\'boss_1\\', true);\\n')">setFlag</button>
-        <button onclick="insertCode('scriptEditor','Engine.crossfadeBGM(\\'boss.mp3\\', 1.2, true, 0.8);\\n')">crossfadeBGM</button>
         <button onclick="insertCode('scriptEditor','var s = Engine.getStats();\\n')">getStats</button>
       </div>
       <textarea id="scriptEditor" class="code-box" spellcheck="false" oninput="updateProp('script', this.value, true)">${escHtml(selNode.script || '')}</textarea>`;
@@ -211,21 +254,22 @@ function renderDock() {
   const n = nodes[selectedIndex];
 
   if (activeTab === 'shader') {
-    const template = `precision mediump float;\nuniform sampler2D uTexture;\nuniform vec4 uColor;\nuniform float uTime;\nvarying vec2 vTexCoord;\nvoid main() {\n  vec4 c = texture2D(uTexture, vTexCoord) * uColor;\n  gl_FragColor = c;\n}`;
     body.innerHTML = `
       <div class="script-toolbar">
-        <button onclick="updateProp('shader', \`${template}\`);renderDock();">载入自定义GLSL模板</button>
+        <button onclick="applyDefaultShaderTemplate()">载入自定义GLSL模板</button>
         <button onclick="updateProp('shader', '');renderDock();">恢复默认实时光照Shader</button>
       </div>
-      <textarea id="shaderEditor" class="code-box" spellcheck="false" placeholder="留空则自动使用内置2.5D多光源Shader..." oninput="updateProp('shader', this.value, true)">${escHtml(n.shader || '')}</textarea>`;
+      <textarea id="shaderEditor" class="code-box" spellcheck="false" placeholder="留空则自动使用内置2.5D多光源/P8法线光照Shader..." oninput="updateProp('shader', this.value, true)">${escHtml(n.shader || '')}</textarea>`;
     return;
   }
 
   const parentOptions = [`<option value="">(根节点 Root)</option>`]
     .concat(nodes.filter((_, idx) => idx !== selectedIndex).map(p => `<option value="${escHtml(p.name)}" ${n.parent === p.name ? 'selected' : ''}>${escHtml(p.name)}</option>`)).join('');
-  const texNames = Array.from(new Set([...Object.keys(imageCache), ...(n.texture ? [n.texture] : [])]));
+  const texNames = Array.from(new Set([...Object.keys(imageCache), ...(n.texture ? [n.texture] : []), ...(n.normalMap ? [n.normalMap] : [])]));
   const texOptions = [`<option value="">(纯色方块)</option>`]
     .concat(texNames.map(t => `<option value="${escHtml(t)}" ${n.texture === t ? 'selected' : ''}>${escHtml(t)}</option>`)).join('');
+  const normalOptions = [`<option value="">(无 - 平面光照)</option>`]
+    .concat(texNames.map(t => `<option value="${escHtml(t)}" ${n.normalMap === t ? 'selected' : ''}>${escHtml(t)}</option>`)).join('');
   const scriptFileOptions = [`<option value="">(使用节点内嵌脚本)</option>`]
     .concat(Array.from(new Set([...scriptAssets, ...(n.scriptFile ? [n.scriptFile] : [])])).map(s => `<option value="${escHtml(s)}" ${n.scriptFile === s ? 'selected' : ''}>scripts/${escHtml(s)}</option>`)).join('');
 
@@ -321,6 +365,12 @@ function renderDock() {
       <div class="field"><label>挂载外部脚本 (scriptFile)</label><select onchange="updateProp('scriptFile', this.value)">${scriptFileOptions}</select></div>
       <div class="field row"><input type="checkbox" ${n.persistent ? 'checked' : ''} onchange="updateProp('persistent', this.checked)"><label>跨场景常驻 (Persistent)</label></div>
 
+      <div class="sec-title">💎 P8 2D法线材质与 SDF 软阴影</div>
+      <div class="field"><label>法线贴图 (normalMap)</label><select onchange="updateProp('normalMap', this.value)">${normalOptions}</select></div>
+      <div class="field"><label>法线凹凸强度 (0~2.5)</label><input type="number" step="0.1" min="0" max="2.5" value="${n.normalStrength ?? 1.0}" oninput="updateProp('normalStrength', +this.value, true)"></div>
+      <div class="field"><label>高光反射 (Specular)</label><input type="number" step="0.05" min="0" max="3" value="${n.specular ?? 0.25}" oninput="updateProp('specular', +this.value, true)"></div>
+      <div class="field row"><input type="checkbox" ${n.shadowCaster ? 'checked' : ''} onchange="updateProp('shadowCaster', this.checked)"><label>SDF 投射软阴影</label></div>
+
       <div class="sec-title">🖼️ UI 九宫格 (9-Slice) 与裁剪区 (P5)</div>
       <div class="field"><label>九宫格 左边距 (sliceLeft)</label><input type="number" min="0" value="${n.sliceLeft ?? 0}" oninput="updateProp('sliceLeft', Math.max(0,+this.value), true)"></div>
       <div class="field"><label>九宫格 右边距 (sliceRight)</label><input type="number" min="0" value="${n.sliceRight ?? 0}" oninput="updateProp('sliceRight', Math.max(0,+this.value), true)"></div>
@@ -357,7 +407,6 @@ function renderDock() {
       <div class="field"><label>攻击伤害值 (Damage)</label><input type="number" value="${n.damage ?? 10}" oninput="updateProp('damage', +this.value, true)"></div>
       ${physicsExtraHtml}
       <div class="field row"><input type="checkbox" ${n.billboard ? 'checked' : ''} onchange="updateProp('billboard', this.checked)"><label>HD-2D 立牌</label></div>
-      <div class="field row"><input type="checkbox" ${n.shadowCaster ? 'checked' : ''} onchange="updateProp('shadowCaster', this.checked)"><label>投射阴影</label></div>
       <div class="field row"><input type="checkbox" ${n.collider ? 'checked' : ''} onchange="updateProp('collider', this.checked)"><label>开启碰撞体</label></div>
       <div class="field row"><input type="checkbox" ${n.isTrigger ? 'checked' : ''} onchange="updateProp('isTrigger', this.checked)"><label>触发器 (不阻挡)</label></div>
       <div class="field row"><input type="checkbox" ${n.oneWay ? 'checked' : ''} onchange="updateProp('oneWay', this.checked)"><label>单向平台 (可上穿)</label></div>
