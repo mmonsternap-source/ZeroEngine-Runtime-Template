@@ -418,4 +418,22 @@ class ZeroPhysicsSystem(
         return res
     }
 
-    private fun intersectSegmentAABB(x1: Float, y1: Float, dx: Float, dy: Float, minX: Fl
+    private fun intersectSegmentAABB(x1: Float, y1: Float, dx: Float, dy: Float, minX: Float, minY: Float, maxX: Float, maxY: Float): Float? {
+        var t0 = 0f; var t1 = 1f
+        val p = floatArrayOf(-dx, dx, -dy, dy)
+        val q = floatArrayOf(x1 - minX, maxX - x1, y1 - minY, maxY - y1)
+        for (i in 0..3) {
+            if (abs(p[i]) < 1e-6f) { if (q[i] < 0f) return null }
+            else {
+                val r = q[i] / p[i]
+                if (p[i] < 0f) { if (r > t1) return null; if (r > t0) t0 = r }
+                else { if (r < t0) return null; if (r < t1) t1 = r }
+            }
+        }
+        return if (t0 <= t1) t0 else null
+    }
+
+    fun onMultiTouch(inputSystem: ZeroInputSystem, event: MotionEvent, w: Int, h: Int) {
+        inputSystem.onMultiTouch(event, w, h)
+    }
+}
