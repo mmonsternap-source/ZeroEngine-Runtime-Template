@@ -356,4 +356,92 @@
       n.blueprint.links = n.blueprint.links.filter(l => l.from !== id && l.to !== id);
       if (pendingPin && pendingPin.nodeId === id) pendingPin = null;
       autoSave(); renderGraph();
- 
+    },
+    updParam(id, k, val, isNum) {
+      const n = getCurNode(); if (!n) return;
+      const nd = n.blueprint.nodes.find(x => x.id === id);
+      if (nd) { nd.params[k] = isNum ? Number(val) : val; autoSave(); }
+    },
+    tapOut(nodeId, port) {
+      if (pendingPin && pendingPin.nodeId === nodeId && pendingPin.port === port) {
+        pendingPin = null;
+      } else {
+        pendingPin = { nodeId, port };
+        document.getElementById('bpHint').textContent = '已选中出口 ▶，现在点击目标卡片左侧「▷ 接入」完成连线';
+      }
+      renderGraph();
+    },
+    tapIn(nodeId) {
+      const n = getCurNode(); if (!n) return;
+      if (!pendingPin) {
+        // 未选中出口时，点击入口可断开该入口的旧连线
+        const before = n.blueprint.links.length;
+        n.blueprint.links = n.blueprint.links.filter(l => l.to !== nodeId);
+        if (n.blueprint.links.length !== before) { autoSave(); renderWires(); showToast('已断开入口连线'); }
+        return;
+      }
+      if (pendingPin.nodeId === nodeId) { pendingPin = null; renderGraph(); return; }
+      n.blueprint.links = n.blueprint.links.filter(l => !(l.from === pendingPin.nodeId && l.fromPort === pendingPin.port));
+      n.blueprint.links.push({ from: pendingPin.nodeId, fromPort: pendingPin.port, to: nodeId });
+      pendingPin = null;
+      document.getElementById('bpHint').textContent = '连线成功！拖动卡片可调整布局';
+      autoSave(); renderGraph();
+    },
+    loadPreset() {
+      const n = getCurNode(); if (!n) return;
+      panX = 16; panY = 16;
+      n.blueprint = {
+        nodes: [
+          { id: 'r1', type: 'ev_ready', x: 10, y: 10, params: {} },
+          { id: 'r2', type: 'act_gi', x: 215, y: 10, params: { amb: 0.14, gi: 1.05 } },
+          { id: 'r3', type: 'act_cloth', x: 420, y: 10, params: { width: 34, wind: -160 } },
+          { id: 'p1', type: 'ev_process', x: 10, y: 150, params: {} },
+          { id: 'p2', type: 'if_touch', x: 215, y: 150, params: {} },
+          { id: 'p3', type: 'act_move', x: 420, y: 120, params: { speed: 480 } },
+          { id: 'p4', type: 'act_stop', x: 420, y: 220, params: {} },
+          { id: 'p5', type: 'act_slide', x: 625, y: 165, params: {} },
+          { id: 't1', type: 'ev_trigger', x: 10, y: 310, params: {} },
+          { id: 't2', type: 'if_tag', x: 215, y: 310, params: { tag: 'coin' } },
+          { id: 't3', type: 'act_fx', x: 420, y: 310, params: { flash: 0.14, shake: 14, hitstop: 0.05 } },
+          { id: 't4', type: 'act_destroy', x: 625, y: 310, params: { target: 'other' } }
+        ],
+        links: [
+          { from: 'r1', fromPort: 'next', to: 'r2' }, { from: 'r2', fromPort: 'next', to: 'r3' },
+          { from: 'p1', fromPort: 'next', to: 'p2' }, { from: 'p2', fromPort: 'true', to: 'p3' },
+          { from: 'p2', fromPort: 'false', to: 'p4' }, { from: 'p3', fromPort: 'next', to: 'p5' },
+          { from: 'p4', fromPort: 'next', to: 'p5' },
+          { from: 't1', fromPort: 'next', to: 't2' }, { from: 't2', fromPort: 'true', to: 't3' },
+          { from: 't3', fromPort: 'next', to: 't4' }
+        ]
+      };
+      autoSave(); renderGraph();
+      showToast('✨ 已载入「暗夜GI+披风+触控移动+吃金币」蓝图');
+    },
+    clearGraph() {
+      const n = getCurNode(); if (!n) return;
+      n.blueprint = { nodes: [], links: [] };
+      pendingPin = null; autoSave(); renderGraph();
+    },
+    togglePreview() {
+      const n = getCurNode(); if (!n) return;
+      compiledPreview = !compiledPreview;
+      const box = document.getElementById('bpCodePreview');
+      box.style.display = compiledPreview ? 'flex' : 'none';
+      if (compiledPreview) document.getElementById('bpCodeText').textContent = compileBlueprint(n.blueprint) || '// (画布为空)';
+    },
+    applyAndClose() {
+      const n = getCurNode();
+      if (n && n.blueprint.nodes.length > 0) {
+        if (typeof recordUndoPoint === 'function') recordUndoPoint();
+        n.script = compileBlueprint(n.blueprint);
+        showToast('⚡ 蓝图已编译并写入 ' + n.name + ' 脚本');
+      }
+      bpOpen = false;
+      document.getElementById('bpOverlay').style.display = 'none';
+      if (typeof autoSave === 'function') autoSave();
+      if (typeof refreshAll === 'function') refreshAll();
+    }
+  };
+
+  window.addEventListener('resize', () => { if (bpOpen) renderWires(); });
+})();
