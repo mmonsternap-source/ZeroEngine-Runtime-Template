@@ -1163,7 +1163,12 @@ class ZeroEngineView(
         val vScale = 1f / vf
         val uOffset = (fi % hf) * uScale
         val vOffset = (fi / hf) * vScale
-        GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uUvRect"), uOffset, vOffset, uScale, vScale)
+        if (isWorld && camMode == "2.5D" && n.nodeType == "Label2D") {
+            // 2.5D 透视相机下 +X 朝左，翻转 U 轴防止世界空间文字左右镜像
+            GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uUvRect"), 1f, vOffset, -1f, vScale)
+        } else {
+            GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uUvRect"), uOffset, vOffset, uScale, vScale)
+        }
 
         val litFlag = if (isWorld) 1 else 0
         GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uEnableLight"), litFlag)
@@ -1609,10 +1614,11 @@ class ZeroEngineView(
         ScriptableObject.putProperty(engineApi, "spawn", jsFunc { args ->
             val cfg = args.getOrNull(0) as? Scriptable ?: return@jsFunc null
             val parentName = RhinoContext.toString(args.getOrNull(1) ?: "")
+            val rawLayer = getJsStr(cfg, "layer", "World")
             val spawned = GameNode(
                 name = getJsStr(cfg, "name", "Spawn_${System.nanoTime() % 10000}"),
                 nodeType = getJsStr(cfg, "nodeType", "Sprite2D"),
-                layer = getJsStr(cfg, "layer", "World"),
+                layer = if (rawLayer.startsWith("UI", ignoreCase = true)) "UI" else "World",
                 parent = parentName,
                 tag = getJsStr(cfg, "tag", "default"),
                 x = getJsFloat(cfg, "x", 0f),
@@ -2109,10 +2115,11 @@ class ZeroEngineView(
                     }
                 }
                 val defaultClipName = o.optString("defaultClip", "")
+                val rawLayer = o.optString("layer", "World")
                 val node = GameNode(
                     name = o.optString("name", "Node_$i"),
                     nodeType = o.optString("nodeType", "Sprite2D"),
-                    layer = o.optString("layer", "World"),
+                    layer = if (rawLayer.startsWith("UI", ignoreCase = true)) "UI" else "World",
                     parent = o.optString("parent", ""),
                     tag = o.optString("tag", "default"),
                     x = o.optDouble("x", 0.0).toFloat(),
