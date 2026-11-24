@@ -66,7 +66,17 @@ class MainActivity : Activity() {
             File(this, "scenes").mkdirs()
             File(this, "textures").mkdirs()
             File(this, "audio").mkdirs()
+            File(this, "scripts").mkdirs()
         }
+    }
+
+    private fun sanitizeScriptName(rawName: String): String {
+        val cleaned = rawName.trim()
+            .replace("\\", "/")
+            .substringAfterLast("/")
+            .replace(Regex("[^\\u4e00-\\u9fa5a-zA-Z0-9._-]"), "_")
+        if (cleaned.isEmpty() || cleaned == ".js") return ""
+        return if (cleaned.endsWith(".js", ignoreCase = true)) cleaned else "$cleaned.js"
     }
 
     private fun syncFileToSaf(projName: String, subDir: String, fileName: String, bytes: ByteArray, mimeType: String) {
@@ -119,7 +129,12 @@ class MainActivity : Activity() {
 
     private fun syncWholeProjectToSaf(projName: String) {
         val projDir = getProjectDir(projName)
-        listOf("scenes" to "application/json", "textures" to "image/png", "audio" to "audio/mpeg").forEach { (sub, mime) ->
+        listOf(
+            "scenes" to "application/json",
+            "textures" to "image/png",
+            "audio" to "audio/mpeg",
+            "scripts" to "text/javascript"
+        ).forEach { (sub, mime) ->
             File(projDir, sub).listFiles()?.filter { it.isFile }?.forEach { f ->
                 syncFileToSaf(projName, sub, f.name, f.readBytes(), mime)
             }
@@ -255,6 +270,49 @@ class MainActivity : Activity() {
             val dir = File(getProjectDir(), "audio")
             val list = dir.listFiles()?.filter { it.isFile }?.map { it.name }?.sorted() ?: emptyList()
             return JSONArray(list).toString()
+        }
+
+        // ==================== P4 外部脚本模块管理（scripts/*.js） ====================
+        @JavascriptInterface
+        fun listScripts(): String {
+            val dir = File(getProjectDir(), "scripts").apply { mkdirs() }
+            val list = dir.listFiles()?.filter { it.isFile && it.name.endsWith(".js", ignoreCase = true) }
+                ?.map { it.name }?.sorted() ?: emptyList()
+            return JSONArray(list).toString()
+        }
+
+        @JavascriptInterface
+        fun loadScriptFile(fileName: String): String {
+            val safeName = sanitizeScriptName(fileName)
+            if (safeName.isEmpty()) return ""
+            val f = File(getProjectDir(), "scripts/$safeName")
+            return if (f.exists()) f.readText() else ""
+        }
+
+        @JavascriptInterface
+        fun saveScriptFile(fileName: String, content: String): Boolean {
+            val safeName = sanitizeScriptName(fileName)
+            if (safeName.isEmpty()) return false
+            return try {
+                val dir = File(getProjectDir(), "scripts").apply { mkdirs() }
+                File(dir, safeName).writeText(content)
+                syncFileToSaf(currentProject, "scripts", safeName, content.toByteArray(Charsets.UTF_8), "text/javascript")
+                appendConsoleLog("[SCRIPT] 已保存模块: scripts/$safeName")
+                true
+            } catch (e: Exception) {
+                appendConsoleLog("[SCRIPT 错误] ${e.message}")
+                false
+            }
+        }
+
+        @JavascriptInterface
+        fun deleteScriptFile(fileName: String): Boolean {
+            val safeName = sanitizeScriptName(fileName)
+            if (safeName.isEmpty()) return false
+            val f = File(getProjectDir(), "scripts/$safeName")
+            val ok = f.exists() && f.delete()
+            if (ok) appendConsoleLog("[SCRIPT] 已删除模块: scripts/$safeName")
+            return ok
         }
 
         @JavascriptInterface
