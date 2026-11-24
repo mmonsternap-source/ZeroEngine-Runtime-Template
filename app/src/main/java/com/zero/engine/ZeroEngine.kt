@@ -37,14 +37,28 @@ import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.*
 
-// ==================== P3 独立子系统 1：音频引擎 ====================
+// ==================== P5 升级子系统 1：多轨混音音频引擎（BGM 交叉淡入淡出 + 独立音量总线 + 音高随机） ====================
 class ZeroAudioSystem(
     private val projectDir: File,
     private val onConsoleLog: (String) -> Unit
 ) {
-    private var bgmPlayer: MediaPlayer? = null
+    private val audioLock = Any()
+    private var activeBgm: MediaPlayer? = null
+    private var fadingBgm: MediaPlayer? = null
+    private var activeBgmFile: String = ""
+
+    private var masterVolume = 1.0f
+    private var bgmBusVolume = 0.85f
+    private var sfxBusVolume = 1.0f
+
+    private var activeTrackVol = 0.8f
+    private var activeTargetVol = 0.8f
+    private var fadingStartVol = 0.8f
+    private var fadeElapsed = 0f
+    private var fadeDuration = 0f
+
     private val soundPool: SoundPool = SoundPool.Builder()
-        .setMaxStreams(8)
+        .setMaxStreams(12)
         .setAudioAttributes(
             AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_GAME)
@@ -54,40 +68,136 @@ class ZeroAudioSystem(
         .build()
     private val sfxCache = ConcurrentHashMap<String, Int>()
 
+    fun setVolume(bus: String, volume: Float) = synchronized(audioLock) {
+        val v = volume.coerceIn(0f, 1f)
+        when (bus.lowercase()) {
+            "master" -> masterVolume = v
+            "bgm" -> bgmBusVolume = v
+            "sfx" -> sfxBusVolume = v
+        }
+        applyBgmVolumesLocked()
+    }
+
+    fun getVolume(bus: String): Float = synchronized(audioLock) {
+        when (bus.lowercase()) {
+            "master" -> masterVolume
+            "bgm" -> bgmBusVolume
+            "sfx" -> sfxBusVolume
+            else -> masterVolume
+        }
+    }
+
     fun playBGM(fileName: String, loop: Boolean, volume: Float) {
+        crossfadeBGM(fileName, 0f, loop, volume)
+    }
+
+    fun crossfadeBGM(fileName: String, durationSec: Float, loop: Boolean, volume: Float) = synchronized(audioLock) {
         try {
-            stopBGM()
             val file = File(File(projectDir, "audio"), fileName)
             if (!file.exists()) {
                 onConsoleLog("[AUDIO 警告] 找不到 BGM 文件: $fileName")
-                return
+                return@synchronized
             }
-            bgmPlayer = MediaPlayer().apply {
+            val targetVol = volume.coerceIn(0f, 1f)
+            if (activeBgm != null && activeBgmFile == fileName && durationSec > 0.01f) {
+                activeTargetVol = targetVol
+                fadeDuration = durationSec
+                fadeElapsed = 0f
+                return@synchronized
+            }
+
+            releasePlayerSafe(fadingBgm)
+            fadingBgm = null
+
+            val dur = max(0f, durationSec)
+            if (dur > 0.02f && activeBgm != null) {
+                fadingBgm = activeBgm
+                fadingStartVol = activeTrackVol
+                activeBgm = null
+            } else {
+                releasePlayerSafe(activeBgm)
+                activeBgm = null
+            }
+
+            val startVol = if (dur > 0.02f) 0f else targetVol
+            val mp = MediaPlayer().apply {
                 setDataSource(file.absolutePath)
                 isLooping = loop
-                setVolume(volume.coerceIn(0f, 1f), volume.coerceIn(0f, 1f))
+                val finalV = (startVol * bgmBusVolume * masterVolume).coerceIn(0f, 1f)
+                setVolume(finalV, finalV)
                 prepare()
                 start()
             }
+            activeBgm = mp
+            activeBgmFile = fileName
+            activeTrackVol = startVol
+            activeTargetVol = targetVol
+            fadeDuration = if (dur > 0.02f) dur else 0f
+            fadeElapsed = 0f
         } catch (e: Exception) {
             onConsoleLog("[AUDIO BGM 错误] ${e.message}")
         }
     }
 
-    fun stopBGM() {
-        try {
-            bgmPlayer?.stop()
-            bgmPlayer?.release()
-            bgmPlayer = null
-        } catch (_: Exception) {}
+    fun update(dt: Float) = synchronized(audioLock) {
+        if (fadeDuration <= 0f) return@synchronized
+        fadeElapsed += dt
+        val t = (fadeElapsed / fadeDuration).coerceIn(0f, 1f)
+        activeTrackVol = activeTargetVol * t
+        val fadeOutVol = fadingStartVol * (1f - t)
+        applyBgmVolumesLocked(fadeOutOverride = fadeOutVol)
+        if (t >= 1f) {
+            releasePlayerSafe(fadingBgm)
+            fadingBgm = null
+            fadeDuration = 0f
+            fadeElapsed = 0f
+            activeTrackVol = activeTargetVol
+            applyBgmVolumesLocked()
+        }
     }
 
-    fun playSFX(fileName: String, volume: Float) {
+    private fun applyBgmVolumesLocked(fadeOutOverride: Float? = null) {
+        val mainV = (activeTrackVol * bgmBusVolume * masterVolume).coerceIn(0f, 1f)
+        try { activeBgm?.setVolume(mainV, mainV) } catch (_: Exception) {}
+        if (fadingBgm != null && fadeOutOverride != null) {
+            val outV = (fadeOutOverride * bgmBusVolume * masterVolume).coerceIn(0f, 1f)
+            try { fadingBgm?.setVolume(outV, outV) } catch (_: Exception) {}
+        }
+    }
+
+    fun stopBGM(fadeOutSec: Float = 0f) = synchronized(audioLock) {
+        if (fadeOutSec > 0.02f && activeBgm != null) {
+            releasePlayerSafe(fadingBgm)
+            fadingBgm = activeBgm
+            fadingStartVol = activeTrackVol
+            activeBgm = null
+            activeBgmFile = ""
+            activeTrackVol = 0f
+            activeTargetVol = 0f
+            fadeDuration = fadeOutSec
+            fadeElapsed = 0f
+            return@synchronized
+        }
+        releasePlayerSafe(activeBgm)
+        releasePlayerSafe(fadingBgm)
+        activeBgm = null
+        fadingBgm = null
+        activeBgmFile = ""
+        fadeDuration = 0f
+    }
+
+    fun playSFX(fileName: String, volume: Float, pitchMin: Float = 1.0f, pitchMax: Float = 1.0f) {
         try {
-            val vol = volume.coerceIn(0f, 1f)
+            val finalVol = (volume.coerceIn(0f, 1f) * sfxBusVolume * masterVolume).coerceIn(0f, 1f)
+            val pMin = pitchMin.coerceIn(0.5f, 2.0f)
+            val pMax = pitchMax.coerceIn(0.5f, 2.0f)
+            val rate = if (pMax > pMin) {
+                (pMin + Math.random().toFloat() * (pMax - pMin)).coerceIn(0.5f, 2.0f)
+            } else pMin
+
             val cachedId = sfxCache[fileName]
             if (cachedId != null) {
-                soundPool.play(cachedId, vol, vol, 1, 0, 1.0f)
+                soundPool.play(cachedId, finalVol, finalVol, 1, 0, rate)
                 return
             }
             val file = File(File(projectDir, "audio"), fileName)
@@ -99,7 +209,7 @@ class ZeroAudioSystem(
             sfxCache[fileName] = sid
             soundPool.setOnLoadCompleteListener { sp, sampleId, status ->
                 if (status == 0 && sampleId == sid) {
-                    sp.play(sampleId, vol, vol, 1, 0, 1.0f)
+                    sp.play(sampleId, finalVol, finalVol, 1, 0, rate)
                 }
             }
         } catch (e: Exception) {
@@ -108,6 +218,8 @@ class ZeroAudioSystem(
     }
 
     fun playToneAsync(hz: Int, ms: Int) {
+        val volScale = (sfxBusVolume * masterVolume).coerceIn(0f, 1f)
+        if (volScale <= 0.001f) return
         Thread {
             try {
                 val sampleRate = 22050
@@ -115,7 +227,7 @@ class ZeroAudioSystem(
                 val buf = ShortArray(count)
                 for (i in 0 until count) {
                     val env = 1.0 - (i.toDouble() / count)
-                    buf[i] = (sin(2.0 * PI * i * hz / sampleRate) * 12000 * env).toInt().toShort()
+                    buf[i] = (sin(2.0 * PI * i * hz / sampleRate) * 12000 * env * volScale).toInt().toShort()
                 }
                 val track = AudioTrack.Builder()
                     .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_GAME).build())
@@ -137,11 +249,14 @@ class ZeroAudioSystem(
         }.start()
     }
 
+    private fun releasePlayerSafe(mp: MediaPlayer?) {
+        try { mp?.stop() } catch (_: Exception) {}
+        try { mp?.release() } catch (_: Exception) {}
+    }
+
     fun release() {
-        stopBGM()
-        try {
-            soundPool.release()
-        } catch (_: Exception) {}
+        stopBGM(0f)
+        try { soundPool.release() } catch (_: Exception) {}
     }
 }
 
@@ -374,11 +489,10 @@ class ZeroInputSystem {
     }
 }
 
-// ==================== P4 独立子系统 3：GPU 动态合批渲染器（Sprite + 粒子 + 阴影合批） ====================
+// ==================== P4 独立子系统 3：GPU 动态合批渲染器（Sprite + 9-Slice + 粒子 + 阴影合批） ====================
 class ZeroSpriteBatch(
     private val maxQuads: Int = 1024
 ) {
-    // 每顶点 10 floats: pos(3) + uv(2) + color(4) + flash(1) = 40 bytes
     private val floatsPerVertex = 10
     private val strideBytes = floatsPerVertex * 4
     private val vertexData = FloatArray(maxQuads * 4 * floatsPerVertex)
@@ -502,19 +616,18 @@ class ZeroSpriteBatch(
         val hy0 = m4 * 0.5f; val hy1 = m5 * 0.5f; val hy2 = m6 * 0.5f
 
         var p = floatPos
-        // Vertex 0: TL (-0.5, -0.5)
         vertexData[p++] = m12 - hx0 - hy0; vertexData[p++] = m13 - hx1 - hy1; vertexData[p++] = m14 - hx2 - hy2
         vertexData[p++] = u0; vertexData[p++] = v0
         vertexData[p++] = r; vertexData[p++] = g; vertexData[p++] = b; vertexData[p++] = a; vertexData[p++] = flash
-        // Vertex 1: TR (+0.5, -0.5)
+
         vertexData[p++] = m12 + hx0 - hy0; vertexData[p++] = m13 + hx1 - hy1; vertexData[p++] = m14 + hx2 - hy2
         vertexData[p++] = u1; vertexData[p++] = v0
         vertexData[p++] = r; vertexData[p++] = g; vertexData[p++] = b; vertexData[p++] = a; vertexData[p++] = flash
-        // Vertex 2: BR (+0.5, +0.5)
+
         vertexData[p++] = m12 + hx0 + hy0; vertexData[p++] = m13 + hx1 + hy1; vertexData[p++] = m14 + hx2 + hy2
         vertexData[p++] = u1; vertexData[p++] = v1
         vertexData[p++] = r; vertexData[p++] = g; vertexData[p++] = b; vertexData[p++] = a; vertexData[p++] = flash
-        // Vertex 3: BL (-0.5, +0.5)
+
         vertexData[p++] = m12 - hx0 + hy0; vertexData[p++] = m13 - hx1 + hy1; vertexData[p++] = m14 - hx2 + hy2
         vertexData[p++] = u0; vertexData[p++] = v1
         vertexData[p++] = r; vertexData[p++] = g; vertexData[p++] = b; vertexData[p++] = a; vertexData[p++] = flash
@@ -590,7 +703,7 @@ class ZeroSpriteBatch(
     }
 }
 
-// ==================== ZeroEngine 主视图与渲染/物理/脚本核心 ====================
+// ==================== ZeroEngine 主视图与渲染/物理/脚本/商业大世界核心（P5） ====================
 class ZeroEngineView(
     context: Context,
     private val projectDir: File,
@@ -690,6 +803,16 @@ class ZeroEngineView(
         var lightRadius: Float = 450f,
         var lightIntensity: Float = 1.4f,
         var shadowCaster: Boolean = false,
+        // P5：UI 九宫格（9-Slice）与矩形裁剪区（Scissor）
+        var sliceLeft: Float = 0f,
+        var sliceRight: Float = 0f,
+        var sliceTop: Float = 0f,
+        var sliceBottom: Float = 0f,
+        var clipChildren: Boolean = false,
+        var clipX: Float = 0f,
+        var clipY: Float = 0f,
+        var clipW: Float = 0f,
+        var clipH: Float = 0f,
         // 物理、平台、斜坡与独立碰撞体
         var collider: Boolean = false,
         var isTrigger: Boolean = false,
@@ -788,6 +911,15 @@ class ZeroEngineView(
                 "scaleY" -> n.scaleY.toDouble()
                 "parallaxX" -> n.parallaxX.toDouble()
                 "parallaxY" -> n.parallaxY.toDouble()
+                "sliceLeft" -> n.sliceLeft.toDouble()
+                "sliceRight" -> n.sliceRight.toDouble()
+                "sliceTop" -> n.sliceTop.toDouble()
+                "sliceBottom" -> n.sliceBottom.toDouble()
+                "clipChildren" -> n.clipChildren
+                "clipX" -> n.clipX.toDouble()
+                "clipY" -> n.clipY.toDouble()
+                "clipW" -> n.clipW.toDouble()
+                "clipH" -> n.clipH.toDouble()
                 "slopeType" -> n.slopeType
                 "colOffsetX" -> n.colOffsetX.toDouble()
                 "colOffsetY" -> n.colOffsetY.toDouble()
@@ -835,6 +967,15 @@ class ZeroEngineView(
                 "scaleY" -> n.scaleY = toJsFloat(value, n.scaleY)
                 "parallaxX" -> n.parallaxX = toJsFloat(value, n.parallaxX)
                 "parallaxY" -> n.parallaxY = toJsFloat(value, n.parallaxY)
+                "sliceLeft" -> n.sliceLeft = toJsFloat(value, n.sliceLeft)
+                "sliceRight" -> n.sliceRight = toJsFloat(value, n.sliceRight)
+                "sliceTop" -> n.sliceTop = toJsFloat(value, n.sliceTop)
+                "sliceBottom" -> n.sliceBottom = toJsFloat(value, n.sliceBottom)
+                "clipChildren" -> n.clipChildren = toJsBool(value, n.clipChildren)
+                "clipX" -> n.clipX = toJsFloat(value, n.clipX)
+                "clipY" -> n.clipY = toJsFloat(value, n.clipY)
+                "clipW" -> n.clipW = toJsFloat(value, n.clipW)
+                "clipH" -> n.clipH = toJsFloat(value, n.clipH)
                 "slopeType" -> n.slopeType = toJsStr(value, n.slopeType)
                 "colOffsetX" -> n.colOffsetX = toJsFloat(value, n.colOffsetX)
                 "colOffsetY" -> n.colOffsetY = toJsFloat(value, n.colOffsetY)
@@ -864,19 +1005,26 @@ class ZeroEngineView(
         }
     }
 
-    // P3 + P4：独立子系统实例
+    // 独立子系统实例
     private val audioSystem = ZeroAudioSystem(projectDir, onConsoleLog)
     private val inputSystem = ZeroInputSystem()
     private val spriteBatch = ZeroSpriteBatch(1024)
 
-    // P4：外部 JS 模块缓存（CommonJS require）
+    // P4：外部 JS 模块缓存
     private val moduleCache = mutableMapOf<String, Any?>()
+
+    // P5：大世界状态标志、数据表与多语言（i18n）
+    private val worldFlags = ConcurrentHashMap<String, Any>()
+    private val dataTableCache = mutableMapOf<String, Any?>()
+    private var currentLang = "zh"
+    private val i18nDicts = mutableMapOf<String, MutableMap<String, String>>()
 
     private val nodes = mutableListOf<GameNode>()
     private val pendingAdd = mutableListOf<GameNode>()
     private val pendingRemove = mutableSetOf<GameNode>()
     private val activeTweens = mutableListOf<TweenTask>()
     private val textureCache = ConcurrentHashMap<String, Int>()
+    private val textureSizes = ConcurrentHashMap<String, Pair<Int, Int>>()
     private val eventListeners = mutableMapOf<String, MutableList<Function>>()
 
     // P1：空间哈希网格与调试线框
@@ -1003,6 +1151,7 @@ class ZeroEngineView(
     private val vpMatrix = FloatArray(16)
     private val invVpMatrix = FloatArray(16)
     private val modelMatrix = FloatArray(16)
+    private val subModelMatrix = FloatArray(16)
     private val mvpMatrix = FloatArray(16)
     private val uiVpMatrix = FloatArray(16)
 
@@ -1074,6 +1223,7 @@ class ZeroEngineView(
                 val ids = textureCache.values.filter { it != 0 && it != whiteTexId }.toIntArray()
                 if (ids.isNotEmpty()) GLES20.glDeleteTextures(ids.size, ids, 0)
                 textureCache.clear()
+                textureSizes.clear()
             }
             if (textTextureCache.isNotEmpty()) {
                 val ids = textTextureCache.values.filter { it != 0 && it != whiteTexId }.toIntArray()
@@ -1084,7 +1234,7 @@ class ZeroEngineView(
         audioSystem.release()
     }
 
-    // ==================== P4：显存自动回收器（释放旧场景不再使用的贴图） ====================
+    // ==================== P4：显存自动回收器 ====================
     private fun unloadUnusedTextures(): Int {
         if (textureCache.isEmpty()) return 0
         val activeTexNames = HashSet<String>()
@@ -1105,7 +1255,10 @@ class ZeroEngineView(
         if (ids.isNotEmpty()) {
             GLES20.glDeleteTextures(ids.size, ids.toIntArray(), 0)
         }
-        for (k in toDelete) textureCache.remove(k)
+        for (k in toDelete) {
+            textureCache.remove(k)
+            textureSizes.remove(k)
+        }
         return toDelete.size
     }
 
@@ -1163,6 +1316,125 @@ class ZeroEngineView(
             onConsoleLog("[SCRIPT 警告] 找不到外部脚本文件: scripts/$norm")
             rawScript
         }
+    }
+
+    // ==================== P5：大世界状态标志（WorldFlags） ====================
+    private fun saveWorldFlagsToDisk(slotName: String): Boolean {
+        return try {
+            val safeName = slotName.replace(Regex("[^a-zA-Z0-9_\\-\\u4e00-\\u9fa5]"), "_").ifEmpty { "world_flags" }
+            val savesDir = File(projectDir, "saves").apply { mkdirs() }
+            val jsonObj = JSONObject()
+            for ((k, v) in worldFlags) {
+                jsonObj.put(k, v)
+            }
+            File(savesDir, "flags_$safeName.json").writeText(jsonObj.toString())
+            true
+        } catch (e: Exception) {
+            onConsoleLog("[FLAGS 存盘失败] ${e.message}")
+            false
+        }
+    }
+
+    private fun loadWorldFlagsFromDisk(slotName: String): Boolean {
+        return try {
+            val safeName = slotName.replace(Regex("[^a-zA-Z0-9_\\-\\u4e00-\\u9fa5]"), "_").ifEmpty { "world_flags" }
+            val file = File(File(projectDir, "saves"), "flags_$safeName.json")
+            if (!file.exists()) return false
+            val root = JSONObject(file.readText())
+            worldFlags.clear()
+            val keys = root.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                val v = root.opt(k)
+                if (v != null && v !== JSONObject.NULL) {
+                    worldFlags[k] = when (v) {
+                        is Number -> v.toDouble()
+                        else -> v
+                    }
+                }
+            }
+            true
+        } catch (e: Exception) {
+            onConsoleLog("[FLAGS 读盘失败] ${e.message}")
+            false
+        }
+    }
+
+    // ==================== P5：数值数据表（DataTable）与多语言（i18n） ====================
+    private fun parseJsonStringToJs(raw: String): Any? {
+        val reviver = object : Callable {
+            override fun call(
+                cx: RhinoContext?,
+                scope: Scriptable?,
+                thisObj: Scriptable?,
+                args: Array<out Any?>
+            ): Any? = args.getOrNull(1)
+        }
+        return NativeJSON.parse(rhino, globalScope, raw, reviver)
+    }
+
+    private fun loadDataTable(tableName: String): Any? {
+        val cleaned = tableName.trim().replace("\\", "/").removePrefix("./")
+        if (cleaned.isEmpty() || cleaned.contains("..")) return null
+        val norm = if (cleaned.endsWith(".json", ignoreCase = true)) cleaned else "$cleaned.json"
+        if (dataTableCache.containsKey(norm)) return dataTableCache[norm]
+
+        val dataDir = File(projectDir, "data").apply { mkdirs() }
+        val file = File(dataDir, norm)
+        if (!file.exists()) {
+            onConsoleLog("[DATA 警告] 找不到数据表文件: data/$norm")
+            return null
+        }
+        return try {
+            val parsed = parseJsonStringToJs(file.readText())
+            dataTableCache[norm] = parsed
+            parsed
+        } catch (e: Exception) {
+            onConsoleLog("[DATA 解析错误 @ $norm] ${e.message}")
+            null
+        }
+    }
+
+    private fun loadI18nFromDiskIfNeeded(lang: String) {
+        val dataDir = File(projectDir, "data")
+        if (!dataDir.exists()) return
+        val dict = i18nDicts.getOrPut(lang) { mutableMapOf() }
+        val perLangFile = File(dataDir, "i18n_$lang.json")
+        if (perLangFile.exists()) {
+            try {
+                val obj = JSONObject(perLangFile.readText())
+                val it = obj.keys()
+                while (it.hasNext()) {
+                    val k = it.next()
+                    dict[k] = obj.optString(k, "")
+                }
+            } catch (e: Exception) {
+                onConsoleLog("[I18N 解析错误 @ i18n_$lang.json] ${e.message}")
+            }
+            return
+        }
+        val combinedFile = File(dataDir, "i18n.json")
+        if (combinedFile.exists()) {
+            try {
+                val root = JSONObject(combinedFile.readText())
+                val sub = root.optJSONObject(lang) ?: return
+                val it = sub.keys()
+                while (it.hasNext()) {
+                    val k = it.next()
+                    dict[k] = sub.optString(k, "")
+                }
+            } catch (e: Exception) {
+                onConsoleLog("[I18N 解析错误 @ i18n.json] ${e.message}")
+            }
+        }
+    }
+
+    private fun translateKey(key: String, fallback: String): String {
+        val dict = i18nDicts[currentLang]
+        if (dict != null && dict.containsKey(key)) {
+            return dict[key] ?: fallback
+        }
+        return if (fallback.isNotEmpty()) fallback else key
     }
 
     private fun releaseNodeGpuResources(n: GameNode) {
@@ -1247,6 +1519,7 @@ class ZeroEngineView(
         spriteBatch.init(batchProgram)
 
         initRhinoVM()
+        loadI18nFromDiskIfNeeded(currentLang)
         loadSceneContent(sceneJson, groupName = "main", additive = false)
         lastFrameNs = System.nanoTime()
     }
@@ -1416,6 +1689,7 @@ class ZeroEngineView(
         smoothedFps = smoothedFps * 0.9f + instFps * 0.1f
 
         inputSystem.beginFrame()
+        audioSystem.update(rawDt)
         updateFadeTransition(rawDt)
 
         pendingSceneLoad?.let { nextSceneFile ->
@@ -1522,7 +1796,55 @@ class ZeroEngineView(
     private fun isBoxInView(minX: Float, maxX: Float, minY: Float, maxY: Float): Boolean =
         maxX >= viewMinX && minX <= viewMaxX && maxY >= viewMinY && minY <= viewMaxY
 
-    // ==================== P4：动态合批 + FBO 光照后处理多 Pass 管线 ====================
+    // ==================== P5：UI 裁剪区（Scissor Rect）解析 ====================
+    private fun resolveUiClipRect(n: GameNode): FloatArray? {
+        var left = Float.NEGATIVE_INFINITY
+        var top = Float.NEGATIVE_INFINITY
+        var right = Float.POSITIVE_INFINITY
+        var bottom = Float.POSITIVE_INFINITY
+        var hasClip = false
+
+        if (n.clipW > 0f && n.clipH > 0f) {
+            left = max(left, n.clipX)
+            top = max(top, n.clipY)
+            right = min(right, n.clipX + n.clipW)
+            bottom = min(bottom, n.clipY + n.clipH)
+            hasClip = true
+        }
+
+        var parentName = n.parent
+        var guard = 0
+        while (parentName.isNotEmpty() && guard < 16) {
+            guard++
+            val p = nodes.find { it.name == parentName } ?: break
+            if (p.clipChildren && p.layer == "UI") {
+                val pgt = getGlobalTransform(p)
+                val pw = abs(p.width * pgt.gSx)
+                val ph = abs(p.height * pgt.gSy)
+                left = max(left, pgt.gx - pw * 0.5f)
+                top = max(top, pgt.gy - ph * 0.5f)
+                right = min(right, pgt.gx + pw * 0.5f)
+                bottom = min(bottom, pgt.gy + ph * 0.5f)
+                hasClip = true
+            }
+            parentName = p.parent
+        }
+
+        return if (hasClip) floatArrayOf(left, top, right, bottom) else null
+    }
+
+    private fun applyUiScissor(rect: FloatArray) {
+        val sx = ((rect[0] / 1080f) * surfaceW).toInt().coerceIn(0, surfaceW)
+        val ex = ((rect[2] / 1080f) * surfaceW).toInt().coerceIn(0, surfaceW)
+        val sy = (((1920f - rect[3]) / 1920f) * surfaceH).toInt().coerceIn(0, surfaceH)
+        val ey = (((1920f - rect[1]) / 1920f) * surfaceH).toInt().coerceIn(0, surfaceH)
+        val sw = max(0, ex - sx)
+        val sh = max(0, ey - sy)
+        GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
+        GLES20.glScissor(sx, sy, sw, sh)
+    }
+
+    // ==================== 动态合批 + FBO 光照后处理 + UI 裁剪/九宫格 渲染管线 ====================
     private fun renderSceneFrame() {
         frameDrawCalls = 0
         frameCulled = 0
@@ -1538,7 +1860,6 @@ class ZeroEngineView(
         val useFbo = postFxEnabled && fboReady
 
         if (useFbo) {
-            // Pass 1：阴影 + 世界精灵合批渲染到 sceneFbo
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, sceneFbo)
             GLES20.glViewport(0, 0, surfaceW, surfaceH)
             GLES20.glClearColor(0.04f, 0.05f, 0.08f, 1f)
@@ -1572,17 +1893,14 @@ class ZeroEngineView(
             }
             spriteBatch.end()
 
-            // Pass 2：无限点光源累加到 lightFbo
             renderLightsToFbo(allLights)
 
-            // Pass 3：全屏后处理合成
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
             GLES20.glViewport(0, 0, surfaceW, surfaceH)
             GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1f)
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
             renderPostComposite()
 
-            // 自发光粒子合批叠加在光照合成之后
             if (particleNodes.isNotEmpty()) {
                 spriteBatch.begin(vpMatrix, false, ambientR, ambientG, ambientB, 0, null, null) { frameDrawCalls++ }
                 for (pNode in particleNodes) {
@@ -1591,7 +1909,6 @@ class ZeroEngineView(
                 spriteBatch.end()
             }
         } else {
-            // 降级直出模式（同样走动态合批）
             val lights = allLights.take(8)
             val lightPosArr = FloatArray(8 * 4)
             val lightColArr = FloatArray(8 * 4)
@@ -1650,12 +1967,17 @@ class ZeroEngineView(
             renderDebugOverlay(vpMatrix)
         }
 
-        // Pass 4：锐利 UI HUD 层（全程合批）
+        // Pass 4：锐利 UI HUD 层（支持 P5 九宫格合批 + Scissor 矩形裁剪）
         val emptyUiArr = FloatArray(4)
         val uiNodes = nodes.filter { it.visible && it.layer == "UI" }.sortedBy { it.zIndex }
         if (uiNodes.isNotEmpty()) {
             spriteBatch.begin(uiVpMatrix, false, 1f, 1f, 1f, 0, null, null) { frameDrawCalls++ }
             for (n in uiNodes) {
+                val clipRect = resolveUiClipRect(n)
+                if (clipRect != null) {
+                    spriteBatch.flush()
+                    applyUiScissor(clipRect)
+                }
                 when {
                     n.nodeType == "ParticleEmitter" -> submitParticlesToBatch(n, isWorld = false, fadeAlpha = 1f)
                     canBatchNode(n) -> submitNodeToBatch(n, isWorld = false)
@@ -1663,6 +1985,10 @@ class ZeroEngineView(
                         spriteBatch.flush()
                         renderNodeSingle(n, uiVpMatrix, isWorld = false, enableInlineLight = false, 0, emptyUiArr, emptyUiArr)
                     }
+                }
+                if (clipRect != null) {
+                    spriteBatch.flush()
+                    GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
                 }
             }
             spriteBatch.end()
@@ -1692,18 +2018,6 @@ class ZeroEngineView(
             }
         }
 
-        Matrix.setIdentityM(modelMatrix, 0)
-        Matrix.translateM(modelMatrix, 0, gt.gx, gt.gy, gt.gz)
-        if (isWorld && camMode == "2.5D" && n.billboard) {
-            Matrix.rotateM(modelMatrix, 0, -90f + camPitch * 0.65f, 1f, 0f, 0f)
-        } else if (isWorld && n.tiltX != 0f) {
-            Matrix.rotateM(modelMatrix, 0, n.tiltX, 1f, 0f, 0f)
-        }
-        if (gt.gRot != 0f) {
-            Matrix.rotateM(modelMatrix, 0, gt.gRot, 0f, 0f, 1f)
-        }
-        Matrix.scaleM(modelMatrix, 0, w, h, 1f)
-
         val hf = max(1, n.hFrames)
         val vf = max(1, n.vFrames)
         val fi = n.currentFrame.coerceIn(0, hf * vf - 1)
@@ -1725,7 +2039,89 @@ class ZeroEngineView(
             else -> whiteTexId
         }
         val flashVal = if (n.flashTimer > 0f) (n.flashTimer * 8f).coerceIn(0f, 1f) else 0f
-        spriteBatch.drawQuad(texId, modelMatrix, u0, v0, u1, v1, n.r, n.g, n.b, n.a, flashVal, additive = false)
+
+        val isNineSlice = n.nodeType == "Sprite2D" &&
+            (n.sliceLeft > 0f || n.sliceRight > 0f || n.sliceTop > 0f || n.sliceBottom > 0f)
+
+        if (!isNineSlice) {
+            Matrix.setIdentityM(modelMatrix, 0)
+            Matrix.translateM(modelMatrix, 0, gt.gx, gt.gy, gt.gz)
+            if (isWorld && camMode == "2.5D" && n.billboard) {
+                Matrix.rotateM(modelMatrix, 0, -90f + camPitch * 0.65f, 1f, 0f, 0f)
+            } else if (isWorld && n.tiltX != 0f) {
+                Matrix.rotateM(modelMatrix, 0, n.tiltX, 1f, 0f, 0f)
+            }
+            if (gt.gRot != 0f) {
+                Matrix.rotateM(modelMatrix, 0, gt.gRot, 0f, 0f, 1f)
+            }
+            Matrix.scaleM(modelMatrix, 0, w, h, 1f)
+            spriteBatch.drawQuad(texId, modelMatrix, u0, v0, u1, v1, n.r, n.g, n.b, n.a, flashVal, additive = false)
+            return
+        }
+
+        // P5：九宫格合批绘制（9 块共用同一贴图与批次，0 额外 DrawCall）
+        val absW = max(1f, abs(w))
+        val absH = max(1f, abs(h))
+        val signX = if (w < 0f) -1f else 1f
+        val signY = if (h < 0f) -1f else 1f
+        val texDim = textureSizes[n.texture]
+        val texW = max(1f, (texDim?.first ?: absW.toInt()).toFloat()) / hf
+        val texH = max(1f, (texDim?.second ?: absH.toInt()).toFloat()) / vf
+
+        val sl = max(0f, n.sliceLeft)
+        val sr = max(0f, n.sliceRight)
+        val st = max(0f, n.sliceTop)
+        val sb = max(0f, n.sliceBottom)
+
+        val scaleClampX = if (sl + sr > absW) absW / (sl + sr) else 1f
+        val scaleClampY = if (st + sb > absH) absH / (st + sb) else 1f
+        val lPx = sl * scaleClampX
+        val rPx = sr * scaleClampX
+        val tPx = st * scaleClampY
+        val bPx = sb * scaleClampY
+
+        val xs = floatArrayOf(-absW * 0.5f, -absW * 0.5f + lPx, absW * 0.5f - rPx, absW * 0.5f)
+        val ys = floatArrayOf(-absH * 0.5f, -absH * 0.5f + tPx, absH * 0.5f - bPx, absH * 0.5f)
+
+        val du = u1 - u0
+        val dv = v1 - v0
+        val uL = (sl / texW).coerceIn(0f, 0.49f) * du
+        val uR = (sr / texW).coerceIn(0f, 0.49f) * du
+        val vT = (st / texH).coerceIn(0f, 0.49f) * dv
+        val vB = (sb / texH).coerceIn(0f, 0.49f) * dv
+        val us = floatArrayOf(u0, u0 + uL, u1 - uR, u1)
+        val vs = floatArrayOf(v0, v0 + vT, v1 - vB, v1)
+
+        Matrix.setIdentityM(modelMatrix, 0)
+        Matrix.translateM(modelMatrix, 0, gt.gx, gt.gy, gt.gz)
+        if (isWorld && camMode == "2.5D" && n.billboard) {
+            Matrix.rotateM(modelMatrix, 0, -90f + camPitch * 0.65f, 1f, 0f, 0f)
+        } else if (isWorld && n.tiltX != 0f) {
+            Matrix.rotateM(modelMatrix, 0, n.tiltX, 1f, 0f, 0f)
+        }
+        if (gt.gRot != 0f) {
+            Matrix.rotateM(modelMatrix, 0, gt.gRot, 0f, 0f, 1f)
+        }
+
+        for (row in 0..2) {
+            val subH = ys[row + 1] - ys[row]
+            if (subH <= 0.01f) continue
+            val subCy = (ys[row] + ys[row + 1]) * 0.5f
+            for (col in 0..2) {
+                val subW = xs[col + 1] - xs[col]
+                if (subW <= 0.01f) continue
+                val subCx = (xs[col] + xs[col + 1]) * 0.5f
+
+                System.arraycopy(modelMatrix, 0, subModelMatrix, 0, 16)
+                Matrix.translateM(subModelMatrix, 0, subCx * signX, subCy * signY, 0f)
+                Matrix.scaleM(subModelMatrix, 0, subW * signX, subH * signY, 1f)
+                spriteBatch.drawQuad(
+                    texId, subModelMatrix,
+                    us[col], vs[row], us[col + 1], vs[row + 1],
+                    n.r, n.g, n.b, n.a, flashVal, additive = false
+                )
+            }
+        }
     }
 
     private fun submitDynamicShadowToBatch(caster: GameNode, lights: List<GameNode>) {
@@ -2411,7 +2807,6 @@ class ZeroEngineView(
         }
     }
 
-    // 单次绘制路径（仅用于斜坡三角形或挂载了自定义 GLSL Shader 的特殊节点）
     private fun renderNodeSingle(
         n: GameNode,
         activeVp: FloatArray,
@@ -2674,16 +3069,7 @@ class ZeroEngineView(
             val safeName = slotName.replace(Regex("[^a-zA-Z0-9_\\-\\u4e00-\\u9fa5]"), "_")
             val file = File(File(projectDir, "saves"), "$safeName.json")
             if (!file.exists()) return null
-            val raw = file.readText()
-            val reviver = object : Callable {
-                override fun call(
-                    cx: RhinoContext?,
-                    scope: Scriptable?,
-                    thisObj: Scriptable?,
-                    args: Array<out Any?>
-                ): Any? = args.getOrNull(1)
-            }
-            NativeJSON.parse(rhino, globalScope, raw, reviver)
+            parseJsonStringToJs(file.readText())
         } catch (e: Exception) {
             onConsoleLog("[LOAD 磁盘读档失败] ${e.message}")
             null
@@ -2700,14 +3086,14 @@ class ZeroEngineView(
         }
     }
 
-    // ==================== Rhino JS SDK 绑定 ====================
+    // ==================== Rhino JS SDK 绑定（P0～P5） ====================
     private fun initRhinoVM() {
         rhino = RhinoContext.enter()
         rhino.optimizationLevel = -1
         globalScope = rhino.initStandardObjects()
         moduleCache.clear()
+        dataTableCache.clear()
 
-        // P4：全局 require() 外部脚本模块化加载
         ScriptableObject.putProperty(globalScope, "require", jsFunc { args ->
             val path = RhinoContext.toString(args.getOrNull(0) ?: "")
             requireScriptModule(path)
@@ -2726,6 +3112,96 @@ class ZeroEngineView(
             moduleCache.clear()
             null
         })
+
+        // P5：大世界状态标志 API（WorldFlags）
+        ScriptableObject.putProperty(engineApi, "setFlag", jsFunc { args ->
+            val key = RhinoContext.toString(args.getOrNull(0) ?: "")
+            if (key.isEmpty()) return@jsFunc null
+            val rawVal = if (args.size >= 2) args[1] else true
+            val stored: Any = when (rawVal) {
+                is Boolean -> rawVal
+                is Number -> rawVal.toDouble()
+                null -> false
+                else -> RhinoContext.toString(rawVal)
+            }
+            worldFlags[key] = stored
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "getFlag", jsFunc { args ->
+            val key = RhinoContext.toString(args.getOrNull(0) ?: "")
+            val def = if (args.size >= 2) args[1] else false
+            worldFlags[key] ?: def
+        })
+        ScriptableObject.putProperty(engineApi, "hasFlag", jsFunc { args ->
+            val key = RhinoContext.toString(args.getOrNull(0) ?: "")
+            val v = worldFlags[key] ?: return@jsFunc false
+            when (v) {
+                is Boolean -> v
+                is Number -> v.toDouble() != 0.0
+                is String -> v.isNotEmpty()
+                else -> true
+            }
+        })
+        ScriptableObject.putProperty(engineApi, "clearFlag", jsFunc { args ->
+            val key = RhinoContext.toString(args.getOrNull(0) ?: "")
+            worldFlags.remove(key)
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "clearAllFlags", jsFunc {
+            worldFlags.clear()
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "getAllFlags", jsFunc {
+            val obj = rhino.newObject(globalScope)
+            for ((k, v) in worldFlags) ScriptableObject.putProperty(obj, k, v)
+            obj
+        })
+        ScriptableObject.putProperty(engineApi, "saveWorldFlags", jsFunc { args ->
+            val slot = RhinoContext.toString(args.getOrNull(0) ?: "world_flags")
+            saveWorldFlagsToDisk(slot)
+        })
+        ScriptableObject.putProperty(engineApi, "loadWorldFlags", jsFunc { args ->
+            val slot = RhinoContext.toString(args.getOrNull(0) ?: "world_flags")
+            loadWorldFlagsFromDisk(slot)
+        })
+
+        // P5：数据表与多语言 API（DataTable / i18n）
+        ScriptableObject.putProperty(engineApi, "loadTable", jsFunc { args ->
+            val name = RhinoContext.toString(args.getOrNull(0) ?: "")
+            loadDataTable(name)
+        })
+        ScriptableObject.putProperty(engineApi, "reloadTables", jsFunc {
+            dataTableCache.clear()
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "setLanguage", jsFunc { args ->
+            val lang = RhinoContext.toString(args.getOrNull(0) ?: "zh").trim().lowercase()
+            if (lang.isNotEmpty()) {
+                currentLang = lang
+                loadI18nFromDiskIfNeeded(lang)
+            }
+            currentLang
+        })
+        ScriptableObject.putProperty(engineApi, "getLanguage", jsFunc { currentLang })
+        ScriptableObject.putProperty(engineApi, "setI18nDict", jsFunc { args ->
+            val lang = RhinoContext.toString(args.getOrNull(0) ?: "zh").trim().lowercase()
+            val obj = args.getOrNull(1) as? Scriptable ?: return@jsFunc null
+            val dict = i18nDicts.getOrPut(lang) { mutableMapOf() }
+            for (id in obj.ids) {
+                val k = id.toString()
+                val v = ScriptableObject.getProperty(obj, k)
+                if (v != null && v !== Scriptable.NOT_FOUND) {
+                    dict[k] = RhinoContext.toString(v)
+                }
+            }
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "t", jsFunc { args ->
+            val key = RhinoContext.toString(args.getOrNull(0) ?: "")
+            val fallback = if (args.size >= 2 && args[1] != null) RhinoContext.toString(args[1]) else ""
+            translateKey(key, fallback)
+        })
+
         ScriptableObject.putProperty(engineApi, "setDebugDraw", jsFunc { args ->
             debugDrawEnabled = (args.getOrNull(0) as? Boolean) ?: false
             null
@@ -2796,6 +3272,9 @@ class ZeroEngineView(
             ScriptableObject.putProperty(obj, "spatialCells", spatialGrid.size)
             ScriptableObject.putProperty(obj, "cachedScenes", preloadedSceneCache.size)
             ScriptableObject.putProperty(obj, "modules", moduleCache.size)
+            ScriptableObject.putProperty(obj, "flags", worldFlags.size)
+            ScriptableObject.putProperty(obj, "tables", dataTableCache.size)
+            ScriptableObject.putProperty(obj, "lang", currentLang)
             ScriptableObject.putProperty(obj, "fbo", postFxEnabled && fboReady)
             ScriptableObject.putProperty(obj, "touches", inputSystem.getTouchCount())
             ScriptableObject.putProperty(obj, "textures", textureCache.size)
@@ -2914,6 +3393,7 @@ class ZeroEngineView(
             activeTweens.add(TweenTask(n, prop, startVal, toVal, dur, ease))
             null
         })
+        // P5：多轨音频与独立音量总线
         ScriptableObject.putProperty(engineApi, "playTone", jsFunc { args ->
             val hz = (args.getOrNull(0) as? Number)?.toInt() ?: 440
             val ms = (args.getOrNull(1) as? Number)?.toInt() ?: 80
@@ -2927,15 +3407,36 @@ class ZeroEngineView(
             if (fileName.isNotEmpty()) audioSystem.playBGM(fileName, loop, vol)
             null
         })
-        ScriptableObject.putProperty(engineApi, "stopBGM", jsFunc {
-            audioSystem.stopBGM()
+        ScriptableObject.putProperty(engineApi, "crossfadeBGM", jsFunc { args ->
+            val fileName = RhinoContext.toString(args.getOrNull(0) ?: "")
+            val dur = (args.getOrNull(1) as? Number)?.toFloat() ?: 1.2f
+            val loop = (args.getOrNull(2) as? Boolean) ?: true
+            val vol = (args.getOrNull(3) as? Number)?.toFloat() ?: 0.8f
+            if (fileName.isNotEmpty()) audioSystem.crossfadeBGM(fileName, dur, loop, vol)
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "stopBGM", jsFunc { args ->
+            val fadeOut = (args.getOrNull(0) as? Number)?.toFloat() ?: 0f
+            audioSystem.stopBGM(fadeOut)
             null
         })
         ScriptableObject.putProperty(engineApi, "playSFX", jsFunc { args ->
             val fileName = RhinoContext.toString(args.getOrNull(0) ?: "")
             val vol = (args.getOrNull(1) as? Number)?.toFloat() ?: 1.0f
-            if (fileName.isNotEmpty()) audioSystem.playSFX(fileName, vol)
+            val pitchMin = (args.getOrNull(2) as? Number)?.toFloat() ?: 1.0f
+            val pitchMax = (args.getOrNull(3) as? Number)?.toFloat() ?: pitchMin
+            if (fileName.isNotEmpty()) audioSystem.playSFX(fileName, vol, pitchMin, pitchMax)
             null
+        })
+        ScriptableObject.putProperty(engineApi, "setVolume", jsFunc { args ->
+            val bus = RhinoContext.toString(args.getOrNull(0) ?: "master")
+            val vol = (args.getOrNull(1) as? Number)?.toFloat() ?: 1.0f
+            audioSystem.setVolume(bus, vol)
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "getVolume", jsFunc { args ->
+            val bus = RhinoContext.toString(args.getOrNull(0) ?: "master")
+            audioSystem.getVolume(bus).toDouble()
         })
         ScriptableObject.putProperty(engineApi, "moveAndSlide", jsFunc { args ->
             val selfObj = args.getOrNull(0) as? Scriptable ?: return@jsFunc null
@@ -2986,10 +3487,23 @@ class ZeroEngineView(
                 height = getJsFloat(cfg, "height", 64f),
                 tiltX = getJsFloat(cfg, "tiltX", 0f),
                 billboard = getJsBool(cfg, "billboard", false),
+                zIndex = getJsInt(cfg, "zIndex", 0),
+                texture = getJsStr(cfg, "texture", ""),
+                text = getJsStr(cfg, "text", ""),
+                fontSize = getJsFloat(cfg, "fontSize", 44f),
                 r = getJsFloat(cfg, "r", 1f),
                 g = getJsFloat(cfg, "g", 1f),
                 b = getJsFloat(cfg, "b", 1f),
                 a = getJsFloat(cfg, "a", 1f),
+                sliceLeft = getJsFloat(cfg, "sliceLeft", 0f),
+                sliceRight = getJsFloat(cfg, "sliceRight", 0f),
+                sliceTop = getJsFloat(cfg, "sliceTop", 0f),
+                sliceBottom = getJsFloat(cfg, "sliceBottom", 0f),
+                clipChildren = getJsBool(cfg, "clipChildren", false),
+                clipX = getJsFloat(cfg, "clipX", 0f),
+                clipY = getJsFloat(cfg, "clipY", 0f),
+                clipW = getJsFloat(cfg, "clipW", 0f),
+                clipH = getJsFloat(cfg, "clipH", 0f),
                 collider = getJsBool(cfg, "collider", false),
                 isTrigger = getJsBool(cfg, "isTrigger", false),
                 oneWay = getJsBool(cfg, "oneWay", false),
@@ -3141,6 +3655,20 @@ class ZeroEngineView(
         }
         n.jsObj = selfObj
 
+        ScriptableObject.putProperty(selfObj, "setNineSlice", jsFunc { args ->
+            n.sliceLeft = (args.getOrNull(0) as? Number)?.toFloat() ?: 0f
+            n.sliceRight = (args.getOrNull(1) as? Number)?.toFloat() ?: n.sliceLeft
+            n.sliceTop = (args.getOrNull(2) as? Number)?.toFloat() ?: n.sliceLeft
+            n.sliceBottom = (args.getOrNull(3) as? Number)?.toFloat() ?: n.sliceTop
+            null
+        })
+        ScriptableObject.putProperty(selfObj, "setClipRect", jsFunc { args ->
+            n.clipX = (args.getOrNull(0) as? Number)?.toFloat() ?: 0f
+            n.clipY = (args.getOrNull(1) as? Number)?.toFloat() ?: 0f
+            n.clipW = (args.getOrNull(2) as? Number)?.toFloat() ?: 0f
+            n.clipH = (args.getOrNull(3) as? Number)?.toFloat() ?: 0f
+            null
+        })
         ScriptableObject.putProperty(selfObj, "jump", jsFunc { args ->
             val jumpForce = (args.getOrNull(0) as? Number)?.toFloat() ?: 920f
             if (n.isGrounded || n.coyoteTimer > 0f) {
@@ -3599,6 +4127,15 @@ class ZeroEngineView(
                     lightRadius = o.optDouble("lightRadius", 450.0).toFloat(),
                     lightIntensity = o.optDouble("lightIntensity", 1.4).toFloat(),
                     shadowCaster = o.optBoolean("shadowCaster", false),
+                    sliceLeft = o.optDouble("sliceLeft", 0.0).toFloat(),
+                    sliceRight = o.optDouble("sliceRight", 0.0).toFloat(),
+                    sliceTop = o.optDouble("sliceTop", 0.0).toFloat(),
+                    sliceBottom = o.optDouble("sliceBottom", 0.0).toFloat(),
+                    clipChildren = o.optBoolean("clipChildren", false),
+                    clipX = o.optDouble("clipX", 0.0).toFloat(),
+                    clipY = o.optDouble("clipY", 0.0).toFloat(),
+                    clipW = o.optDouble("clipW", 0.0).toFloat(),
+                    clipH = o.optDouble("clipH", 0.0).toFloat(),
                     collider = o.optBoolean("collider", false),
                     isTrigger = o.optBoolean("isTrigger", false),
                     oneWay = o.optBoolean("oneWay", false),
@@ -3657,6 +4194,7 @@ class ZeroEngineView(
         val file = File(File(projectDir, "textures"), fileName)
         if (!file.exists()) return whiteTexId
         val bmp = BitmapFactory.decodeFile(file.absolutePath) ?: return whiteTexId
+        textureSizes[fileName] = bmp.width to bmp.height
         val id = uploadBitmapToGL(bmp)
         bmp.recycle()
         textureCache[fileName] = id
@@ -3752,7 +4290,10 @@ class ZeroEngineView(
             "name", "tag", "sceneGroup", "persistent",
             "x", "y", "z", "vx", "vy", "vz",
             "width", "height", "rotation", "tiltX", "scaleX", "scaleY",
-            "parallaxX", "parallaxY", "slopeType",
+            "parallaxX", "parallaxY",
+            "sliceLeft", "sliceRight", "sliceTop", "sliceBottom",
+            "clipChildren", "clipX", "clipY", "clipW", "clipH",
+            "slopeType",
             "colOffsetX", "colOffsetY", "colWidth", "colHeight", "colLayer", "colMask",
             "bodyMode", "gravity", "fallMultiplier", "maxJumps", "isGrounded",
             "isHitbox", "isHurtbox", "damage", "invulnTimer",
