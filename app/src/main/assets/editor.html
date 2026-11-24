@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>ZeroEngine Pro IDE v1.4</title>
+<title>ZeroEngine Pro IDE v1.8</title>
 <link rel="stylesheet" href="editor.css">
 </head>
 <body>
@@ -24,6 +24,7 @@
     <button onclick="resetView()">居中</button>
     <button class="export-btn" onclick="exportBundle()">📦导出</button>
     <button class="anim-btn" onclick="AnimStudio.open()">🎬动画</button>
+    <button style="background:#4f46e5;border-color:#4338ca;color:#fff;" onclick="BlueprintStudio.open()">🧩蓝图</button>
     <button class="play" onclick="playScene()">▶ 运行</button>
   </div>
 </header>
@@ -44,7 +45,7 @@
   </div>
   <div class="viewport" id="vpBox">
     <canvas id="stage"></canvas>
-    <div class="vp-hud" id="vpHud">v1.4 | 2.5D</div>
+    <div class="vp-hud" id="vpHud">v1.8 | 2.5D</div>
   </div>
 </div>
 
@@ -111,5 +112,6 @@
 <script src="editor_viewport.js"></script>
 <script src="editor_dock.js"></script>
 <script src="anim_studio.js"></script>
+<script src="blueprint_studio.js"></script>
 </body>
 </html>
