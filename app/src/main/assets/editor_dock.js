@@ -1,4 +1,4 @@
-// ==================== ZeroEngine 左侧节点树与底部检查器/脚本/着色器/控制台面板 (P0~P10) ====================
+// ==================== ZeroEngine 左侧节点树与底部检查器/脚本/着色器/控制台面板 (P0~P11) ====================
 
 function renderTree() {
   document.getElementById('treeList').innerHTML = nodes.map((n, i) => {
@@ -151,7 +151,8 @@ function renderDock() {
     body.innerHTML = `<div class="doc-box">
 <b>📂 当前工程 Save 文件夹位置：</b> <button style="padding:2px 6px;font-size:10px;" onclick="chooseSaveFolderNative()">更改目录</button><br>
 <span style="color:#34d399;">${escHtml(getSaveFolderPath())}</span><br><br>
-<b>ZeroEngine SDK v1.6 商业版手册 (P0~P10)</b><br>
+<b>ZeroEngine SDK v1.7 商业版手册 (P0~P11)</b><br>
+• <b>P11 2D实时全局光照(GI)</b>: 默认开启彩色漫反射光线反弹；Engine.setGI({enabled:true, intensity:0.85, radius:0.18, saturation:1.5})<br>
 • <b>P10 2D骨骼蒙皮与网格变形</b>: self.createSkinnedMesh(8, 12) / self.bindBones(["Spine","Head"], 2.2) / self.setMeshWave(8, 2, 6, 4)<br>
 • <b>P9 实时布料与骨骼IK</b>: self.attachCloth({segments:10, widthStart:36, widthEnd:8, r:0.9, g:0.15, b:0.2}) / Engine.setGlobalWind(-160, 0) / Engine.solveIK("Arm","Forearm", tx, ty, 70, 65, false)<br>
 • <b>P8 2D法线光照与SDF软阴影</b>: 勾选「SDF 投射软阴影」即生成实时软阴影；Engine.setSdfShadow(true, 10, 0.08) / self.setNormalMap("hero_n.png", 1.2, 0.4)<br>
@@ -234,6 +235,7 @@ function renderDock() {
       : '';
     body.innerHTML = modeBar + mountHint + `
       <div class="script-toolbar">
+        <button onclick="insertCode('scriptEditor','Engine.setGI({enabled:true, intensity:0.85, radius:0.18, saturation:1.5});\\n')">setGI</button>
         <button onclick="insertCode('scriptEditor','self.createSkinnedMesh(8, 12);\\nself.setMeshWave(8, 2, 6, 4);\\n')">createSkinnedMesh</button>
         <button onclick="insertCode('scriptEditor','self.bindBones([\\'Spine\\', \\'Head\\'], 2.2);\\n')">bindBones</button>
         <button onclick="insertCode('scriptEditor','self.attachCloth({offsetY:-30,segments:10,segmentLen:18,widthStart:34,widthEnd:8,r:0.9,g:0.15,b:0.22,windX:-160});\\n')">attachCloth</button>
