@@ -77,6 +77,22 @@ class ZeroEngineView(
         var elapsed: Float = 0f
     )
 
+    data class DebugRay(
+        val x1: Float,
+        val y1: Float,
+        val x2: Float,
+        val y2: Float,
+        val hit: Boolean,
+        var ttl: Float = 0.16f
+    )
+
+    data class ColliderBounds(
+        val cx: Float,
+        val cy: Float,
+        val hw: Float,
+        val hh: Float
+    )
+
     data class GameNode(
         var name: String,
         var nodeType: String = "Sprite2D", // Sprite2D | Label2D | PointLight | ParticleEmitter | TileMap
@@ -109,11 +125,17 @@ class ZeroEngineView(
         var lightRadius: Float = 450f,
         var lightIntensity: Float = 1.4f,
         var shadowCaster: Boolean = false,
-        // 通用物理、平台与斜坡参数
+        // 通用物理、平台、斜坡与 P1 独立碰撞体参数
         var collider: Boolean = false,
         var isTrigger: Boolean = false,
         var oneWay: Boolean = false,
         var slopeType: String = "none",     // none | left_up (/) | right_up (\)
+        var colOffsetX: Float = 0f,
+        var colOffsetY: Float = 0f,
+        var colWidth: Float = 0f,           // <= 0 时自动使用 node.width
+        var colHeight: Float = 0f,          // <= 0 时自动使用 node.height
+        var colLayer: Int = 1,              // 碰撞所属层位掩码
+        var colMask: Int = 0xFFFF,          // 碰撞目标层位掩码
         var bodyMode: String = "kinematic", // kinematic | platformer | rigid
         var gravity: Float = 2200f,
         var fallMultiplier: Float = 1.55f,
@@ -144,9 +166,10 @@ class ZeroEngineView(
         var animTimer: Float = 0f,
         var currentClipName: String = "",
         val clips: MutableMap<String, AnimClip> = mutableMapOf(),
-        // TileMap 稀疏瓦片数据 + P0 静态 VBO 缓存
+        // TileMap 稀疏瓦片数据 + P0 VBO 缓存 + P1 O(1) 哈希查表
         var tileSize: Float = 90f,
         val tiles: MutableList<TileCell> = mutableListOf(),
+        val tileLookup: HashMap<Long, TileCell> = HashMap(),
         var tileVboId: Int = 0,
         var tileVertexCount: Int = 0,
         var tileDirty: Boolean = true,
@@ -171,7 +194,7 @@ class ZeroEngineView(
         var customProgram: Int = 0
     )
 
-    // ==================== P0：零拷贝 JS 属性代理（彻底消灭 syncToJs/syncFromJs） ====================
+    // ==================== P0 + P1：零拷贝 JS 属性代理 ====================
     private inner class GameNodeJsProxy(val n: GameNode) : ScriptableObject() {
         override fun getClassName() = "GameNode"
 
@@ -199,6 +222,12 @@ class ZeroEngineView(
                 "parallaxX" -> n.parallaxX.toDouble()
                 "parallaxY" -> n.parallaxY.toDouble()
                 "slopeType" -> n.slopeType
+                "colOffsetX" -> n.colOffsetX.toDouble()
+                "colOffsetY" -> n.colOffsetY.toDouble()
+                "colWidth" -> n.colWidth.toDouble()
+                "colHeight" -> n.colHeight.toDouble()
+                "colLayer" -> n.colLayer
+                "colMask" -> n.colMask
                 "bodyMode" -> n.bodyMode
                 "gravity" -> n.gravity.toDouble()
                 "fallMultiplier" -> n.fallMultiplier.toDouble()
@@ -239,6 +268,12 @@ class ZeroEngineView(
                 "parallaxX" -> n.parallaxX = toJsFloat(value, n.parallaxX)
                 "parallaxY" -> n.parallaxY = toJsFloat(value, n.parallaxY)
                 "slopeType" -> n.slopeType = toJsStr(value, n.slopeType)
+                "colOffsetX" -> n.colOffsetX = toJsFloat(value, n.colOffsetX)
+                "colOffsetY" -> n.colOffsetY = toJsFloat(value, n.colOffsetY)
+                "colWidth" -> n.colWidth = toJsFloat(value, n.colWidth)
+                "colHeight" -> n.colHeight = toJsFloat(value, n.colHeight)
+                "colLayer" -> n.colLayer = toJsInt(value, n.colLayer)
+                "colMask" -> n.colMask = toJsInt(value, n.colMask)
                 "bodyMode" -> n.bodyMode = toJsStr(value, n.bodyMode)
                 "gravity" -> n.gravity = toJsFloat(value, n.gravity)
                 "fallMultiplier" -> n.fallMultiplier = toJsFloat(value, n.fallMultiplier)
@@ -255,7 +290,7 @@ class ZeroEngineView(
                 "text" -> n.text = toJsStr(value, n.text)
                 "lightRadius" -> n.lightRadius = toJsFloat(value, n.lightRadius)
                 "lightIntensity" -> n.lightIntensity = toJsFloat(value, n.lightIntensity)
-                "name", "isGrounded", "currentClip" -> Unit // 引擎只读属性
+                "name", "isGrounded", "currentClip" -> Unit
                 else -> super.put(name, start, value)
             }
         }
@@ -268,7 +303,19 @@ class ZeroEngineView(
     private val textureCache = ConcurrentHashMap<String, Int>()
     private val eventListeners = mutableMapOf<String, MutableList<Function>>()
 
-    // P0：有界 LRU 文字纹理缓存（超出上限自动释放 GPU 显存，杜绝内存泄漏）
+    // ==================== P1：空间哈希网格与调试线框状态 ====================
+    private val spatialCellSize = 256f
+    private val spatialGrid = HashMap<Long, MutableList<GameNode>>(256)
+    private val activeTileMaps = mutableListOf<GameNode>()
+    private val queryCandidates = LinkedHashSet<GameNode>(32)
+
+    private var debugDrawEnabled = false
+    private val debugRays = mutableListOf<DebugRay>()
+    private val debugVertBuf: FloatBuffer = ByteBuffer.allocateDirect(4 * 5 * 4)
+        .order(ByteOrder.nativeOrder()).asFloatBuffer()
+    private val identityMatrix = FloatArray(16).apply { Matrix.setIdentityM(this, 0) }
+
+    // P0：有界 LRU 文字纹理缓存
     private val maxTextTextures = 64
     private val textTextureCache = object : LinkedHashMap<String, Int>(64, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Int>?): Boolean {
@@ -300,7 +347,7 @@ class ZeroEngineView(
         .build()
     private val sfxCache = ConcurrentHashMap<String, Int>()
 
-    // 2D / 2.5D 摄像机状态与 P0 视锥边界
+    // 2D / 2.5D 摄像机状态与视锥边界
     private var camMode = "2.5D"
     private var camX = 540f
     private var camY = 960f
@@ -326,7 +373,7 @@ class ZeroEngineView(
     private var viewMinY = -99999f
     private var viewMaxY = 99999f
 
-    // P0：实时性能统计（供 Engine.getStats() 查询）
+    // 实时性能统计
     private var smoothedFps = 60f
     private var frameDrawCalls = 0
     private var lastFrameDrawCalls = 0
@@ -409,6 +456,9 @@ class ZeroEngineView(
         renderMode = RENDERMODE_CONTINUOUSLY
     }
 
+    private fun packGridKey(gx: Int, gy: Int): Long =
+        (gx.toLong() shl 32) or (gy.toLong() and 0xFFFFFFFFL)
+
     fun releaseResources() {
         queueEvent {
             releaseSceneGpuResources()
@@ -466,10 +516,12 @@ class ZeroEngineView(
         pendingAdd.clear()
         pendingRemove.clear()
         activeTweens.clear()
+        debugRays.clear()
         camTarget = null
         camBoundsEnabled = false
         parseSceneJson(rawJson, nodes)
         nodes.forEach { bindNodeScript(it) }
+        rebuildSpatialIndex()
         nodes.toList().forEach { callLifecycle(it, "onReady") }
     }
 
@@ -478,6 +530,70 @@ class ZeroEngineView(
         surfaceH = max(1, height)
         GLES20.glViewport(0, 0, surfaceW, surfaceH)
         Matrix.orthoM(uiVpMatrix, 0, 0f, 1080f, 1920f, 0f, -100f, 100f)
+    }
+
+    // ==================== P1：独立碰撞体边界计算与空间哈希索引 ====================
+    private fun getColliderBounds(n: GameNode): ColliderBounds {
+        val gt = getGlobalTransform(n)
+        val rawW = if (n.colWidth > 0f) n.colWidth else n.width
+        val rawH = if (n.colHeight > 0f) n.colHeight else n.height
+        val hw = rawW * abs(gt.gSx) * 0.5f
+        val hh = rawH * abs(gt.gSy) * 0.5f
+        // 节点水平翻转（scaleX < 0）时，自动镜像 colOffsetX，方便动作游戏左右出刀
+        val cx = gt.gx + n.colOffsetX * gt.gSx
+        val cy = gt.gy + n.colOffsetY * gt.gSy
+        return ColliderBounds(cx, cy, hw, hh)
+    }
+
+    private fun canCollideLayer(mover: GameNode, target: GameNode): Boolean {
+        return (mover.colMask and target.colLayer) != 0
+    }
+
+    private fun rebuildSpatialIndex() {
+        spatialGrid.clear()
+        activeTileMaps.clear()
+        for (n in nodes) {
+            if (!n.visible || pendingRemove.contains(n)) continue
+            if (!n.collider && !n.isHitbox && !n.isHurtbox) continue
+            if (n.nodeType == "TileMap") {
+                if (n.tiles.isNotEmpty()) activeTileMaps.add(n)
+                continue
+            }
+            insertNodeIntoSpatialGrid(n)
+        }
+    }
+
+    private fun insertNodeIntoSpatialGrid(n: GameNode) {
+        val b = getColliderBounds(n)
+        val minCx = floor((b.cx - b.hw) / spatialCellSize).toInt()
+        val maxCx = floor((b.cx + b.hw) / spatialCellSize).toInt()
+        val minCy = floor((b.cy - b.hh) / spatialCellSize).toInt()
+        val maxCy = floor((b.cy + b.hh) / spatialCellSize).toInt()
+        for (cx in minCx..maxCx) {
+            for (cy in minCy..maxCy) {
+                val key = packGridKey(cx, cy)
+                spatialGrid.getOrPut(key) { mutableListOf() }.add(n)
+            }
+        }
+    }
+
+    private fun querySpatialCandidates(minX: Float, maxX: Float, minY: Float, maxY: Float, out: MutableSet<GameNode>) {
+        out.clear()
+        val minCx = floor(minX / spatialCellSize).toInt()
+        val maxCx = floor(maxX / spatialCellSize).toInt()
+        val minCy = floor(minY / spatialCellSize).toInt()
+        val maxCy = floor(maxY / spatialCellSize).toInt()
+        for (cx in minCx..maxCx) {
+            for (cy in minCy..maxCy) {
+                val bucket = spatialGrid[packGridKey(cx, cy)] ?: continue
+                for (i in bucket.indices) {
+                    out.add(bucket[i])
+                }
+            }
+        }
+        for (tm in activeTileMaps) {
+            out.add(tm)
+        }
     }
 
     override fun onDrawFrame(gl: GL10?) {
@@ -508,6 +624,15 @@ class ZeroEngineView(
         val dt = rawDt * timeScale
         engineTime += dt
 
+        if (debugRays.isNotEmpty()) {
+            val iter = debugRays.iterator()
+            while (iter.hasNext()) {
+                val r = iter.next()
+                r.ttl -= rawDt
+                if (r.ttl <= 0f) iter.remove()
+            }
+        }
+
         updateCameraMatrices(dt)
         updateWorldTouchFromScreen()
         updateTweens(dt)
@@ -519,6 +644,9 @@ class ZeroEngineView(
             nodes.addAll(added)
             added.forEach { bindNodeScript(it); callLifecycle(it, "onReady") }
         }
+
+        // 每帧开始重建空间哈希网格，加速所有物理移动与射线检测
+        rebuildSpatialIndex()
 
         nodes.toList().forEach { n ->
             if (!pendingRemove.contains(n)) {
@@ -541,6 +669,8 @@ class ZeroEngineView(
             }
         }
 
+        // 脚本位移结束后刷新空间索引，进行高精度战斗判定
+        rebuildSpatialIndex()
         processCombatOverlaps()
 
         if (pendingRemove.isNotEmpty()) {
@@ -608,6 +738,11 @@ class ZeroEngineView(
             }
         }
 
+        // P1：调试线框渲染层（绘制在世界物体之上、UI 之下）
+        if (debugDrawEnabled) {
+            renderDebugOverlay(vpMatrix)
+        }
+
         val uiNodes = nodes.filter { it.visible && it.layer == "UI" }.sortedBy { it.zIndex }
         for (n in uiNodes) {
             if (n.nodeType == "ParticleEmitter") {
@@ -621,14 +756,156 @@ class ZeroEngineView(
         lastFrameCulled = frameCulled
     }
 
+    // ==================== P1：一键 Debug 线框绘制 ====================
+    private fun drawDebugRect(
+        posLoc: Int, uvLoc: Int, colLoc: Int,
+        minX: Float, minY: Float, maxX: Float, maxY: Float, z: Float,
+        r: Float, g: Float, b: Float, a: Float
+    ) {
+        debugVertBuf.clear()
+        debugVertBuf.put(minX); debugVertBuf.put(minY); debugVertBuf.put(z); debugVertBuf.put(0f); debugVertBuf.put(0f)
+        debugVertBuf.put(maxX); debugVertBuf.put(minY); debugVertBuf.put(z); debugVertBuf.put(0f); debugVertBuf.put(0f)
+        debugVertBuf.put(maxX); debugVertBuf.put(maxY); debugVertBuf.put(z); debugVertBuf.put(0f); debugVertBuf.put(0f)
+        debugVertBuf.put(minX); debugVertBuf.put(maxY); debugVertBuf.put(z); debugVertBuf.put(0f); debugVertBuf.put(0f)
+        debugVertBuf.position(0)
+        GLES20.glVertexAttribPointer(posLoc, 3, GLES20.GL_FLOAT, false, 20, debugVertBuf)
+        debugVertBuf.position(3)
+        GLES20.glVertexAttribPointer(uvLoc, 2, GLES20.GL_FLOAT, false, 20, debugVertBuf)
+        GLES20.glUniform4f(colLoc, r, g, b, a)
+        GLES20.glDrawArrays(GLES20.GL_LINE_LOOP, 0, 4)
+        frameDrawCalls++
+    }
+
+    private fun drawDebugSlope(
+        posLoc: Int, uvLoc: Int, colLoc: Int,
+        minX: Float, minY: Float, maxX: Float, maxY: Float, z: Float,
+        leftUp: Boolean
+    ) {
+        debugVertBuf.clear()
+        if (leftUp) {
+            debugVertBuf.put(maxX); debugVertBuf.put(minY); debugVertBuf.put(z); debugVertBuf.put(0f); debugVertBuf.put(0f)
+            debugVertBuf.put(minX); debugVertBuf.put(maxY); debugVertBuf.put(z); debugVertBuf.put(0f); debugVertBuf.put(0f)
+            debugVertBuf.put(maxX); debugVertBuf.put(maxY); debugVertBuf.put(z); debugVertBuf.put(0f); debugVertBuf.put(0f)
+        } else {
+            debugVertBuf.put(minX); debugVertBuf.put(minY); debugVertBuf.put(z); debugVertBuf.put(0f); debugVertBuf.put(0f)
+            debugVertBuf.put(minX); debugVertBuf.put(maxY); debugVertBuf.put(z); debugVertBuf.put(0f); debugVertBuf.put(0f)
+            debugVertBuf.put(maxX); debugVertBuf.put(maxY); debugVertBuf.put(z); debugVertBuf.put(0f); debugVertBuf.put(0f)
+        }
+        debugVertBuf.position(0)
+        GLES20.glVertexAttribPointer(posLoc, 3, GLES20.GL_FLOAT, false, 20, debugVertBuf)
+        debugVertBuf.position(3)
+        GLES20.glVertexAttribPointer(uvLoc, 2, GLES20.GL_FLOAT, false, 20, debugVertBuf)
+        GLES20.glUniform4f(colLoc, 0.75f, 1.0f, 0.15f, 0.95f)
+        GLES20.glDrawArrays(GLES20.GL_LINE_LOOP, 0, 3)
+        frameDrawCalls++
+    }
+
+    private fun drawDebugLine(
+        posLoc: Int, uvLoc: Int, colLoc: Int,
+        x1: Float, y1: Float, x2: Float, y2: Float, z: Float,
+        r: Float, g: Float, b: Float, a: Float
+    ) {
+        debugVertBuf.clear()
+        debugVertBuf.put(x1); debugVertBuf.put(y1); debugVertBuf.put(z); debugVertBuf.put(0f); debugVertBuf.put(0f)
+        debugVertBuf.put(x2); debugVertBuf.put(y2); debugVertBuf.put(z); debugVertBuf.put(0f); debugVertBuf.put(0f)
+        debugVertBuf.position(0)
+        GLES20.glVertexAttribPointer(posLoc, 3, GLES20.GL_FLOAT, false, 20, debugVertBuf)
+        debugVertBuf.position(3)
+        GLES20.glVertexAttribPointer(uvLoc, 2, GLES20.GL_FLOAT, false, 20, debugVertBuf)
+        GLES20.glUniform4f(colLoc, r, g, b, a)
+        GLES20.glDrawArrays(GLES20.GL_LINES, 0, 2)
+        frameDrawCalls++
+    }
+
+    private fun renderDebugOverlay(activeVp: FloatArray) {
+        val prog = defaultLitProgram
+        GLES20.glUseProgram(prog)
+        GLES20.glLineWidth(3f)
+
+        val posLoc = GLES20.glGetAttribLocation(prog, "aPosition")
+        val uvLoc = GLES20.glGetAttribLocation(prog, "aTexCoord")
+        val colLoc = GLES20.glGetUniformLocation(prog, "uColor")
+        GLES20.glEnableVertexAttribArray(posLoc)
+        GLES20.glEnableVertexAttribArray(uvLoc)
+
+        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uMVP"), 1, false, activeVp, 0)
+        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uModel"), 1, false, identityMatrix, 0)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uEnableLight"), 0)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uFlash"), 0f)
+        GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uUvRect"), 0f, 0f, 1f, 1f)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, whiteTexId)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uTexture"), 0)
+
+        for (n in nodes) {
+            if (!n.visible || n.layer != "World") continue
+            if (!n.collider && !n.isHitbox && !n.isHurtbox) continue
+
+            val gt = getGlobalTransform(n)
+            if (n.nodeType == "TileMap" && n.collider) {
+                val ts = max(8f, n.tileSize)
+                for (cell in n.tiles) {
+                    val x0 = gt.gx + cell.gx * ts
+                    val y0 = gt.gy + cell.gy * ts
+                    val x1 = x0 + ts
+                    val y1 = y0 + ts
+                    if (!isBoxInView(x0, x1, y0, y1)) continue
+                    drawDebugRect(posLoc, uvLoc, colLoc, x0, y0, x1, y1, gt.gz + 6f, 0.2f, 0.95f, 0.45f, 0.5f)
+                }
+                continue
+            }
+
+            val cb = getColliderBounds(n)
+            val minX = cb.cx - cb.hw
+            val maxX = cb.cx + cb.hw
+            val minY = cb.cy - cb.hh
+            val maxY = cb.cy + cb.hh
+            if (!isBoxInView(minX, maxX, minY, maxY)) continue
+
+            if (n.collider) {
+                when (n.slopeType) {
+                    "left_up" -> drawDebugSlope(posLoc, uvLoc, colLoc, minX, minY, maxX, maxY, gt.gz + 6f, leftUp = true)
+                    "right_up" -> drawDebugSlope(posLoc, uvLoc, colLoc, minX, minY, maxX, maxY, gt.gz + 6f, leftUp = false)
+                    else -> {
+                        if (n.isTrigger) {
+                            drawDebugRect(posLoc, uvLoc, colLoc, minX, minY, maxX, maxY, gt.gz + 6f, 0.1f, 0.9f, 1.0f, 0.9f)
+                        } else {
+                            drawDebugRect(posLoc, uvLoc, colLoc, minX, minY, maxX, maxY, gt.gz + 6f, 0.2f, 1.0f, 0.35f, 0.9f)
+                        }
+                    }
+                }
+            }
+            if (n.isHurtbox) {
+                drawDebugRect(posLoc, uvLoc, colLoc, minX + 3f, minY + 3f, maxX - 3f, maxY - 3f, gt.gz + 7f, 0.3f, 0.55f, 1.0f, 0.95f)
+            }
+            if (n.isHitbox) {
+                drawDebugRect(posLoc, uvLoc, colLoc, minX - 2f, minY - 2f, maxX + 2f, maxY + 2f, gt.gz + 8f, 1.0f, 0.2f, 0.2f, 0.95f)
+            }
+        }
+
+        for (ray in debugRays) {
+            if (ray.hit) {
+                drawDebugLine(posLoc, uvLoc, colLoc, ray.x1, ray.y1, ray.x2, ray.y2, 10f, 1.0f, 0.25f, 0.85f, 0.95f)
+            } else {
+                drawDebugLine(posLoc, uvLoc, colLoc, ray.x1, ray.y1, ray.x2, ray.y2, 10f, 1.0f, 0.9f, 0.2f, 0.85f)
+            }
+        }
+
+        GLES20.glDisableVertexAttribArray(posLoc)
+        GLES20.glDisableVertexAttribArray(uvLoc)
+    }
+
     private fun processCombatOverlaps() {
         val hitboxes = nodes.filter { it.visible && it.isHitbox && !pendingRemove.contains(it) }
-        val hurtboxes = nodes.filter { it.visible && it.isHurtbox && !pendingRemove.contains(it) }
-        if (hitboxes.isEmpty() || hurtboxes.isEmpty()) return
+        if (hitboxes.isEmpty()) return
 
         for (hb in hitboxes) {
-            for (hurt in hurtboxes) {
+            val cb = getColliderBounds(hb)
+            querySpatialCandidates(cb.cx - cb.hw, cb.cx + cb.hw, cb.cy - cb.hh, cb.cy + cb.hh, queryCandidates)
+            for (hurt in queryCandidates) {
+                if (!hurt.visible || !hurt.isHurtbox || pendingRemove.contains(hurt)) continue
                 if (hb === hurt || hb.parent == hurt.name || hurt.parent == hb.name) continue
+                if (!canCollideLayer(hb, hurt)) continue
                 if (hurt.invulnTimer > 0f) continue
                 if (hb.hitCooldownMap.containsKey(hurt.name)) continue
                 if (checkOverlap(hb, hurt)) {
@@ -655,6 +932,7 @@ class ZeroEngineView(
             n.tileVboId = 0
         }
         n.tileDirty = false
+        n.tileLookup.clear()
         if (n.tiles.isEmpty()) {
             n.tileVertexCount = 0
             return
@@ -675,6 +953,8 @@ class ZeroEngineView(
         var maxY = Float.NEGATIVE_INFINITY
 
         for (cell in n.tiles) {
+            n.tileLookup[packGridKey(cell.gx, cell.gy)] = cell
+
             val x0 = cell.gx * ts
             val x1 = x0 + ts
             val y0 = cell.gy * ts
@@ -1039,7 +1319,6 @@ class ZeroEngineView(
             Matrix.multiplyMM(vpMatrix, 0, projMatrix, 0, viewMatrix, 0)
             Matrix.invertM(invVpMatrix, 0, vpMatrix, 0)
 
-            // P0：通过四角射线反投影计算 2.5D 视锥地面覆盖范围（加 400px 安全冗余防立绘边缘闪烁）
             var minX = Float.POSITIVE_INFINITY
             var maxX = Float.NEGATIVE_INFINITY
             var minY = Float.POSITIVE_INFINITY
@@ -1164,7 +1443,6 @@ class ZeroEngineView(
         val uOffset = (fi % hf) * uScale
         val vOffset = (fi / hf) * vScale
         if (isWorld && camMode == "2.5D" && n.nodeType == "Label2D") {
-            // 2.5D 透视相机下 +X 朝左，翻转 U 轴防止世界空间文字左右镜像
             GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uUvRect"), 1f, vOffset, -1f, vScale)
         } else {
             GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uUvRect"), uOffset, vOffset, uScale, vScale)
@@ -1293,36 +1571,47 @@ class ZeroEngineView(
         }
     }
 
-    // ==================== 通用射线检测 (支持实体包围盒与 TileMap) ====================
-    private fun performRaycast(x1: Float, y1: Float, x2: Float, y2: Float, ignoreTag: String): Scriptable {
+    // ==================== P1：空间加速射线检测 (支持实体包围盒与 TileMap O(1) 范围查询) ====================
+    private fun performRaycast(x1: Float, y1: Float, x2: Float, y2: Float, ignoreTag: String, mask: Int): Scriptable {
         var closestT = 1.0f
         var hitNode: GameNode? = null
 
         val dx = x2 - x1
         val dy = y2 - y1
+        val rMinX = min(x1, x2)
+        val rMaxX = max(x1, x2)
+        val rMinY = min(y1, y2)
+        val rMaxY = max(y1, y2)
 
-        for (other in nodes) {
+        querySpatialCandidates(rMinX, rMaxX, rMinY, rMaxY, queryCandidates)
+
+        for (other in queryCandidates) {
             if (!other.visible || !other.collider || other.isTrigger || other.layer != "World") continue
             if (ignoreTag.isNotEmpty() && other.tag == ignoreTag) continue
+            if ((mask and other.colLayer) == 0) continue
 
-            val gb = getGlobalTransform(other)
             if (other.nodeType == "TileMap") {
+                val gb = getGlobalTransform(other)
                 val ts = max(8f, other.tileSize)
-                for (cell in other.tiles) {
-                    val minX = gb.gx + cell.gx * ts
-                    val maxX = minX + ts
-                    val minY = gb.gy + cell.gy * ts
-                    val maxY = minY + ts
-                    val t = intersectSegmentAABB(x1, y1, dx, dy, minX, minY, maxX, maxY)
-                    if (t != null && t < closestT) {
-                        closestT = t
-                        hitNode = other
+                val gx0 = floor((rMinX - gb.gx) / ts).toInt()
+                val gx1 = floor((rMaxX - gb.gx) / ts).toInt()
+                val gy0 = floor((rMinY - gb.gy) / ts).toInt()
+                val gy1 = floor((rMaxY - gb.gy) / ts).toInt()
+                for (gx in gx0..gx1) {
+                    for (gy in gy0..gy1) {
+                        if (!other.tileLookup.containsKey(packGridKey(gx, gy))) continue
+                        val minX = gb.gx + gx * ts
+                        val minY = gb.gy + gy * ts
+                        val t = intersectSegmentAABB(x1, y1, dx, dy, minX, minY, minX + ts, minY + ts)
+                        if (t != null && t < closestT) {
+                            closestT = t
+                            hitNode = other
+                        }
                     }
                 }
             } else {
-                val hw = (other.width * abs(gb.gSx)) * 0.5f
-                val hh = (other.height * abs(gb.gSy)) * 0.5f
-                val t = intersectSegmentAABB(x1, y1, dx, dy, gb.gx - hw, gb.gy - hh, gb.gx + hw, gb.gy + hh)
+                val cb = getColliderBounds(other)
+                val t = intersectSegmentAABB(x1, y1, dx, dy, cb.cx - cb.hw, cb.cy - cb.hh, cb.cx + cb.hw, cb.cy + cb.hh)
                 if (t != null && t < closestT) {
                     closestT = t
                     hitNode = other
@@ -1335,12 +1624,14 @@ class ZeroEngineView(
             val hx = x1 + dx * closestT
             val hy = y1 + dy * closestT
             val dist = hypot(hx - x1, hy - y1)
+            if (debugDrawEnabled) debugRays.add(DebugRay(x1, y1, hx, hy, hit = true))
             ScriptableObject.putProperty(res, "hit", true)
             ScriptableObject.putProperty(res, "x", hx.toDouble())
             ScriptableObject.putProperty(res, "y", hy.toDouble())
             ScriptableObject.putProperty(res, "distance", dist.toDouble())
             ScriptableObject.putProperty(res, "node", hitNode.jsObj)
         } else {
+            if (debugDrawEnabled) debugRays.add(DebugRay(x1, y1, x2, y2, hit = false))
             ScriptableObject.putProperty(res, "hit", false)
             ScriptableObject.putProperty(res, "x", x2.toDouble())
             ScriptableObject.putProperty(res, "y", y2.toDouble())
@@ -1375,7 +1666,7 @@ class ZeroEngineView(
         return if (t0 <= t1) t0 else null
     }
 
-    // ==================== 本地磁盘永久存档 (长椅/多槽位存档) ====================
+    // ==================== 本地磁盘永久存档 ====================
     private fun saveDiskSlot(slotName: String, dataObj: Any?): Boolean {
         return try {
             val safeName = slotName.replace(Regex("[^a-zA-Z0-9_\\-\\u4e00-\\u9fa5]"), "_")
@@ -1436,12 +1727,18 @@ class ZeroEngineView(
             onConsoleLog("[LOG] $msg")
             null
         })
+        ScriptableObject.putProperty(engineApi, "setDebugDraw", jsFunc { args ->
+            debugDrawEnabled = (args.getOrNull(0) as? Boolean) ?: false
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "isDebugDraw", jsFunc { debugDrawEnabled })
         ScriptableObject.putProperty(engineApi, "getStats", jsFunc {
             val obj = rhino.newObject(globalScope)
             ScriptableObject.putProperty(obj, "fps", smoothedFps.toDouble())
             ScriptableObject.putProperty(obj, "drawCalls", lastFrameDrawCalls)
             ScriptableObject.putProperty(obj, "culled", lastFrameCulled)
             ScriptableObject.putProperty(obj, "nodes", nodes.size)
+            ScriptableObject.putProperty(obj, "spatialCells", spatialGrid.size)
             ScriptableObject.putProperty(obj, "textures", textureCache.size)
             ScriptableObject.putProperty(obj, "textTextures", textTextureCache.size)
             obj
@@ -1480,7 +1777,8 @@ class ZeroEngineView(
             val x2 = (args.getOrNull(2) as? Number)?.toFloat() ?: 0f
             val y2 = (args.getOrNull(3) as? Number)?.toFloat() ?: 0f
             val ignoreTag = args.getOrNull(4)?.takeIf { it !== Scriptable.NOT_FOUND }?.toString() ?: ""
-            performRaycast(x1, y1, x2, y2, ignoreTag)
+            val mask = (args.getOrNull(5) as? Number)?.toInt() ?: 0xFFFF
+            performRaycast(x1, y1, x2, y2, ignoreTag, mask)
         })
         ScriptableObject.putProperty(engineApi, "hitstop", jsFunc { args ->
             val sec = (args.getOrNull(0) as? Number)?.toFloat() ?: 0.05f
@@ -1636,6 +1934,12 @@ class ZeroEngineView(
                 isTrigger = getJsBool(cfg, "isTrigger", false),
                 oneWay = getJsBool(cfg, "oneWay", false),
                 slopeType = getJsStr(cfg, "slopeType", "none"),
+                colOffsetX = getJsFloat(cfg, "colOffsetX", 0f),
+                colOffsetY = getJsFloat(cfg, "colOffsetY", 0f),
+                colWidth = getJsFloat(cfg, "colWidth", 0f),
+                colHeight = getJsFloat(cfg, "colHeight", 0f),
+                colLayer = getJsInt(cfg, "colLayer", 1),
+                colMask = getJsInt(cfg, "colMask", 0xFFFF),
                 bodyMode = getJsStr(cfg, "bodyMode", "kinematic"),
                 isHitbox = getJsBool(cfg, "isHitbox", false),
                 isHurtbox = getJsBool(cfg, "isHurtbox", false),
@@ -1823,14 +2127,14 @@ class ZeroEngineView(
         }
     }
 
-    // ==================== 含斜坡自动爬升与贴地的 moveAndSlide ====================
+    // ==================== P1：空间哈希加速 + 独立 Collider 的 moveAndSlide ====================
     private fun computeSlopeSurfaceY(slope: GameNode, footX: Float): Float {
-        val gb = getGlobalTransform(slope)
-        val sw = slope.width * abs(gb.gSx)
-        val sh = slope.height * abs(gb.gSy)
-        val left = gb.gx - sw * 0.5f
-        val top = gb.gy - sh * 0.5f
-        val bottom = gb.gy + sh * 0.5f
+        val sb = getColliderBounds(slope)
+        val sw = sb.hw * 2f
+        val sh = sb.hh * 2f
+        val left = sb.cx - sb.hw
+        val top = sb.cy - sb.hh
+        val bottom = sb.cy + sb.hh
         val t = ((footX - left) / max(1f, sw)).coerceIn(0f, 1f)
         return if (slope.slopeType == "left_up") {
             bottom - t * sh
@@ -1850,35 +2154,43 @@ class ZeroEngineView(
             }
         }
 
-        val halfH = (n.height * abs(n.scaleY)) * 0.5f
-        val prevBottom = n.y + halfH
+        val startBounds = getColliderBounds(n)
+        val prevBottom = startBounds.cy + startBounds.hh
+
+        // 预查询移动前后扫过的空间区域（一次查网格，X/Y/Trigger 复用）
+        val sweepMinX = min(startBounds.cx, startBounds.cx + n.vx * dt) - startBounds.hw - 32f
+        val sweepMaxX = max(startBounds.cx, startBounds.cx + n.vx * dt) + startBounds.hw + 32f
+        val sweepMinY = min(startBounds.cy, startBounds.cy + n.vy * dt) - startBounds.hh - 32f
+        val sweepMaxY = max(startBounds.cy, startBounds.cy + n.vy * dt) + startBounds.hh + 32f
+        querySpatialCandidates(sweepMinX, sweepMaxX, sweepMinY, sweepMaxY, queryCandidates)
+        val nearby = queryCandidates.toList()
 
         // 1. X 轴位移与斜坡平滑爬升
         n.x += n.vx * dt
         var climbedSlope = false
         if (n.collider && !n.isTrigger) {
-            for (other in nodes) {
-                if (other !== n && other.visible && other.collider && !other.isTrigger && !other.oneWay && other.layer == n.layer) {
-                    if (other.slopeType == "left_up" || other.slopeType == "right_up") {
-                        if (checkOverlap(n, other)) {
-                            val ga = getGlobalTransform(n)
-                            val surfY = computeSlopeSurfaceY(other, ga.gx)
-                            val footY = n.y + halfH
-                            if (footY >= surfY - 18f && n.vy >= -40f) {
-                                n.y = surfY - halfH
-                                n.vy = 0f
-                                n.isGrounded = true
-                                n.jumpCount = 0
-                                n.coyoteTimer = n.coyoteTimeMax
-                                climbedSlope = true
-                                collidedSolids.add(other)
-                            }
+            for (other in nearby) {
+                if (other === n || !other.visible || !other.collider || other.isTrigger || other.oneWay || other.layer != n.layer) continue
+                if (!canCollideLayer(n, other)) continue
+                if (other.slopeType == "left_up" || other.slopeType == "right_up") {
+                    if (checkOverlap(n, other)) {
+                        val cb = getColliderBounds(n)
+                        val surfY = computeSlopeSurfaceY(other, cb.cx)
+                        val footY = cb.cy + cb.hh
+                        if (footY >= surfY - 18f && n.vy >= -40f) {
+                            n.y += (surfY - footY)
+                            n.vy = 0f
+                            n.isGrounded = true
+                            n.jumpCount = 0
+                            n.coyoteTimer = n.coyoteTimeMax
+                            climbedSlope = true
+                            collidedSolids.add(other)
                         }
-                    } else if (checkOverlap(n, other)) {
-                        n.x -= n.vx * dt
-                        if (n.bodyMode == "rigid") n.vx = -n.vx * n.bounciness else n.vx = 0f
-                        collidedSolids.add(other)
                     }
+                } else if (checkOverlap(n, other)) {
+                    n.x -= n.vx * dt
+                    if (n.bodyMode == "rigid") n.vx = -n.vx * n.bounciness else n.vx = 0f
+                    collidedSolids.add(other)
                 }
             }
         }
@@ -1888,59 +2200,58 @@ class ZeroEngineView(
         if (!climbedSlope) n.isGrounded = false
         n.y += n.vy * dt
         if (n.collider && !n.isTrigger) {
-            for (other in nodes) {
-                if (other !== n && other.visible && other.collider && !other.isTrigger && other.layer == n.layer) {
-                    if (other.slopeType == "left_up" || other.slopeType == "right_up") {
-                        val ga = getGlobalTransform(n)
-                        val surfY = computeSlopeSurfaceY(other, ga.gx)
-                        val footY = n.y + halfH
-                        if (checkOverlap(n, other) && footY >= surfY && n.vy >= 0f) {
-                            n.y = surfY - halfH
+            for (other in nearby) {
+                if (other === n || !other.visible || !other.collider || other.isTrigger || other.layer != n.layer) continue
+                if (!canCollideLayer(n, other)) continue
+                if (other.slopeType == "left_up" || other.slopeType == "right_up") {
+                    val cb = getColliderBounds(n)
+                    val surfY = computeSlopeSurfaceY(other, cb.cx)
+                    val footY = cb.cy + cb.hh
+                    if (checkOverlap(n, other) && footY >= surfY && n.vy >= 0f) {
+                        n.y += (surfY - footY)
+                        n.vy = 0f
+                        n.isGrounded = true
+                        n.jumpCount = 0
+                        n.coyoteTimer = n.coyoteTimeMax
+                        collidedSolids.add(other)
+                    } else if (wasGrounded && n.vy >= 0f && !n.isGrounded) {
+                        val sb = getColliderBounds(other)
+                        if (abs(cb.cx - sb.cx) <= sb.hw && surfY - footY in 0f..24f) {
+                            n.y += (surfY - footY)
                             n.vy = 0f
                             n.isGrounded = true
                             n.jumpCount = 0
                             n.coyoteTimer = n.coyoteTimeMax
                             collidedSolids.add(other)
-                        } else if (wasGrounded && n.vy >= 0f && !n.isGrounded) {
-                            val gb = getGlobalTransform(other)
-                            val sw = other.width * abs(gb.gSx)
-                            if (abs(ga.gx - gb.gx) <= sw * 0.5f && surfY - footY in 0f..24f) {
-                                n.y = surfY - halfH
-                                n.vy = 0f
-                                n.isGrounded = true
-                                n.jumpCount = 0
-                                n.coyoteTimer = n.coyoteTimeMax
-                                collidedSolids.add(other)
-                            }
                         }
-                    } else if (other.oneWay) {
-                        if (n.vy >= 0f && n.dropThroughTimer <= 0f) {
-                            val gb = getGlobalTransform(other)
-                            val otherTop = gb.gy - (other.height * abs(gb.gSy)) * 0.5f
-                            if (prevBottom <= otherTop + 14f && checkOverlap(n, other)) {
-                                n.y -= n.vy * dt
-                                n.vy = 0f
-                                n.isGrounded = true
-                                n.jumpCount = 0
-                                n.coyoteTimer = n.coyoteTimeMax
-                                collidedSolids.add(other)
-                            }
-                        }
-                    } else if (checkOverlap(n, other)) {
-                        val fallingDown = n.vy > 0f
-                        n.y -= n.vy * dt
-                        if (fallingDown) {
+                    }
+                } else if (other.oneWay) {
+                    if (n.vy >= 0f && n.dropThroughTimer <= 0f) {
+                        val ob = getColliderBounds(other)
+                        val otherTop = ob.cy - ob.hh
+                        if (prevBottom <= otherTop + 14f && checkOverlap(n, other)) {
+                            n.y -= n.vy * dt
+                            n.vy = 0f
                             n.isGrounded = true
                             n.jumpCount = 0
                             n.coyoteTimer = n.coyoteTimeMax
+                            collidedSolids.add(other)
                         }
-                        if (n.bodyMode == "rigid" && abs(n.vy) > 90f) {
-                            n.vy = -n.vy * n.bounciness
-                        } else {
-                            n.vy = 0f
-                        }
-                        collidedSolids.add(other)
                     }
+                } else if (checkOverlap(n, other)) {
+                    val fallingDown = n.vy > 0f
+                    n.y -= n.vy * dt
+                    if (fallingDown) {
+                        n.isGrounded = true
+                        n.jumpCount = 0
+                        n.coyoteTimer = n.coyoteTimeMax
+                    }
+                    if (n.bodyMode == "rigid" && abs(n.vy) > 90f) {
+                        n.vy = -n.vy * n.bounciness
+                    } else {
+                        n.vy = 0f
+                    }
+                    collidedSolids.add(other)
                 }
             }
         }
@@ -1960,8 +2271,9 @@ class ZeroEngineView(
         }
 
         if (n.collider) {
-            for (other in nodes.toList()) {
+            for (other in nearby) {
                 if (other !== n && other.visible && other.collider && other.layer == n.layer) {
+                    if (!canCollideLayer(n, other)) continue
                     if (n.isTrigger || other.isTrigger) {
                         if (checkOverlap(n, other)) {
                             if (!pendingRemove.contains(n) && !pendingRemove.contains(other)) {
@@ -1976,25 +2288,28 @@ class ZeroEngineView(
     }
 
     private fun checkOverlap(a: GameNode, b: GameNode): Boolean {
-        val ga = getGlobalTransform(a)
-        val gb = getGlobalTransform(b)
-        val aw = a.width * abs(ga.gSx)
-        val ah = a.height * abs(ga.gSy)
+        val ba = getColliderBounds(a)
 
         if (b.nodeType == "TileMap") {
+            val gb = getGlobalTransform(b)
             val ts = max(8f, b.tileSize)
-            for (cell in b.tiles) {
-                val cx = gb.gx + (cell.gx + 0.5f) * ts
-                val cy = gb.gy + (cell.gy + 0.5f) * ts
-                if (abs(ga.gx - cx) < (aw + ts) * 0.5f && abs(ga.gy - cy) < (ah + ts) * 0.5f) {
-                    return true
+            val minGx = floor((ba.cx - ba.hw - gb.gx) / ts).toInt()
+            val maxGx = floor((ba.cx + ba.hw - gb.gx) / ts).toInt()
+            val minGy = floor((ba.cy - ba.hh - gb.gy) / ts).toInt()
+            val maxGy = floor((ba.cy + ba.hh - gb.gy) / ts).toInt()
+            for (gx in minGx..maxGx) {
+                for (gy in minGy..maxGy) {
+                    if (b.tileLookup.containsKey(packGridKey(gx, gy))) {
+                        return true
+                    }
                 }
             }
             return false
         }
 
-        return abs(ga.gx - gb.gx) < (aw + b.width * abs(gb.gSx)) * 0.5f &&
-               abs(ga.gy - gb.gy) < (ah + b.height * abs(gb.gSy)) * 0.5f
+        val bb = getColliderBounds(b)
+        return abs(ba.cx - bb.cx) < (ba.hw + bb.hw) &&
+               abs(ba.cy - bb.cy) < (ba.hh + bb.hh)
     }
 
     data class GlobalTransform(val gx: Float, val gy: Float, val gz: Float, val gRot: Float, val gSx: Float, val gSy: Float)
@@ -2101,17 +2416,18 @@ class ZeroEngineView(
                     }
                 }
                 val tileList = mutableListOf<TileCell>()
+                val tileMapLookup = HashMap<Long, TileCell>()
                 val tilesArr = o.optJSONArray("tiles")
                 if (tilesArr != null) {
                     for (tIdx in 0 until tilesArr.length()) {
                         val to = tilesArr.getJSONObject(tIdx)
-                        tileList.add(
-                            TileCell(
-                                gx = to.optInt("gx", 0),
-                                gy = to.optInt("gy", 0),
-                                frame = to.optInt("frame", 0)
-                            )
+                        val cell = TileCell(
+                            gx = to.optInt("gx", 0),
+                            gy = to.optInt("gy", 0),
+                            frame = to.optInt("frame", 0)
                         )
+                        tileList.add(cell)
+                        tileMapLookup[packGridKey(cell.gx, cell.gy)] = cell
                     }
                 }
                 val defaultClipName = o.optString("defaultClip", "")
@@ -2150,6 +2466,12 @@ class ZeroEngineView(
                     isTrigger = o.optBoolean("isTrigger", false),
                     oneWay = o.optBoolean("oneWay", false),
                     slopeType = o.optString("slopeType", "none"),
+                    colOffsetX = o.optDouble("colOffsetX", 0.0).toFloat(),
+                    colOffsetY = o.optDouble("colOffsetY", 0.0).toFloat(),
+                    colWidth = o.optDouble("colWidth", 0.0).toFloat(),
+                    colHeight = o.optDouble("colHeight", 0.0).toFloat(),
+                    colLayer = o.optInt("colLayer", 1),
+                    colMask = o.optInt("colMask", 0xFFFF),
                     bodyMode = o.optString("bodyMode", "kinematic"),
                     gravity = o.optDouble("gravity", 2200.0).toFloat(),
                     fallMultiplier = o.optDouble("fallMultiplier", 1.55).toFloat(),
@@ -2167,6 +2489,7 @@ class ZeroEngineView(
                     clips = clipMap,
                     tileSize = o.optDouble("tileSize", 90.0).toFloat(),
                     tiles = tileList,
+                    tileLookup = tileMapLookup,
                     emitRate = o.optDouble("emitRate", 24.0).toFloat(),
                     particleLife = o.optDouble("particleLife", 1.1).toFloat(),
                     particleSpeed = o.optDouble("particleSpeed", 160.0).toFloat(),
@@ -2315,8 +2638,9 @@ class ZeroEngineView(
         private val BRIDGED_PROPS = setOf(
             "name", "tag", "x", "y", "z", "vx", "vy", "vz",
             "width", "height", "rotation", "tiltX", "scaleX", "scaleY",
-            "parallaxX", "parallaxY", "slopeType", "bodyMode",
-            "gravity", "fallMultiplier", "maxJumps", "isGrounded",
+            "parallaxX", "parallaxY", "slopeType",
+            "colOffsetX", "colOffsetY", "colWidth", "colHeight", "colLayer", "colMask",
+            "bodyMode", "gravity", "fallMultiplier", "maxJumps", "isGrounded",
             "isHitbox", "isHurtbox", "damage", "invulnTimer",
             "r", "g", "b", "a", "visible", "text", "currentClip",
             "lightRadius", "lightIntensity"
