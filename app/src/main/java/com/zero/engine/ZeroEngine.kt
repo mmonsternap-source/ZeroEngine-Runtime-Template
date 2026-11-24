@@ -245,27 +245,30 @@ class ZeroInputSystem {
         return true
     }
 
-    fun onMultiTouch(event: MotionEvent, viewW: Int, viewH: Int) = synchronized(lock) {
-        val w = max(1, viewW).toFloat()
-        val h = max(1, viewH).toFloat()
-        when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
-                val idx = event.actionIndex
-                val pid = event.getPointerId(idx)
-                activePointers[pid] = ((event.getX(idx) / w) * 1080f) to ((event.getY(idx) / h) * 1920f)
-            }
-            MotionEvent.ACTION_MOVE -> {
-                for (i in 0 until event.pointerCount) {
-                    val pid = event.getPointerId(i)
-                    activePointers[pid] = ((event.getX(i) / w) * 1080f) to ((event.getY(i) / h) * 1920f)
+    fun onMultiTouch(event: MotionEvent, viewW: Int, viewH: Int) {
+        synchronized(lock) {
+            val w = max(1, viewW).toFloat()
+            val h = max(1, viewH).toFloat()
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                    val idx = event.actionIndex
+                    val pid = event.getPointerId(idx)
+                    activePointers[pid] = ((event.getX(idx) / w) * 1080f) to ((event.getY(idx) / h) * 1920f)
                 }
-            }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
-                val idx = event.actionIndex
-                activePointers.remove(event.getPointerId(idx))
-            }
-            MotionEvent.ACTION_CANCEL -> {
-                activePointers.clear()
+                MotionEvent.ACTION_MOVE -> {
+                    for (i in 0 until event.pointerCount) {
+                        val pid = event.getPointerId(i)
+                        activePointers[pid] = ((event.getX(i) / w) * 1080f) to ((event.getY(i) / h) * 1920f)
+                    }
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
+                    val idx = event.actionIndex
+                    activePointers.remove(event.getPointerId(idx))
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    activePointers.clear()
+                }
+                else -> Unit
             }
         }
     }
