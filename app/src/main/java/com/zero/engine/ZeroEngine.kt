@@ -29,6 +29,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.*
@@ -93,12 +94,21 @@ class ZeroEngineView(
         val hh: Float
     )
 
+    data class AdditiveLoadReq(
+        val sceneFile: String,
+        val offsetX: Float,
+        val offsetY: Float
+    )
+
     data class GameNode(
         var name: String,
         var nodeType: String = "Sprite2D", // Sprite2D | Label2D | PointLight | ParticleEmitter | TileMap
         var layer: String = "World",       // World | UI
         var parent: String = "",
         var tag: String = "default",
+        // P2：多场景分组与跨场景常驻标记
+        var sceneGroup: String = "main",
+        var persistent: Boolean = false,
         var x: Float = 0f,
         var y: Float = 0f,
         var z: Float = 0f,
@@ -134,8 +144,8 @@ class ZeroEngineView(
         var colOffsetY: Float = 0f,
         var colWidth: Float = 0f,           // <= 0 时自动使用 node.width
         var colHeight: Float = 0f,          // <= 0 时自动使用 node.height
-        var colLayer: Int = 1,              // 碰撞所属层位掩码
-        var colMask: Int = 0xFFFF,          // 碰撞目标层位掩码
+        var colLayer: Int = 1,
+        var colMask: Int = 0xFFFF,
         var bodyMode: String = "kinematic", // kinematic | platformer | rigid
         var gravity: Float = 2200f,
         var fallMultiplier: Float = 1.55f,
@@ -194,7 +204,7 @@ class ZeroEngineView(
         var customProgram: Int = 0
     )
 
-    // ==================== P0 + P1：零拷贝 JS 属性代理 ====================
+    // ==================== P0 + P1 + P2：零拷贝 JS 属性代理 ====================
     private inner class GameNodeJsProxy(val n: GameNode) : ScriptableObject() {
         override fun getClassName() = "GameNode"
 
@@ -207,6 +217,8 @@ class ZeroEngineView(
             return when (name) {
                 "name" -> n.name
                 "tag" -> n.tag
+                "sceneGroup" -> n.sceneGroup
+                "persistent" -> n.persistent
                 "x" -> n.x.toDouble()
                 "y" -> n.y.toDouble()
                 "z" -> n.z.toDouble()
@@ -253,6 +265,7 @@ class ZeroEngineView(
         override fun put(name: String?, start: Scriptable?, value: Any?) {
             when (name) {
                 "tag" -> n.tag = toJsStr(value, n.tag)
+                "persistent" -> n.persistent = toJsBool(value, n.persistent)
                 "x" -> n.x = toJsFloat(value, n.x)
                 "y" -> n.y = toJsFloat(value, n.y)
                 "z" -> n.z = toJsFloat(value, n.z)
@@ -290,7 +303,7 @@ class ZeroEngineView(
                 "text" -> n.text = toJsStr(value, n.text)
                 "lightRadius" -> n.lightRadius = toJsFloat(value, n.lightRadius)
                 "lightIntensity" -> n.lightIntensity = toJsFloat(value, n.lightIntensity)
-                "name", "isGrounded", "currentClip" -> Unit
+                "name", "sceneGroup", "isGrounded", "currentClip" -> Unit
                 else -> super.put(name, start, value)
             }
         }
@@ -315,6 +328,46 @@ class ZeroEngineView(
         .order(ByteOrder.nativeOrder()).asFloatBuffer()
     private val identityMatrix = FloatArray(16).apply { Matrix.setIdentityM(this, 0) }
 
+    // ==================== P2：多场景叠加、后台异步预加载与平滑转场 ====================
+    private val globalDataStore = ConcurrentHashMap<String, Any?>()
+    private val preloadedSceneCache = ConcurrentHashMap<String, String>()
+    private val sceneIoExecutor = Executors.newSingleThreadExecutor()
+    @Volatile private var pendingSceneLoad: String? = null
+    private val pendingAdditiveLoads = mutableListOf<AdditiveLoadReq>()
+    private val pendingUnloadScenes = mutableListOf<String>()
+
+    // P2：FBO 离屏光照 + 全屏后处理管线状态
+    private var postFxEnabled = true
+    private var fboReady = false
+    private var sceneFbo = 0
+    private var sceneColorTex = 0
+    private var lightFbo = 0
+    private var lightMapTex = 0
+    private var lightW = 540
+    private var lightH = 960
+    private var lightProgram = 0
+    private var postProgram = 0
+
+    private var postBloom = 0.25f
+    private var postVignette = 0.28f
+    private var postChromatic = 0.0f
+    private var postFade = 0.0f
+    private var fadeTarget = 0.0f
+    private var fadeSpeed = 0.0f
+    private var pendingFadeScene: String? = null
+    private var fadeSceneDur = 0.35f
+
+    private val fullScreenQuadBuffer: FloatBuffer = ByteBuffer.allocateDirect(4 * 4 * 4)
+        .order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
+            put(floatArrayOf(
+                -1f, -1f, 0f, 0f,
+                 1f, -1f, 1f, 0f,
+                -1f,  1f, 0f, 1f,
+                 1f,  1f, 1f, 1f
+            ))
+            position(0)
+        }
+
     // P0：有界 LRU 文字纹理缓存
     private val maxTextTextures = 64
     private val textTextureCache = object : LinkedHashMap<String, Int>(64, 0.75f, true) {
@@ -329,10 +382,6 @@ class ZeroEngineView(
             return false
         }
     }
-
-    // 跨关卡内存数据与异步场景切换
-    private val globalDataStore = ConcurrentHashMap<String, Any?>()
-    @Volatile private var pendingSceneLoad: String? = null
 
     // 音频管理器 (BGM + SFX)
     private var bgmPlayer: MediaPlayer? = null
@@ -379,6 +428,7 @@ class ZeroEngineView(
     private var lastFrameDrawCalls = 0
     private var frameCulled = 0
     private var lastFrameCulled = 0
+    private var lastFrameLights = 0
 
     // 全局顿帧与时间缩放
     private var hitstopTimer = 0f
@@ -459,9 +509,16 @@ class ZeroEngineView(
     private fun packGridKey(gx: Int, gy: Int): Long =
         (gx.toLong() shl 32) or (gy.toLong() and 0xFFFFFFFFL)
 
+    private fun normalizeSceneName(name: String): String =
+        if (name.endsWith(".scene")) name else "$name.scene"
+
     fun releaseResources() {
+        try {
+            sceneIoExecutor.shutdownNow()
+        } catch (_: Exception) {}
         queueEvent {
-            releaseSceneGpuResources()
+            releaseFbos()
+            releaseSceneGpuResources(includePersistent = true)
             if (textureCache.isNotEmpty()) {
                 val ids = textureCache.values.filter { it != 0 && it != whiteTexId }.toIntArray()
                 if (ids.isNotEmpty()) GLES20.glDeleteTextures(ids.size, ids, 0)
@@ -483,17 +540,73 @@ class ZeroEngineView(
         } catch (_: Exception) {}
     }
 
-    private fun releaseSceneGpuResources() {
+    private fun releaseNodeGpuResources(n: GameNode) {
+        if (n.tileVboId != 0) {
+            GLES20.glDeleteBuffers(1, intArrayOf(n.tileVboId), 0)
+            n.tileVboId = 0
+            n.tileVertexCount = 0
+        }
+        if (n.customProgram != 0 && n.customProgram != defaultLitProgram) {
+            GLES20.glDeleteProgram(n.customProgram)
+            n.customProgram = 0
+        }
+    }
+
+    private fun releaseSceneGpuResources(includePersistent: Boolean) {
         for (n in nodes) {
-            if (n.tileVboId != 0) {
-                GLES20.glDeleteBuffers(1, intArrayOf(n.tileVboId), 0)
-                n.tileVboId = 0
-                n.tileVertexCount = 0
-            }
-            if (n.customProgram != 0 && n.customProgram != defaultLitProgram) {
-                GLES20.glDeleteProgram(n.customProgram)
-                n.customProgram = 0
-            }
+            if (!includePersistent && n.persistent) continue
+            releaseNodeGpuResources(n)
+        }
+    }
+
+    // ==================== P2：FBO 离屏帧缓冲创建与管理 ====================
+    private fun releaseFbos() {
+        fboReady = false
+        if (sceneFbo != 0) { GLES20.glDeleteFramebuffers(1, intArrayOf(sceneFbo), 0); sceneFbo = 0 }
+        if (sceneColorTex != 0) { GLES20.glDeleteTextures(1, intArrayOf(sceneColorTex), 0); sceneColorTex = 0 }
+        if (lightFbo != 0) { GLES20.glDeleteFramebuffers(1, intArrayOf(lightFbo), 0); lightFbo = 0 }
+        if (lightMapTex != 0) { GLES20.glDeleteTextures(1, intArrayOf(lightMapTex), 0); lightMapTex = 0 }
+    }
+
+    private fun createFboTarget(w: Int, h: Int): Pair<Int, Int> {
+        val fbos = IntArray(1)
+        val texs = IntArray(1)
+        GLES20.glGenFramebuffers(1, fbos, 0)
+        GLES20.glGenTextures(1, texs, 0)
+
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texs[0])
+        GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, w, h, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbos[0])
+        GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, texs[0], 0)
+        val status = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+
+        return if (status == GLES20.GL_FRAMEBUFFER_COMPLETE) {
+            fbos[0] to texs[0]
+        } else {
+            GLES20.glDeleteFramebuffers(1, fbos, 0)
+            GLES20.glDeleteTextures(1, texs, 0)
+            0 to 0
+        }
+    }
+
+    private fun recreateFbos(w: Int, h: Int) {
+        releaseFbos()
+        lightW = max(1, w / 2)
+        lightH = max(1, h / 2)
+        val (sf, st) = createFboTarget(w, h)
+        val (lf, lt) = createFboTarget(lightW, lightH)
+        if (sf != 0 && lf != 0) {
+            sceneFbo = sf; sceneColorTex = st
+            lightFbo = lf; lightMapTex = lt
+            fboReady = (lightProgram != 0 && postProgram != 0)
+        } else {
+            releaseFbos()
         }
     }
 
@@ -504,25 +617,78 @@ class ZeroEngineView(
 
         whiteTexId = createSolidWhiteTexture()
         defaultLitProgram = buildShaderProgram(VERTEX_SHADER, DEFAULT_LIT_FRAGMENT_SHADER)
+        lightProgram = buildShaderProgram(VERTEX_SHADER, LIGHT_FRAGMENT_SHADER)
+        postProgram = buildShaderProgram(POST_VERTEX_SHADER, POST_FRAGMENT_SHADER)
 
         initRhinoVM()
-        loadSceneContent(sceneJson)
+        loadSceneContent(sceneJson, groupName = "main", additive = false)
         lastFrameNs = System.nanoTime()
     }
 
-    private fun loadSceneContent(rawJson: String) {
-        releaseSceneGpuResources()
-        nodes.clear()
-        pendingAdd.clear()
-        pendingRemove.clear()
-        activeTweens.clear()
-        debugRays.clear()
-        camTarget = null
-        camBoundsEnabled = false
-        parseSceneJson(rawJson, nodes)
-        nodes.forEach { bindNodeScript(it) }
+    private fun readSceneText(sceneFile: String): String? {
+        val norm = normalizeSceneName(sceneFile)
+        preloadedSceneCache[norm]?.let { return it }
+        val file = File(File(projectDir, "scenes"), norm)
+        if (!file.exists()) return null
+        val txt = file.readText()
+        preloadedSceneCache[norm] = txt
+        return txt
+    }
+
+    private fun preloadSceneAsync(sceneFile: String) {
+        val norm = normalizeSceneName(sceneFile)
+        if (preloadedSceneCache.containsKey(norm)) return
+        sceneIoExecutor.execute {
+            try {
+                val file = File(File(projectDir, "scenes"), norm)
+                if (file.exists()) {
+                    preloadedSceneCache[norm] = file.readText()
+                    onConsoleLog("[ASYNC] 后台预加载完成: $norm")
+                } else {
+                    onConsoleLog("[ASYNC 警告] 预加载找不到文件: $norm")
+                }
+            } catch (e: Exception) {
+                onConsoleLog("[ASYNC 错误] ${e.message}")
+            }
+        }
+    }
+
+    private fun loadSceneContent(
+        rawJson: String,
+        groupName: String,
+        additive: Boolean,
+        offsetX: Float = 0f,
+        offsetY: Float = 0f
+    ) {
+        if (!additive) {
+            releaseSceneGpuResources(includePersistent = false)
+            val kept = nodes.filter { it.persistent }
+            nodes.clear()
+            nodes.addAll(kept)
+            pendingAdd.removeAll { !it.persistent }
+            pendingRemove.clear()
+            activeTweens.removeAll { !it.node.persistent }
+            debugRays.clear()
+            if (camTarget != null && camTarget?.persistent != true) {
+                camTarget = null
+            }
+            camBoundsEnabled = false
+        }
+
+        val newNodes = mutableListOf<GameNode>()
+        parseSceneJson(rawJson, newNodes, groupName, applyCamera = !additive)
+        if (additive && (offsetX != 0f || offsetY != 0f)) {
+            for (n in newNodes) {
+                if (n.parent.isEmpty() && n.layer == "World") {
+                    n.x += offsetX
+                    n.y += offsetY
+                }
+            }
+        }
+        nodes.addAll(newNodes)
+        newNodes.forEach { bindNodeScript(it) }
         rebuildSpatialIndex()
-        nodes.toList().forEach { callLifecycle(it, "onReady") }
+        newNodes.forEach { callLifecycle(it, "onReady") }
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -530,6 +696,7 @@ class ZeroEngineView(
         surfaceH = max(1, height)
         GLES20.glViewport(0, 0, surfaceW, surfaceH)
         Matrix.orthoM(uiVpMatrix, 0, 0f, 1080f, 1920f, 0f, -100f, 100f)
+        recreateFbos(surfaceW, surfaceH)
     }
 
     // ==================== P1：独立碰撞体边界计算与空间哈希索引 ====================
@@ -539,7 +706,6 @@ class ZeroEngineView(
         val rawH = if (n.colHeight > 0f) n.colHeight else n.height
         val hw = rawW * abs(gt.gSx) * 0.5f
         val hh = rawH * abs(gt.gSy) * 0.5f
-        // 节点水平翻转（scaleX < 0）时，自动镜像 colOffsetX，方便动作游戏左右出刀
         val cx = gt.gx + n.colOffsetX * gt.gSx
         val cy = gt.gy + n.colOffsetY * gt.gSy
         return ColliderBounds(cx, cy, hw, hh)
@@ -596,6 +762,28 @@ class ZeroEngineView(
         }
     }
 
+    private fun updateFadeTransition(rawDt: Float) {
+        if (fadeSpeed > 0f) {
+            val step = fadeSpeed * rawDt
+            if (postFade < fadeTarget) {
+                postFade = min(fadeTarget, postFade + step)
+            } else if (postFade > fadeTarget) {
+                postFade = max(fadeTarget, postFade - step)
+            }
+            if (abs(postFade - fadeTarget) < 0.001f) {
+                postFade = fadeTarget
+                fadeSpeed = 0f
+                val nextScene = pendingFadeScene
+                if (nextScene != null && postFade >= 0.99f) {
+                    pendingFadeScene = null
+                    pendingSceneLoad = nextScene
+                    fadeTarget = 0f
+                    fadeSpeed = 1f / max(0.05f, fadeSceneDur)
+                }
+            }
+        }
+    }
+
     override fun onDrawFrame(gl: GL10?) {
         val now = System.nanoTime()
         val rawDt = ((now - lastFrameNs) / 1_000_000_000.0).toFloat().coerceIn(0.001f, 0.05f)
@@ -603,14 +791,45 @@ class ZeroEngineView(
         val instFps = 1f / rawDt
         smoothedFps = smoothedFps * 0.9f + instFps * 0.1f
 
+        updateFadeTransition(rawDt)
+
+        // 处理主场景切换（优先读后台预加载缓存）
         pendingSceneLoad?.let { nextSceneFile ->
             pendingSceneLoad = null
-            val file = File(File(projectDir, "scenes"), nextSceneFile)
-            if (file.exists()) {
-                onConsoleLog("[SCENE] 切换关卡场景 -> $nextSceneFile")
-                loadSceneContent(file.readText())
+            val norm = normalizeSceneName(nextSceneFile)
+            val txt = readSceneText(norm)
+            if (txt != null) {
+                onConsoleLog("[SCENE] 切换关卡场景 -> $norm")
+                loadSceneContent(txt, groupName = norm, additive = false)
             } else {
-                onConsoleLog("[SCENE 错误] 找不到场景文件: $nextSceneFile")
+                onConsoleLog("[SCENE 错误] 找不到场景文件: $norm")
+            }
+        }
+
+        // 处理叠加场景加载
+        if (pendingAdditiveLoads.isNotEmpty()) {
+            val reqs = pendingAdditiveLoads.toList()
+            pendingAdditiveLoads.clear()
+            for (req in reqs) {
+                val norm = normalizeSceneName(req.sceneFile)
+                val txt = readSceneText(norm)
+                if (txt != null) {
+                    onConsoleLog("[SCENE] 叠加加载场景 -> $norm")
+                    loadSceneContent(txt, groupName = norm, additive = true, offsetX = req.offsetX, offsetY = req.offsetY)
+                } else {
+                    onConsoleLog("[SCENE 错误] 叠加加载找不到文件: $norm")
+                }
+            }
+        }
+
+        // 处理按场景组卸载
+        if (pendingUnloadScenes.isNotEmpty()) {
+            val groups = pendingUnloadScenes.toSet()
+            pendingUnloadScenes.clear()
+            for (n in nodes) {
+                if (!n.persistent && n.sceneGroup in groups) {
+                    pendingRemove.add(n)
+                }
             }
         }
 
@@ -645,7 +864,6 @@ class ZeroEngineView(
             added.forEach { bindNodeScript(it); callLifecycle(it, "onReady") }
         }
 
-        // 每帧开始重建空间哈希网格，加速所有物理移动与射线检测
         rebuildSpatialIndex()
 
         nodes.toList().forEach { n ->
@@ -669,20 +887,12 @@ class ZeroEngineView(
             }
         }
 
-        // 脚本位移结束后刷新空间索引，进行高精度战斗判定
         rebuildSpatialIndex()
         processCombatOverlaps()
 
         if (pendingRemove.isNotEmpty()) {
             for (rem in pendingRemove) {
-                if (rem.tileVboId != 0) {
-                    GLES20.glDeleteBuffers(1, intArrayOf(rem.tileVboId), 0)
-                    rem.tileVboId = 0
-                }
-                if (rem.customProgram != 0 && rem.customProgram != defaultLitProgram) {
-                    GLES20.glDeleteProgram(rem.customProgram)
-                    rem.customProgram = 0
-                }
+                releaseNodeGpuResources(rem)
             }
             nodes.removeAll(pendingRemove)
             pendingRemove.clear()
@@ -695,65 +905,205 @@ class ZeroEngineView(
         return maxX >= viewMinX && minX <= viewMaxX && maxY >= viewMinY && minY <= viewMaxY
     }
 
+    // ==================== P2：多 Pass FBO 离屏光照 + 后处理渲染管线 ====================
     private fun renderSceneFrame() {
         frameDrawCalls = 0
         frameCulled = 0
 
-        val lights = nodes.filter { it.visible && it.nodeType == "PointLight" }.take(8)
-        val lightPosArr = FloatArray(8 * 4)
-        val lightColArr = FloatArray(8 * 4)
-        lights.forEachIndexed { idx, l ->
-            val gt = getGlobalTransform(l)
-            lightPosArr[idx * 4] = gt.gx
-            lightPosArr[idx * 4 + 1] = gt.gy
-            lightPosArr[idx * 4 + 2] = gt.gz
-            lightPosArr[idx * 4 + 3] = l.lightRadius
-            lightColArr[idx * 4] = l.r * l.lightIntensity
-            lightColArr[idx * 4 + 1] = l.g * l.lightIntensity
-            lightColArr[idx * 4 + 2] = l.b * l.lightIntensity
-            lightColArr[idx * 4 + 3] = 1f
-        }
-
-        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
-
+        val allLights = nodes.filter { it.visible && it.nodeType == "PointLight" }
+        lastFrameLights = allLights.size
+        val worldNodes = nodes.filter { it.visible && it.layer != "UI" && it.nodeType != "PointLight" }
+            .sortedWith(compareBy({ it.zIndex }, { it.nodeType != "TileMap" }, { it.tiltX >= -45f }, { getGlobalTransform(it).gy }))
         val casters = nodes.filter { it.visible && it.layer != "UI" && it.shadowCaster && it.nodeType != "PointLight" }
-        if (lights.isNotEmpty() && casters.isNotEmpty()) {
-            for (caster in casters) {
-                val cg = getGlobalTransform(caster)
-                val pad = max(caster.width * abs(cg.gSx), caster.height * abs(cg.gSy)) * 1.6f
-                if (isBoxInView(cg.gx - pad, cg.gx + pad, cg.gy - pad, cg.gy + pad)) {
-                    renderDynamicShadow(caster, lights, vpMatrix)
+        val particleNodes = worldNodes.filter { it.nodeType == "ParticleEmitter" }
+        val solidWorldNodes = worldNodes.filter { it.nodeType != "ParticleEmitter" }
+
+        val useFbo = postFxEnabled && fboReady
+
+        if (useFbo) {
+            // Pass 1：将所有世界实体与动态阴影无光照绘制到 sceneFbo
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, sceneFbo)
+            GLES20.glViewport(0, 0, surfaceW, surfaceH)
+            GLES20.glClearColor(0.04f, 0.05f, 0.08f, 1f)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+
+            if (allLights.isNotEmpty() && casters.isNotEmpty()) {
+                for (caster in casters) {
+                    val cg = getGlobalTransform(caster)
+                    val pad = max(caster.width * abs(cg.gSx), caster.height * abs(cg.gSy)) * 1.6f
+                    if (isBoxInView(cg.gx - pad, cg.gx + pad, cg.gy - pad, cg.gy + pad)) {
+                        renderDynamicShadow(caster, allLights, vpMatrix)
+                    }
+                }
+            }
+
+            val emptyArr = FloatArray(4)
+            for (n in solidWorldNodes) {
+                when (n.nodeType) {
+                    "TileMap" -> renderTileMap(n, vpMatrix, isWorld = true, enableInlineLight = false, 0, emptyArr, emptyArr)
+                    else -> renderNode(n, vpMatrix, isWorld = true, enableInlineLight = false, 0, emptyArr, emptyArr)
+                }
+            }
+
+            // Pass 2：将无限数量点光源累加渲染到半分辨率 lightFbo
+            renderLightsToFbo(allLights)
+
+            // Pass 3：在默认屏幕上合成光照 + 泛光 + 色差 + 暗角 + 转场黑屏
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+            GLES20.glViewport(0, 0, surfaceW, surfaceH)
+            GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1f)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+            renderPostComposite()
+
+            // 自发光粒子叠加在光照合成之后（暗场依然耀眼，同时响应转场淡出）
+            for (pNode in particleNodes) {
+                renderParticles(pNode, vpMatrix, isWorld = true, fadeAlpha = 1f - postFade)
+            }
+        } else {
+            // 降级直出模式（兼容关闭后处理或不支持 FBO 的极旧设备）
+            val lights = allLights.take(8)
+            val lightPosArr = FloatArray(8 * 4)
+            val lightColArr = FloatArray(8 * 4)
+            lights.forEachIndexed { idx, l ->
+                val gt = getGlobalTransform(l)
+                lightPosArr[idx * 4] = gt.gx
+                lightPosArr[idx * 4 + 1] = gt.gy
+                lightPosArr[idx * 4 + 2] = gt.gz
+                lightPosArr[idx * 4 + 3] = l.lightRadius
+                lightColArr[idx * 4] = l.r * l.lightIntensity
+                lightColArr[idx * 4 + 1] = l.g * l.lightIntensity
+                lightColArr[idx * 4 + 2] = l.b * l.lightIntensity
+                lightColArr[idx * 4 + 3] = 1f
+            }
+
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+            GLES20.glViewport(0, 0, surfaceW, surfaceH)
+            GLES20.glClearColor(0.04f, 0.05f, 0.08f, 1f)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
+
+            if (lights.isNotEmpty() && casters.isNotEmpty()) {
+                for (caster in casters) {
+                    val cg = getGlobalTransform(caster)
+                    val pad = max(caster.width * abs(cg.gSx), caster.height * abs(cg.gSy)) * 1.6f
+                    if (isBoxInView(cg.gx - pad, cg.gx + pad, cg.gy - pad, cg.gy + pad)) {
+                        renderDynamicShadow(caster, lights, vpMatrix)
+                    }
+                }
+            }
+
+            for (n in worldNodes) {
+                when (n.nodeType) {
+                    "ParticleEmitter" -> renderParticles(n, vpMatrix, isWorld = true, fadeAlpha = 1f)
+                    "TileMap" -> renderTileMap(n, vpMatrix, isWorld = true, enableInlineLight = true, lights.size, lightPosArr, lightColArr)
+                    else -> renderNode(n, vpMatrix, isWorld = true, enableInlineLight = true, lights.size, lightPosArr, lightColArr)
                 }
             }
         }
 
-        val worldNodes = nodes.filter { it.visible && it.layer != "UI" && it.nodeType != "PointLight" }
-            .sortedWith(compareBy({ it.zIndex }, { it.nodeType != "TileMap" }, { it.tiltX >= -45f }, { getGlobalTransform(it).gy }))
-
-        for (n in worldNodes) {
-            when (n.nodeType) {
-                "ParticleEmitter" -> renderParticles(n, vpMatrix, isWorld = true)
-                "TileMap" -> renderTileMap(n, vpMatrix, isWorld = true, lights.size, lightPosArr, lightColArr)
-                else -> renderNode(n, vpMatrix, isWorld = true, lights.size, lightPosArr, lightColArr)
-            }
-        }
-
-        // P1：调试线框渲染层（绘制在世界物体之上、UI 之下）
+        // P1：调试线框渲染层
         if (debugDrawEnabled) {
             renderDebugOverlay(vpMatrix)
         }
 
+        // Pass 4：锐利 UI HUD 层（不受世界光照与色差影响）
+        val emptyUiArr = FloatArray(4)
         val uiNodes = nodes.filter { it.visible && it.layer == "UI" }.sortedBy { it.zIndex }
         for (n in uiNodes) {
             if (n.nodeType == "ParticleEmitter") {
-                renderParticles(n, uiVpMatrix, isWorld = false)
+                renderParticles(n, uiVpMatrix, isWorld = false, fadeAlpha = 1f)
             } else {
-                renderNode(n, uiVpMatrix, isWorld = false, 0, lightPosArr, lightColArr)
+                renderNode(n, uiVpMatrix, isWorld = false, enableInlineLight = false, 0, emptyUiArr, emptyUiArr)
             }
         }
 
         lastFrameDrawCalls = frameDrawCalls
         lastFrameCulled = frameCulled
+    }
+
+    private fun renderLightsToFbo(lights: List<GameNode>) {
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, lightFbo)
+        GLES20.glViewport(0, 0, lightW, lightH)
+        GLES20.glClearColor(ambientR, ambientG, ambientB, 1f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+
+        if (lights.isEmpty()) return
+
+        GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE)
+        GLES20.glUseProgram(lightProgram)
+
+        val posLoc = GLES20.glGetAttribLocation(lightProgram, "aPosition")
+        val uvLoc = GLES20.glGetAttribLocation(lightProgram, "aTexCoord")
+        val mvpLoc = GLES20.glGetUniformLocation(lightProgram, "uMVP")
+        val modelLoc = GLES20.glGetUniformLocation(lightProgram, "uModel")
+        val uvRectLoc = GLES20.glGetUniformLocation(lightProgram, "uUvRect")
+        val colLoc = GLES20.glGetUniformLocation(lightProgram, "uColor")
+
+        quadBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(posLoc)
+        GLES20.glVertexAttribPointer(posLoc, 3, GLES20.GL_FLOAT, false, 20, quadBuffer)
+        quadBuffer.position(3)
+        GLES20.glEnableVertexAttribArray(uvLoc)
+        GLES20.glVertexAttribPointer(uvLoc, 2, GLES20.GL_FLOAT, false, 20, quadBuffer)
+        GLES20.glUniform4f(uvRectLoc, 0f, 0f, 1f, 1f)
+
+        for (l in lights) {
+            val gt = getGlobalTransform(l)
+            val rad = max(8f, l.lightRadius)
+            if (!isBoxInView(gt.gx - rad, gt.gx + rad, gt.gy - rad, gt.gy + rad)) {
+                frameCulled++
+                continue
+            }
+            Matrix.setIdentityM(modelMatrix, 0)
+            Matrix.translateM(modelMatrix, 0, gt.gx, gt.gy, gt.gz)
+            Matrix.scaleM(modelMatrix, 0, rad * 2f, rad * 2f, 1f)
+            Matrix.multiplyMM(mvpMatrix, 0, vpMatrix, 0, modelMatrix, 0)
+
+            GLES20.glUniformMatrix4fv(mvpLoc, 1, false, mvpMatrix, 0)
+            GLES20.glUniformMatrix4fv(modelLoc, 1, false, modelMatrix, 0)
+            GLES20.glUniform4f(colLoc, l.r * l.lightIntensity, l.g * l.lightIntensity, l.b * l.lightIntensity, 1f)
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+            frameDrawCalls++
+        }
+
+        GLES20.glDisableVertexAttribArray(posLoc)
+        GLES20.glDisableVertexAttribArray(uvLoc)
+        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+    }
+
+    private fun renderPostComposite() {
+        GLES20.glDisable(GLES20.GL_BLEND)
+        GLES20.glUseProgram(postProgram)
+
+        val posLoc = GLES20.glGetAttribLocation(postProgram, "aPosition")
+        val uvLoc = GLES20.glGetAttribLocation(postProgram, "aTexCoord")
+        fullScreenQuadBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(posLoc)
+        GLES20.glVertexAttribPointer(posLoc, 2, GLES20.GL_FLOAT, false, 16, fullScreenQuadBuffer)
+        fullScreenQuadBuffer.position(2)
+        GLES20.glEnableVertexAttribArray(uvLoc)
+        GLES20.glVertexAttribPointer(uvLoc, 2, GLES20.GL_FLOAT, false, 16, fullScreenQuadBuffer)
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, sceneColorTex)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(postProgram, "uSceneTex"), 0)
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lightMapTex)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(postProgram, "uLightTex"), 1)
+
+        GLES20.glUniform2f(GLES20.glGetUniformLocation(postProgram, "uTexelSize"), 1f / surfaceW, 1f / surfaceH)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(postProgram, "uBloom"), postBloom)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(postProgram, "uVignette"), postVignette)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(postProgram, "uChromatic"), postChromatic)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(postProgram, "uFade"), postFade)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        frameDrawCalls++
+
+        GLES20.glDisableVertexAttribArray(posLoc)
+        GLES20.glDisableVertexAttribArray(uvLoc)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glEnable(GLES20.GL_BLEND)
     }
 
     // ==================== P1：一键 Debug 线框绘制 ====================
@@ -925,7 +1275,7 @@ class ZeroEngineView(
         }
     }
 
-    // ==================== P0：TileMap 静态 VBO 合批（整张地图仅 1 次 DrawCall） ====================
+    // ==================== P0：TileMap 静态 VBO 合批 ====================
     private fun buildTileMapVbo(n: GameNode) {
         if (n.tileVboId != 0) {
             GLES20.glDeleteBuffers(1, intArrayOf(n.tileVboId), 0)
@@ -970,11 +1320,9 @@ class ZeroEngineView(
             val u1 = u0 + uScale
             val v1 = v0 + vScale
 
-            // Triangle 1: TL, TR, BL
             data[offset++] = x0; data[offset++] = y0; data[offset++] = 0f; data[offset++] = u0; data[offset++] = v0
             data[offset++] = x1; data[offset++] = y0; data[offset++] = 0f; data[offset++] = u1; data[offset++] = v0
             data[offset++] = x0; data[offset++] = y1; data[offset++] = 0f; data[offset++] = u0; data[offset++] = v1
-            // Triangle 2: TR, BR, BL
             data[offset++] = x1; data[offset++] = y0; data[offset++] = 0f; data[offset++] = u1; data[offset++] = v0
             data[offset++] = x1; data[offset++] = y1; data[offset++] = 0f; data[offset++] = u1; data[offset++] = v1
             data[offset++] = x0; data[offset++] = y1; data[offset++] = 0f; data[offset++] = u0; data[offset++] = v1
@@ -1004,6 +1352,7 @@ class ZeroEngineView(
         n: GameNode,
         activeVp: FloatArray,
         isWorld: Boolean,
+        enableInlineLight: Boolean,
         lightCount: Int,
         lightPos: FloatArray,
         lightCol: FloatArray
@@ -1043,12 +1392,14 @@ class ZeroEngineView(
         GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uColor"), n.r, n.g, n.b, n.a)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uTime"), engineTime)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uFlash"), 0f)
-        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uEnableLight"), if (isWorld) 1 else 0)
-        GLES20.glUniform3f(GLES20.glGetUniformLocation(prog, "uAmbient"), ambientR, ambientG, ambientB)
-        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uLightCount"), lightCount)
-        if (lightCount > 0) {
-            GLES20.glUniform4fv(GLES20.glGetUniformLocation(prog, "uLightPos"), lightCount, lightPos, 0)
-            GLES20.glUniform4fv(GLES20.glGetUniformLocation(prog, "uLightColor"), lightCount, lightCol, 0)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uEnableLight"), if (enableInlineLight) 1 else 0)
+        if (enableInlineLight) {
+            GLES20.glUniform3f(GLES20.glGetUniformLocation(prog, "uAmbient"), ambientR, ambientG, ambientB)
+            GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uLightCount"), lightCount)
+            if (lightCount > 0) {
+                GLES20.glUniform4fv(GLES20.glGetUniformLocation(prog, "uLightPos"), lightCount, lightPos, 0)
+                GLES20.glUniform4fv(GLES20.glGetUniformLocation(prog, "uLightColor"), lightCount, lightCol, 0)
+            }
         }
 
         val texId = if (n.texture.isNotEmpty()) getImageTexture(n.texture) else whiteTexId
@@ -1155,7 +1506,8 @@ class ZeroEngineView(
         }
     }
 
-    private fun renderParticles(n: GameNode, activeVp: FloatArray, isWorld: Boolean) {
+    private fun renderParticles(n: GameNode, activeVp: FloatArray, isWorld: Boolean, fadeAlpha: Float) {
+        if (fadeAlpha <= 0.001f) return
         val gt = getGlobalTransform(n)
         val prog = defaultLitProgram
         GLES20.glUseProgram(prog)
@@ -1197,7 +1549,7 @@ class ZeroEngineView(
 
             GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uMVP"), 1, false, mvpMatrix, 0)
             GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uModel"), 1, false, modelMatrix, 0)
-            GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uColor"), n.r, n.g, n.b, p.alpha * ratio)
+            GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uColor"), n.r, n.g, n.b, p.alpha * ratio * fadeAlpha)
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
             frameDrawCalls++
         }
@@ -1377,6 +1729,7 @@ class ZeroEngineView(
         n: GameNode,
         activeVp: FloatArray,
         isWorld: Boolean,
+        enableInlineLight: Boolean,
         lightCount: Int,
         lightPos: FloatArray,
         lightCol: FloatArray
@@ -1448,13 +1801,14 @@ class ZeroEngineView(
             GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uUvRect"), uOffset, vOffset, uScale, vScale)
         }
 
-        val litFlag = if (isWorld) 1 else 0
-        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uEnableLight"), litFlag)
-        GLES20.glUniform3f(GLES20.glGetUniformLocation(prog, "uAmbient"), ambientR, ambientG, ambientB)
-        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uLightCount"), lightCount)
-        if (lightCount > 0) {
-            GLES20.glUniform4fv(GLES20.glGetUniformLocation(prog, "uLightPos"), lightCount, lightPos, 0)
-            GLES20.glUniform4fv(GLES20.glGetUniformLocation(prog, "uLightColor"), lightCount, lightCol, 0)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uEnableLight"), if (enableInlineLight) 1 else 0)
+        if (enableInlineLight) {
+            GLES20.glUniform3f(GLES20.glGetUniformLocation(prog, "uAmbient"), ambientR, ambientG, ambientB)
+            GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uLightCount"), lightCount)
+            if (lightCount > 0) {
+                GLES20.glUniform4fv(GLES20.glGetUniformLocation(prog, "uLightPos"), lightCount, lightPos, 0)
+                GLES20.glUniform4fv(GLES20.glGetUniformLocation(prog, "uLightColor"), lightCount, lightCol, 0)
+            }
         }
 
         val texId = when {
@@ -1571,7 +1925,7 @@ class ZeroEngineView(
         }
     }
 
-    // ==================== P1：空间加速射线检测 (支持实体包围盒与 TileMap O(1) 范围查询) ====================
+    // ==================== P1：空间加速射线检测 ====================
     private fun performRaycast(x1: Float, y1: Float, x2: Float, y2: Float, ignoreTag: String, mask: Int): Scriptable {
         var closestT = 1.0f
         var hitNode: GameNode? = null
@@ -1732,13 +2086,78 @@ class ZeroEngineView(
             null
         })
         ScriptableObject.putProperty(engineApi, "isDebugDraw", jsFunc { debugDrawEnabled })
+        // P2：屏幕后处理与转场 API
+        ScriptableObject.putProperty(engineApi, "setPostFX", jsFunc { args ->
+            val cfg = args.getOrNull(0) as? Scriptable ?: return@jsFunc null
+            postFxEnabled = getJsBool(cfg, "enabled", postFxEnabled)
+            postBloom = getJsFloat(cfg, "bloom", postBloom).coerceIn(0f, 3f)
+            postVignette = getJsFloat(cfg, "vignette", postVignette).coerceIn(0f, 2f)
+            postChromatic = getJsFloat(cfg, "chromatic", postChromatic).coerceIn(0f, 3f)
+            postFade = getJsFloat(cfg, "fade", postFade).coerceIn(0f, 1f)
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "setFade", jsFunc { args ->
+            val target = ((args.getOrNull(0) as? Number)?.toFloat() ?: 0f).coerceIn(0f, 1f)
+            val dur = (args.getOrNull(1) as? Number)?.toFloat() ?: 0.3f
+            pendingFadeScene = null
+            if (dur <= 0.01f) {
+                postFade = target
+                fadeTarget = target
+                fadeSpeed = 0f
+            } else {
+                fadeTarget = target
+                fadeSpeed = abs(target - postFade) / dur
+            }
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "fadeToScene", jsFunc { args ->
+            val sName = RhinoContext.toString(args.getOrNull(0) ?: "")
+            val dur = ((args.getOrNull(1) as? Number)?.toFloat() ?: 0.35f).coerceAtLeast(0.05f)
+            if (sName.isNotEmpty()) {
+                preloadSceneAsync(sName)
+                pendingFadeScene = normalizeSceneName(sName)
+                fadeSceneDur = dur
+                fadeTarget = 1f
+                fadeSpeed = 1f / dur
+            }
+            null
+        })
+        // P2：后台异步预加载与多场景叠加/卸载 API
+        ScriptableObject.putProperty(engineApi, "preloadScene", jsFunc { args ->
+            val sName = RhinoContext.toString(args.getOrNull(0) ?: "")
+            if (sName.isNotEmpty()) preloadSceneAsync(sName)
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "loadSceneAdditive", jsFunc { args ->
+            val sName = RhinoContext.toString(args.getOrNull(0) ?: "")
+            val ox = (args.getOrNull(1) as? Number)?.toFloat() ?: 0f
+            val oy = (args.getOrNull(2) as? Number)?.toFloat() ?: 0f
+            if (sName.isNotEmpty()) {
+                pendingAdditiveLoads.add(AdditiveLoadReq(normalizeSceneName(sName), ox, oy))
+            }
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "unloadScene", jsFunc { args ->
+            val sName = RhinoContext.toString(args.getOrNull(0) ?: "")
+            if (sName.isNotEmpty()) {
+                pendingUnloadScenes.add(normalizeSceneName(sName))
+            }
+            null
+        })
+        ScriptableObject.putProperty(engineApi, "clearSceneCache", jsFunc {
+            preloadedSceneCache.clear()
+            null
+        })
         ScriptableObject.putProperty(engineApi, "getStats", jsFunc {
             val obj = rhino.newObject(globalScope)
             ScriptableObject.putProperty(obj, "fps", smoothedFps.toDouble())
             ScriptableObject.putProperty(obj, "drawCalls", lastFrameDrawCalls)
             ScriptableObject.putProperty(obj, "culled", lastFrameCulled)
             ScriptableObject.putProperty(obj, "nodes", nodes.size)
+            ScriptableObject.putProperty(obj, "lights", lastFrameLights)
             ScriptableObject.putProperty(obj, "spatialCells", spatialGrid.size)
+            ScriptableObject.putProperty(obj, "cachedScenes", preloadedSceneCache.size)
+            ScriptableObject.putProperty(obj, "fbo", postFxEnabled && fboReady)
             ScriptableObject.putProperty(obj, "textures", textureCache.size)
             ScriptableObject.putProperty(obj, "textTextures", textTextureCache.size)
             obj
@@ -1746,7 +2165,7 @@ class ZeroEngineView(
         ScriptableObject.putProperty(engineApi, "loadScene", jsFunc { args ->
             val sName = RhinoContext.toString(args.getOrNull(0) ?: "")
             if (sName.isNotEmpty()) {
-                pendingSceneLoad = if (sName.endsWith(".scene")) sName else "$sName.scene"
+                pendingSceneLoad = normalizeSceneName(sName)
             }
             null
         })
@@ -1919,6 +2338,7 @@ class ZeroEngineView(
                 layer = if (rawLayer.startsWith("UI", ignoreCase = true)) "UI" else "World",
                 parent = parentName,
                 tag = getJsStr(cfg, "tag", "default"),
+                persistent = getJsBool(cfg, "persistent", false),
                 x = getJsFloat(cfg, "x", 0f),
                 y = getJsFloat(cfg, "y", 0f),
                 z = getJsFloat(cfg, "z", 0f),
@@ -1958,10 +2378,10 @@ class ZeroEngineView(
             val sx = (args.getOrNull(1) as? Number)?.toFloat() ?: 0f
             val sy = (args.getOrNull(2) as? Number)?.toFloat() ?: 0f
             val sz = (args.getOrNull(3) as? Number)?.toFloat() ?: 0f
-            val file = File(File(projectDir, "scenes"), sceneFile)
-            if (file.exists()) {
+            val txt = readSceneText(sceneFile)
+            if (txt != null) {
                 val loaded = mutableListOf<GameNode>()
-                parseSceneJson(file.readText(), loaded)
+                parseSceneJson(txt, loaded, groupName = normalizeSceneName(sceneFile), applyCamera = false)
                 loaded.forEach {
                     if (it.parent.isEmpty()) { it.x += sx; it.y += sy; it.z += sz }
                     pendingAdd.add(it)
@@ -2157,7 +2577,6 @@ class ZeroEngineView(
         val startBounds = getColliderBounds(n)
         val prevBottom = startBounds.cy + startBounds.hh
 
-        // 预查询移动前后扫过的空间区域（一次查网格，X/Y/Trigger 复用）
         val sweepMinX = min(startBounds.cx, startBounds.cx + n.vx * dt) - startBounds.hw - 32f
         val sweepMaxX = max(startBounds.cx, startBounds.cx + n.vx * dt) + startBounds.hw + 32f
         val sweepMinY = min(startBounds.cy, startBounds.cy + n.vy * dt) - startBounds.hh - 32f
@@ -2376,11 +2795,16 @@ class ZeroEngineView(
         }
     }
 
-    private fun parseSceneJson(raw: String, outList: MutableList<GameNode>) {
+    private fun parseSceneJson(
+        raw: String,
+        outList: MutableList<GameNode>,
+        groupName: String = "main",
+        applyCamera: Boolean = true
+    ) {
         try {
             val root = JSONObject(raw)
             val camObj = root.optJSONObject("camera")
-            if (camObj != null) {
+            if (applyCamera && camObj != null) {
                 camMode = camObj.optString("mode", "2.5D")
                 camPitch = camObj.optDouble("pitch", 48.0).toFloat()
                 camDistance = camObj.optDouble("distance", 1250.0).toFloat()
@@ -2438,6 +2862,8 @@ class ZeroEngineView(
                     layer = if (rawLayer.startsWith("UI", ignoreCase = true)) "UI" else "World",
                     parent = o.optString("parent", ""),
                     tag = o.optString("tag", "default"),
+                    sceneGroup = groupName,
+                    persistent = o.optBoolean("persistent", false),
                     x = o.optDouble("x", 0.0).toFloat(),
                     y = o.optDouble("y", 0.0).toFloat(),
                     z = o.optDouble("z", 0.0).toFloat(),
@@ -2636,7 +3062,8 @@ class ZeroEngineView(
 
     companion object {
         private val BRIDGED_PROPS = setOf(
-            "name", "tag", "x", "y", "z", "vx", "vy", "vz",
+            "name", "tag", "sceneGroup", "persistent",
+            "x", "y", "z", "vx", "vy", "vz",
             "width", "height", "rotation", "tiltX", "scaleX", "scaleY",
             "parallaxX", "parallaxY", "slopeType",
             "colOffsetX", "colOffsetY", "colWidth", "colHeight", "colLayer", "colMask",
@@ -2692,6 +3119,76 @@ class ZeroEngineView(
                 }
                 vec3 finalRgb = mix(litRgb, vec3(1.0, 1.0, 1.0), clamp(uFlash, 0.0, 1.0));
                 gl_FragColor = vec4(finalRgb, base.a);
+            }
+        """
+
+        private const val LIGHT_FRAGMENT_SHADER = """
+            precision mediump float;
+            uniform vec4 uColor;
+            varying vec2 vTexCoord;
+            void main() {
+                vec2 d = (vTexCoord - vec2(0.5, 0.5)) * 2.0;
+                float dist = length(d);
+                float atten = clamp(1.0 - dist, 0.0, 1.0);
+                atten = atten * atten;
+                gl_FragColor = vec4(uColor.rgb * atten, 1.0);
+            }
+        """
+
+        private const val POST_VERTEX_SHADER = """
+            attribute vec2 aPosition;
+            attribute vec2 aTexCoord;
+            varying vec2 vTexCoord;
+            void main() {
+                vTexCoord = aTexCoord;
+                gl_Position = vec4(aPosition, 0.0, 1.0);
+            }
+        """
+
+        private const val POST_FRAGMENT_SHADER = """
+            precision mediump float;
+            uniform sampler2D uSceneTex;
+            uniform sampler2D uLightTex;
+            uniform vec2 uTexelSize;
+            uniform float uBloom;
+            uniform float uVignette;
+            uniform float uChromatic;
+            uniform float uFade;
+            varying vec2 vTexCoord;
+            void main() {
+                vec2 uv = vTexCoord;
+                vec3 baseRgb;
+                if (uChromatic > 0.0001) {
+                    float off = uChromatic * 0.015;
+                    float r = texture2D(uSceneTex, vec2(clamp(uv.x + off, 0.0, 1.0), uv.y)).r;
+                    float g = texture2D(uSceneTex, uv).g;
+                    float b = texture2D(uSceneTex, vec2(clamp(uv.x - off, 0.0, 1.0), uv.y)).b;
+                    baseRgb = vec3(r, g, b);
+                } else {
+                    baseRgb = texture2D(uSceneTex, uv).rgb;
+                }
+                vec3 lightRgb = texture2D(uLightTex, uv).rgb;
+                vec3 col = baseRgb * lightRgb;
+
+                if (uBloom > 0.001) {
+                    vec2 stepUv = uTexelSize * 3.5;
+                    vec3 b0 = texture2D(uSceneTex, clamp(uv + vec2( stepUv.x,  stepUv.y), 0.0, 1.0)).rgb * texture2D(uLightTex, clamp(uv + vec2( stepUv.x,  stepUv.y), 0.0, 1.0)).rgb;
+                    vec3 b1 = texture2D(uSceneTex, clamp(uv + vec2(-stepUv.x,  stepUv.y), 0.0, 1.0)).rgb * texture2D(uLightTex, clamp(uv + vec2(-stepUv.x,  stepUv.y), 0.0, 1.0)).rgb;
+                    vec3 b2 = texture2D(uSceneTex, clamp(uv + vec2( stepUv.x, -stepUv.y), 0.0, 1.0)).rgb * texture2D(uLightTex, clamp(uv + vec2( stepUv.x, -stepUv.y), 0.0, 1.0)).rgb;
+                    vec3 b3 = texture2D(uSceneTex, clamp(uv + vec2(-stepUv.x, -stepUv.y), 0.0, 1.0)).rgb * texture2D(uLightTex, clamp(uv + vec2(-stepUv.x, -stepUv.y), 0.0, 1.0)).rgb;
+                    vec3 avg = (b0 + b1 + b2 + b3) * 0.25;
+                    vec3 bright = max(avg - vec3(0.55), vec3(0.0));
+                    col += bright * uBloom * 1.8;
+                }
+
+                if (uVignette > 0.001) {
+                    vec2 d = uv - vec2(0.5, 0.5);
+                    float vig = 1.0 - dot(d, d) * (uVignette * 2.2);
+                    col *= clamp(vig, 0.0, 1.0);
+                }
+
+                col = mix(col, vec3(0.0, 0.0, 0.0), clamp(uFade, 0.0, 1.0));
+                gl_FragColor = vec4(col, 1.0);
             }
         """
     }
