@@ -144,6 +144,7 @@ class ZeroEngineView(
     private val dataStore = ZeroDataStore(projectDir, onConsoleLog)
     private val physicsSystem = ZeroPhysicsSystem(onConsoleLog)
     private val lightingSystem = ZeroLightingSystem(projectDir, onConsoleLog)
+    private val rigSystem = ZeroRigAndClothSystem(onConsoleLog)
 
     private val atlasCache = ConcurrentHashMap<String, TextureAtlasData>()
     private val nodes = mutableListOf<GameNode>()
@@ -225,7 +226,7 @@ class ZeroEngineView(
         try { sceneIoExecutor.shutdownNow() } catch (_: Exception) {}
         inputSystem.clearAllPointers()
         queueEvent {
-            releaseFbos(); releaseSceneGpuResources(includePersistent = true); lightingSystem.releaseGL()
+            releaseFbos(); releaseSceneGpuResources(includePersistent = true); lightingSystem.releaseGL(); rigSystem.releaseGL()
             val texIds = (textureCache.values + textTextureCache.values).filter { it != 0 && it != whiteTexId }.toIntArray()
             if (texIds.isNotEmpty()) GLES20.glDeleteTextures(texIds.size, texIds, 0)
             textureCache.clear(); textureSizes.clear(); textTextureCache.clear()
@@ -280,6 +281,7 @@ class ZeroEngineView(
         batchProgram = ZeroShaders.buildShaderProgram(ZeroShaders.BATCH_VERTEX_SHADER, ZeroShaders.BATCH_FRAGMENT_SHADER, onConsoleLog)
         spriteBatch.init(batchProgram)
         lightingSystem.initGL()
+        rigSystem.initGL()
         initRhinoVM(); dataStore.loadI18nFromDiskIfNeeded(dataStore.currentLang)
         loadSceneContent(sceneJson, groupName = "main", additive = false); lastFrameNs = System.nanoTime()
     }
@@ -309,7 +311,7 @@ class ZeroEngineView(
             releaseSceneGpuResources(includePersistent = false)
             val kept = nodes.filter { it.persistent }
             nodes.clear(); nodes.addAll(kept); pendingAdd.removeAll { !it.persistent }; pendingRemove.clear()
-            activeTweens.removeAll { !it.node.persistent }; physicsSystem.clearRays()
+            activeTweens.removeAll { !it.node.persistent }; physicsSystem.clearRays(); rigSystem.clearAll()
             if (camTarget?.persistent != true) camTarget = null; camBoundsEnabled = false
         }
         val newNodes = mutableListOf<GameNode>()
@@ -376,6 +378,9 @@ class ZeroEngineView(
                 callLifecycle(n, "onProcess", dt)
             }
         }
+        // P9：步进骨骼 IK 约束与 Verlet 披风/丝带布料物理
+        rigSystem.update(dt, nodes) { getGlobalTransform(it) }
+
         physicsSystem.rebuildSpatialIndex(nodes, pendingRemove) { getGlobalTransform(it) }
         physicsSystem.processCombatOverlaps(nodes, pendingRemove, rhino, { getGlobalTransform(it) }, { node, fn, arg -> callLifecycle(node, fn, arg) }) { hs ->
             hitstopTimer = max(hitstopTimer, hs.coerceIn(0f, 0.35f))
@@ -443,7 +448,6 @@ class ZeroEngineView(
         val solidWorldNodes = worldNodes.filter { it.nodeType != "ParticleEmitter" && (it.nodeType == "TileMap" || it.normalMap.isEmpty()) }
         val emptyArr = FloatArray(4)
 
-        // P8：每帧收集视口内 SDF 软阴影遮挡体
         lightingSystem.collectOccluders(nodes, { x0, x1, y0, y1 -> isBoxInView(x0, x1, y0, y1) }, { getGlobalTransform(it) })
         val (lightPosArr, lightColArr) = packLightsArrays(allLights)
         val clampedLightCount = min(allLights.size, ZeroLightingSystem.MAX_LIGHTS)
@@ -463,10 +467,11 @@ class ZeroEngineView(
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0); GLES20.glViewport(0, 0, surfaceW, surfaceH)
             GLES20.glClearColor(0f, 0f, 0f, 1f); GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT); renderPostComposite()
 
-            // P8：法线贴图角色/物体走独立实时逐像素立体高光 + SDF 软阴影
             if (normalNodes.isNotEmpty() && postFade < 0.99f) {
                 normalNodes.forEach { renderNodeSingle(it, vpMatrix, true, true, clampedLightCount, lightPosArr, lightColArr) }
             }
+            // P9：渲染 Verlet 动态披风与丝带网格
+            rigSystem.renderCloths(vpMatrix, nodes, 1f - postFade, whiteTexId, { getImageTexture(it) }, { getGlobalTransform(it) }) { frameDrawCalls++ }
             if (particleNodes.isNotEmpty()) {
                 spriteBatch.begin(vpMatrix, false, ambientR, ambientG, ambientB, 0, null, null) { frameDrawCalls++ }
                 particleNodes.forEach { submitParticlesToBatch(it, true, 1f - postFade) }; spriteBatch.end()
@@ -484,6 +489,7 @@ class ZeroEngineView(
                 }
             }
             spriteBatch.end()
+            rigSystem.renderCloths(vpMatrix, nodes, 1f, whiteTexId, { getImageTexture(it) }, { getGlobalTransform(it) }) { frameDrawCalls++ }
         }
 
         if (physicsSystem.debugDrawEnabled) renderDebugOverlay(vpMatrix)
@@ -864,6 +870,34 @@ class ZeroEngineView(
         }
     }
 
+    private fun createClothFromJsConfig(cfg: Scriptable, defaultAnchor: String): String {
+        val anchorName = getJsStr(cfg, "anchor", defaultAnchor)
+        val id = getJsStr(cfg, "id", "${anchorName}_cloth_${System.nanoTime() % 1000}")
+        val anchorNode = nodes.find { it.name == anchorName }
+        val gt = anchorNode?.let { getGlobalTransform(it) }
+        rigSystem.createCloth(
+            id = id,
+            anchorNodeName = anchorName,
+            startX = gt?.gx ?: getJsFloat(cfg, "x", 540f),
+            startY = gt?.gy ?: getJsFloat(cfg, "y", 960f),
+            offsetX = getJsFloat(cfg, "offsetX", 0f),
+            offsetY = getJsFloat(cfg, "offsetY", 0f),
+            segments = getJsInt(cfg, "segments", 10),
+            segmentLen = getJsFloat(cfg, "segmentLen", 18f),
+            widthStart = getJsFloat(cfg, "widthStart", 38f),
+            widthEnd = getJsFloat(cfg, "widthEnd", 10f),
+            r = getJsFloat(cfg, "r", 0.88f),
+            g = getJsFloat(cfg, "g", 0.18f),
+            b = getJsFloat(cfg, "b", 0.24f),
+            a = getJsFloat(cfg, "a", 0.95f),
+            gravityY = getJsFloat(cfg, "gravityY", 980f),
+            windX = getJsFloat(cfg, "windX", -120f),
+            turbulence = getJsFloat(cfg, "turbulence", 180f),
+            texture = getJsStr(cfg, "texture", "")
+        )
+        return id
+    }
+
     private fun initRhinoVM() {
         rhino = RhinoContext.enter().apply { optimizationLevel = -1 }; globalScope = rhino.initStandardObjects(); dataStore.clearRuntimeCaches(); atlasCache.clear()
         ScriptableObject.putProperty(globalScope, "require", jsFunc { args -> dataStore.requireScriptModule(rhino, globalScope, RhinoContext.toString(args.getOrNull(0) ?: "")) })
@@ -877,6 +911,28 @@ class ZeroEngineView(
             (args.getOrNull(2) as? Number)?.toFloat()?.let { lightingSystem.shadowMinLight = it.coerceIn(0f, 1f) }
             null
         })
+        // P9：2D 骨骼 IK 与 Verlet 布料物理 API
+        ScriptableObject.putProperty(engineApi, "createCloth", jsFunc { args ->
+            val cfg = args.getOrNull(0) as? Scriptable ?: return@jsFunc ""
+            createClothFromJsConfig(cfg, "")
+        })
+        ScriptableObject.putProperty(engineApi, "removeCloth", jsFunc { args -> rigSystem.removeCloth(RhinoContext.toString(args.getOrNull(0) ?: "")); null })
+        ScriptableObject.putProperty(engineApi, "setGlobalWind", jsFunc { args ->
+            rigSystem.setGlobalWind((args.getOrNull(0) as? Number)?.toFloat() ?: 0f, (args.getOrNull(1) as? Number)?.toFloat() ?: 0f); null
+        })
+        ScriptableObject.putProperty(engineApi, "solveIK", jsFunc { args ->
+            val root = nodes.find { it.name == RhinoContext.toString(args.getOrNull(0) ?: "") } ?: return@jsFunc false
+            val mid = nodes.find { it.name == RhinoContext.toString(args.getOrNull(1) ?: "") } ?: return@jsFunc false
+            rigSystem.solveTwoBoneIK(root, mid, (args.getOrNull(2) as? Number)?.toFloat() ?: 0f, (args.getOrNull(3) as? Number)?.toFloat() ?: 0f, (args.getOrNull(4) as? Number)?.toFloat() ?: 80f, (args.getOrNull(5) as? Number)?.toFloat() ?: 80f, (args.getOrNull(6) as? Boolean) ?: false) { getGlobalTransform(it) }
+        })
+        ScriptableObject.putProperty(engineApi, "registerIK", jsFunc { args ->
+            rigSystem.registerTwoBoneIK(RhinoContext.toString(args.getOrNull(0) ?: ""), RhinoContext.toString(args.getOrNull(1) ?: ""), RhinoContext.toString(args.getOrNull(2) ?: ""), (args.getOrNull(3) as? Number)?.toFloat() ?: 80f, (args.getOrNull(4) as? Number)?.toFloat() ?: 80f, (args.getOrNull(5) as? Boolean) ?: false); null
+        })
+        ScriptableObject.putProperty(engineApi, "setIKTarget", jsFunc { args ->
+            rigSystem.setIkTarget(RhinoContext.toString(args.getOrNull(0) ?: ""), (args.getOrNull(1) as? Number)?.toFloat() ?: 0f, (args.getOrNull(2) as? Number)?.toFloat() ?: 0f, (args.getOrNull(3) as? Boolean) ?: true); null
+        })
+        ScriptableObject.putProperty(engineApi, "removeIK", jsFunc { args -> rigSystem.removeIk(RhinoContext.toString(args.getOrNull(0) ?: "")); null })
+
         ScriptableObject.putProperty(engineApi, "loadAtlas", jsFunc { args ->
             val d = queryAtlas(RhinoContext.toString(args.getOrNull(0) ?: "")) ?: return@jsFunc null
             rhino.newObject(globalScope).apply {
@@ -911,6 +967,7 @@ class ZeroEngineView(
             rhino.newObject(globalScope).apply {
                 ScriptableObject.putProperty(this, "fps", smoothedFps.toDouble()); ScriptableObject.putProperty(this, "drawCalls", lastFrameDrawCalls); ScriptableObject.putProperty(this, "culled", lastFrameCulled)
                 ScriptableObject.putProperty(this, "nodes", nodes.size); ScriptableObject.putProperty(this, "lights", lastFrameLights); ScriptableObject.putProperty(this, "occluders", lightingSystem.activeOccluderCount)
+                ScriptableObject.putProperty(this, "cloths", rigSystem.activeClothCount); ScriptableObject.putProperty(this, "iks", rigSystem.activeIkCount)
                 ScriptableObject.putProperty(this, "sdfShadow", lightingSystem.sdfShadowEnabled); ScriptableObject.putProperty(this, "spatialCells", physicsSystem.spatialCellsCount)
                 ScriptableObject.putProperty(this, "modules", dataStore.moduleCache.size); ScriptableObject.putProperty(this, "atlases", atlasCache.size); ScriptableObject.putProperty(this, "flags", dataStore.worldFlags.size)
                 ScriptableObject.putProperty(this, "tables", dataStore.dataTableCache.size); ScriptableObject.putProperty(this, "lang", dataStore.currentLang); ScriptableObject.putProperty(this, "fbo", postFxEnabled && fboReady)
@@ -980,6 +1037,11 @@ class ZeroEngineView(
         val selfObj = GameNodeJsProxy(n).apply { parentScope = nodeScope; prototype = nodeScope }
         n.jsObj = selfObj
 
+        // P9：节点一键挂载披风/围巾/丝带
+        ScriptableObject.putProperty(selfObj, "attachCloth", jsFunc { args ->
+            val cfg = (args.getOrNull(0) as? Scriptable) ?: rhino.newObject(globalScope)
+            createClothFromJsConfig(cfg, n.name)
+        })
         ScriptableObject.putProperty(selfObj, "setNormalMap", jsFunc { args ->
             n.normalMap = RhinoContext.toString(args.getOrNull(0) ?: "")
             (args.getOrNull(1) as? Number)?.toFloat()?.let { n.normalStrength = it }
