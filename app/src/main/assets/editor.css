@@ -1,0 +1,62 @@
+* { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, sans-serif; }
+body { background: #0b0e14; color: #e2e8f0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; user-select: none; }
+header { background: #131822; padding: 5px 8px; display: flex; flex-direction: column; gap: 5px; border-bottom: 1px solid #232c3d; }
+.header-row { display: flex; gap: 4px; align-items: center; width: 100%; overflow-x: auto; }
+select.proj-sel { background: #0b0e14; color: #38bdf8; border: 1px solid #334155; padding: 4px 5px; border-radius: 4px; font-size: 11px; font-weight: 700; max-width: 115px; }
+button { background: #1e2636; color: #e2e8f0; border: 1px solid #334155; padding: 4px 6px; border-radius: 4px; font-size: 11px; font-weight: 600; white-space: nowrap; }
+button:disabled { opacity: 0.38; }
+button.active-toggle { background: #1d4ed8; border-color: #3b82f6; color: #fff; }
+button.save-btn { background: #0284c7; border-color: #0369a1; color: #fff; }
+button.export-btn { background: #7c3aed; border-color: #6d28d9; color: #fff; }
+button.anim-btn { background: #be185d; border-color: #9d174d; color: #fff; }
+button.play { background: #10b981; border-color: #059669; color: #042f2e; font-weight: 800; margin-left: auto; }
+button.danger { background: #dc2626; border-color: #b91c1c; color: #fff; }
+
+.workspace { flex: 1; display: flex; overflow: hidden; }
+.scene-tree { width: 136px; background: #10141d; border-right: 1px solid #232c3d; display: flex; flex-direction: column; }
+.tree-header { padding: 5px; font-size: 10px; color: #94a3b8; border-bottom: 1px solid #1e2533; display: flex; flex-wrap: wrap; gap: 3px; align-items: center; }
+.tree-header button { padding: 3px 5px; font-size: 10px; }
+.tree-list { flex: 1; overflow-y: auto; padding: 4px; }
+.tree-item { padding: 5px; font-size: 11px; border-radius: 4px; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #cbd5e1; }
+.tree-item.active { background: #1e3a8a; color: #93c5fd; font-weight: 700; }
+
+.viewport { flex: 1; position: relative; background: #07090e; overflow: hidden; touch-action: none; }
+canvas { width: 100%; height: 100%; display: block; }
+.vp-hud { position: absolute; top: 6px; left: 6px; font-size: 10px; color: #94a3b8; background: rgba(11,14,20,0.82); padding: 3px 6px; border-radius: 4px; pointer-events: none; font-family: monospace; }
+
+.bottom-dock { height: 295px; background: #131822; border-top: 1px solid #232c3d; display: flex; flex-direction: column; }
+.tabs { display: flex; background: #0e121a; border-bottom: 1px solid #232c3d; }
+.tab { flex: 1; text-align: center; padding: 6px 2px; font-size: 11px; color: #94a3b8; border-bottom: 2px solid transparent; }
+.tab.active { color: #38bdf8; border-bottom-color: #38bdf8; font-weight: 700; background: #131822; }
+.dock-body { flex: 1; overflow-y: auto; padding: 8px; }
+
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.field { display: flex; flex-direction: column; gap: 2px; font-size: 10px; color: #94a3b8; }
+.field input, .field select { background: #090c12; border: 1px solid #334155; color: #fff; padding: 4px 5px; border-radius: 4px; font-size: 11px; width: 100%; }
+.field.row { flex-direction: row; align-items: center; gap: 5px; padding-top: 6px; }
+.sec-title { grid-column: 1 / -1; font-size: 10px; font-weight: 700; color: #38bdf8; border-top: 1px solid #1e293b; padding-top: 6px; margin-top: 2px; }
+
+.clip-box { margin-top: 10px; padding: 7px; background: #0c1018; border: 1px solid #232c3d; border-radius: 6px; }
+.clip-row { display: grid; grid-template-columns: 1.1fr 0.55fr 0.55fr 0.55fr 1fr auto auto; gap: 3px; align-items: center; margin-top: 5px; font-size: 10px; }
+.clip-row input { background: #090c12; border: 1px solid #334155; color: #fff; padding: 3px 4px; border-radius: 3px; font-size: 10px; width: 100%; }
+
+.palette-grid { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; max-height: 92px; overflow-y: auto; }
+.palette-cell { width: 34px; height: 34px; border: 1px solid #334155; border-radius: 4px; background-color: #090c12; background-repeat: no-repeat; position: relative; }
+.palette-cell.selected { border: 2px solid #38bdf8; box-shadow: 0 0 6px rgba(56,189,248,0.6); }
+.palette-idx { position: absolute; bottom: 0; right: 1px; font-size: 8px; color: #fff; background: rgba(0,0,0,0.65); padding: 0 2px; }
+
+.script-mode-bar { display: flex; gap: 4px; align-items: center; margin-bottom: 6px; overflow-x: auto; }
+.script-mode-bar select { background: #090c12; color: #34d399; border: 1px solid #334155; padding: 3px 5px; border-radius: 4px; font-size: 11px; font-family: monospace; flex: 1; min-width: 110px; }
+.script-toolbar { display: flex; gap: 4px; overflow-x: auto; padding-bottom: 5px; }
+.script-toolbar button { font-family: monospace; font-size: 10px; padding: 3px 6px; background: #1e293b; }
+textarea.code-box { width: 100%; height: 170px; background: #080a0f; color: #a5f3fc; border: 1px solid #334155; border-radius: 4px; padding: 7px; font-family: monospace; font-size: 11px; line-height: 1.4; resize: none; user-select: text; }
+pre#consoleOut, .doc-box { font-family: monospace; font-size: 11px; color: #cbd5e1; white-space: pre-wrap; line-height: 1.45; user-select: text; }
+.doc-box b { color: #38bdf8; }
+
+.modal-mask { position: fixed; inset: 0; background: rgba(2,6,23,0.84); display: none; align-items: center; justify-content: center; z-index: 999; padding: 18px; }
+.modal-card { background: #131822; border: 1px solid #334155; border-radius: 8px; padding: 14px; width: 100%; max-width: 340px; display: flex; flex-direction: column; gap: 10px; }
+.modal-title { font-size: 13px; font-weight: 700; color: #38bdf8; }
+.modal-input { background: #090c12; border: 1px solid #3b82f6; color: #fff; padding: 8px; border-radius: 5px; font-size: 13px; user-select: text; }
+.path-box { background: #090c12; border: 1px solid #334155; color: #34d399; padding: 8px; border-radius: 5px; font-family: monospace; font-size: 11px; word-break: break-all; user-select: text; line-height: 1.4; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.toast-bar { position: fixed; bottom: 310px; left: 50%; transform: translateX(-50%); background: rgba(15,23,42,0.95); color: #34d399; border: 1px solid #059669; padding: 6px 12px; border-radius: 6px; font-size: 11px; z-index: 998; display: none; white-space: nowrap; }
