@@ -536,4 +536,123 @@ function onNativeImagePicked(fileName, dataUrl, w, h) {
 
 function autoSave() {
   if (window.ZeroBridge) {
-    window.ZeroBridge.saveSceneFile(currentScene, JSON.stringi
+    window.ZeroBridge.saveSceneFile(currentScene, JSON.stringify({ camera: cameraCfg, nodes: serializeNodesForEngine() }));
+  }
+}
+
+function playScene() {
+  flushActiveEditorsSilent();
+  autoSave();
+  if (window.ZeroBridge) {
+    window.ZeroBridge.runGame(JSON.stringify({ camera: cameraCfg, nodes: serializeNodesForEngine() }));
+  }
+}
+
+// ==================== 节点增删与快捷片段操作 ====================
+function addNode(type) {
+  recordUndoPoint();
+  const idx = nodes.length + 1;
+  const isEmitter = type === 'ParticleEmitter';
+  const isLight = type === 'PointLight';
+  const isTile = type === 'TileMap';
+  nodes.push(normalizeNode({
+    name: `${type}_${idx}`, nodeType: type, layer: "World", parent: "",
+    tag: isLight ? 'light' : (isEmitter ? 'fx' : (isTile ? 'wall' : 'default')),
+    x: isTile ? 0 : 540, y: isTile ? 0 : 960, z: isLight ? 60 : 0,
+    width: isLight ? 60 : (isTile ? 90 : 140), height: isLight ? 60 : (isTile ? 90 : 140),
+    billboard: type === 'Sprite2D' && cameraCfg.mode === '2.5D', zIndex: isEmitter ? 6 : 1,
+    text: type === 'Label2D' ? 'Label' : '', fontSize: 44,
+    r: isLight ? 1.0 : (isEmitter ? 1.0 : (isTile ? 0.36 : 0.25)),
+    g: isLight ? 0.8 : (isEmitter ? 0.65 : (isTile ? 0.44 : 0.85)),
+    b: isLight ? 0.35 : (isEmitter ? 0.2 : (isTile ? 0.56 : 0.65)),
+    a: isEmitter ? 0.95 : 1,
+    tileSize: 90, lightRadius: 500, lightIntensity: 1.6,
+    emitRate: 24, particleLife: 1.0, particleSpeed: 150, particleSize: 16, particleGravity: -60,
+    collider: type === 'Sprite2D' || isTile
+  }));
+  selectedIndex = nodes.length - 1;
+  if (isTile) tileBrushMode = 'paint';
+  autoSave(); refreshAll();
+}
+
+function addUINode() {
+  recordUndoPoint();
+  const idx = nodes.length + 1;
+  nodes.push(normalizeNode({
+    name: `UI_Button_${idx}`, nodeType: "Sprite2D", layer: "UI", parent: "", tag: "ui",
+    x: 200, y: 1680, z: 0, width: 160, height: 160, zIndex: 100,
+    r: 0.3, g: 0.6, b: 1.0, a: 0.85
+  }));
+  selectedIndex = nodes.length - 1;
+  autoSave(); refreshAll();
+}
+
+function duplicateSelected() {
+  if (selectedIndex < 0) return;
+  recordUndoPoint();
+  const copy = normalizeNode(JSON.parse(JSON.stringify(nodes[selectedIndex])));
+  copy.name += "_copy"; copy.x += 60; copy.y += 60;
+  nodes.push(copy); selectedIndex = nodes.length - 1;
+  autoSave(); refreshAll();
+}
+
+function deleteSelected() {
+  if (selectedIndex < 0) return;
+  recordUndoPoint();
+  const removedName = nodes[selectedIndex].name;
+  nodes.splice(selectedIndex, 1);
+  nodes.forEach(n => { if (n.parent === removedName) n.parent = ""; });
+  selectedIndex = nodes.length - 1;
+  tileBrushMode = 'off';
+  autoSave(); refreshAll();
+}
+
+function clearAllTiles() {
+  if (selectedIndex < 0 || nodes[selectedIndex]?.nodeType !== 'TileMap') return;
+  if (!nodes[selectedIndex].tiles?.length) return;
+  recordUndoPoint();
+  nodes[selectedIndex].tiles = [];
+  autoSave(); refreshAll();
+  showToast("已清空当前瓦片层");
+}
+
+function addClip() {
+  if (selectedIndex < 0) return;
+  recordUndoPoint();
+  const n = nodes[selectedIndex];
+  if (!Array.isArray(n.clips)) n.clips = [];
+  n.clips.push({ name: `anim_${n.clips.length + 1}`, start: 0, end: 0, fps: 12, loop: true, eventsStr: "" });
+  autoSave(); renderDock();
+}
+
+function updateClip(cIdx, key, val) {
+  if (selectedIndex < 0) return;
+  const n = nodes[selectedIndex];
+  if (!n.clips || !n.clips[cIdx]) return;
+  recordUndoPoint();
+  n.clips[cIdx][key] = val;
+  autoSave();
+}
+
+function deleteClip(cIdx) {
+  if (selectedIndex < 0) return;
+  recordUndoPoint();
+  nodes[selectedIndex].clips.splice(cIdx, 1);
+  autoSave(); renderDock();
+}
+
+window.onload = () => {
+  resizeCanvas();
+  if (window.ZeroBridge) {
+    refreshProjectAndSceneLists();
+    refreshAudioList();
+    refreshScriptList();
+    refreshDataList();
+    loadCurrentSceneFromDisk();
+    if (window.ZeroBridge.hasCustomSaveLocation && !window.ZeroBridge.hasCustomSaveLocation()) {
+      showSaveLocationModal(true);
+    }
+  }
+  refreshAll();
+  updateUndoRedoButtons();
+};
