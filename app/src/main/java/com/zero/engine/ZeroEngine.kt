@@ -703,13 +703,29 @@ class ZeroSpriteBatch(
     }
 }
 
-// ==================== ZeroEngine 主视图与渲染/物理/脚本/商业大世界核心（P5） ====================
+// ==================== ZeroEngine 主视图与渲染/物理/脚本/商业大世界/图集核心（P6） ====================
 class ZeroEngineView(
     context: Context,
     private val projectDir: File,
     private val sceneJson: String,
     private val onConsoleLog: (String) -> Unit
 ) : GLSurfaceView(context), GLSurfaceView.Renderer {
+
+    data class AtlasFrame(
+        val x: Float,
+        val y: Float,
+        val w: Float,
+        val h: Float,
+        val sourceW: Float,
+        val sourceH: Float
+    )
+
+    data class TextureAtlasData(
+        val imageFile: String,
+        val atlasW: Float,
+        val atlasH: Float,
+        val frames: Map<String, AtlasFrame>
+    )
 
     data class AnimClip(
         val name: String,
@@ -793,6 +809,9 @@ class ZeroEngineView(
         var parallaxX: Float = 1f,
         var parallaxY: Float = 1f,
         var texture: String = "",
+        // P6：纹理大图集（TextureAtlas）
+        var atlas: String = "",
+        var atlasFrame: String = "",
         var text: String = "",
         var fontSize: Float = 44f,
         var r: Float = 1f,
@@ -911,6 +930,8 @@ class ZeroEngineView(
                 "scaleY" -> n.scaleY.toDouble()
                 "parallaxX" -> n.parallaxX.toDouble()
                 "parallaxY" -> n.parallaxY.toDouble()
+                "atlas" -> n.atlas
+                "atlasFrame" -> n.atlasFrame
                 "sliceLeft" -> n.sliceLeft.toDouble()
                 "sliceRight" -> n.sliceRight.toDouble()
                 "sliceTop" -> n.sliceTop.toDouble()
@@ -967,6 +988,8 @@ class ZeroEngineView(
                 "scaleY" -> n.scaleY = toJsFloat(value, n.scaleY)
                 "parallaxX" -> n.parallaxX = toJsFloat(value, n.parallaxX)
                 "parallaxY" -> n.parallaxY = toJsFloat(value, n.parallaxY)
+                "atlas" -> n.atlas = toJsStr(value, n.atlas)
+                "atlasFrame" -> n.atlasFrame = toJsStr(value, n.atlasFrame)
                 "sliceLeft" -> n.sliceLeft = toJsFloat(value, n.sliceLeft)
                 "sliceRight" -> n.sliceRight = toJsFloat(value, n.sliceRight)
                 "sliceTop" -> n.sliceTop = toJsFloat(value, n.sliceTop)
@@ -1018,6 +1041,9 @@ class ZeroEngineView(
     private val dataTableCache = mutableMapOf<String, Any?>()
     private var currentLang = "zh"
     private val i18nDicts = mutableMapOf<String, MutableMap<String, String>>()
+
+    // P6：纹理大图集缓存（TextureAtlas）
+    private val atlasCache = ConcurrentHashMap<String, TextureAtlasData>()
 
     private val nodes = mutableListOf<GameNode>()
     private val pendingAdd = mutableListOf<GameNode>()
@@ -1234,15 +1260,102 @@ class ZeroEngineView(
         audioSystem.release()
     }
 
-    // ==================== P4：显存自动回收器 ====================
+    // ==================== P6：纹理大图集（TextureAtlas）加载与 UV 查表 ====================
+    private fun loadAtlasData(atlasName: String): TextureAtlasData? {
+        val cleaned = atlasName.trim().replace("\\", "/").removePrefix("./")
+        if (cleaned.isEmpty() || cleaned.contains("..")) return null
+        val norm = if (cleaned.endsWith(".json", ignoreCase = true)) cleaned else "$cleaned.json"
+        atlasCache[norm]?.let { return it }
+
+        val texDir = File(projectDir, "textures")
+        val file = File(texDir, norm)
+        if (!file.exists()) {
+            onConsoleLog("[ATLAS 警告] 找不到图集文件: textures/$norm")
+            return null
+        }
+        return try {
+            val root = JSONObject(file.readText())
+            val metaObj = root.optJSONObject("meta")
+            val imageFile = root.optString("image", "").ifEmpty {
+                metaObj?.optString("image", "") ?: ""
+            }
+            if (imageFile.isEmpty()) {
+                onConsoleLog("[ATLAS 错误] 图集缺少 image 字段: $norm")
+                return null
+            }
+            // 触发图片加载以记录宽高
+            getImageTexture(imageFile)
+            val imgSize = textureSizes[imageFile]
+            val sizeObj = root.optJSONObject("size") ?: metaObj?.optJSONObject("size")
+            val atlasW = sizeObj?.optDouble("w", (imgSize?.first ?: 1024).toDouble())?.toFloat()
+                ?: (imgSize?.first ?: 1024).toFloat()
+            val atlasH = sizeObj?.optDouble("h", (imgSize?.second ?: 1024).toDouble())?.toFloat()
+                ?: (imgSize?.second ?: 1024).toFloat()
+
+            val frameMap = HashMap<String, AtlasFrame>()
+            val framesObj = root.optJSONObject("frames")
+            if (framesObj != null) {
+                val keys = framesObj.keys()
+                while (keys.hasNext()) {
+                    val key = keys.next()
+                    val fo = framesObj.optJSONObject(key) ?: continue
+                    val rect = fo.optJSONObject("frame") ?: fo
+                    val srcSize = fo.optJSONObject("sourceSize")
+                    frameMap[key] = AtlasFrame(
+                        x = rect.optDouble("x", 0.0).toFloat(),
+                        y = rect.optDouble("y", 0.0).toFloat(),
+                        w = rect.optDouble("w", 0.0).toFloat(),
+                        h = rect.optDouble("h", 0.0).toFloat(),
+                        sourceW = srcSize?.optDouble("w", rect.optDouble("w", 0.0))?.toFloat()
+                            ?: rect.optDouble("w", 0.0).toFloat(),
+                        sourceH = srcSize?.optDouble("h", rect.optDouble("h", 0.0))?.toFloat()
+                            ?: rect.optDouble("h", 0.0).toFloat()
+                    )
+                }
+            } else {
+                val framesArr = root.optJSONArray("frames")
+                if (framesArr != null) {
+                    for (i in 0 until framesArr.length()) {
+                        val fo = framesArr.optJSONObject(i) ?: continue
+                        val key = fo.optString("filename", "frame_$i")
+                        val rect = fo.optJSONObject("frame") ?: fo
+                        frameMap[key] = AtlasFrame(
+                            x = rect.optDouble("x", 0.0).toFloat(),
+                            y = rect.optDouble("y", 0.0).toFloat(),
+                            w = rect.optDouble("w", 0.0).toFloat(),
+                            h = rect.optDouble("h", 0.0).toFloat(),
+                            sourceW = rect.optDouble("w", 0.0).toFloat(),
+                            sourceH = rect.optDouble("h", 0.0).toFloat()
+                        )
+                    }
+                }
+            }
+
+            val data = TextureAtlasData(imageFile, max(1f, atlasW), max(1f, atlasH), frameMap)
+            atlasCache[norm] = data
+            data
+        } catch (e: Exception) {
+            onConsoleLog("[ATLAS 解析错误 @ $norm] ${e.message}")
+            null
+        }
+    }
+
+    // ==================== P4：显存自动回收器（含图集关联贴图保护） ====================
     private fun unloadUnusedTextures(): Int {
         if (textureCache.isEmpty()) return 0
         val activeTexNames = HashSet<String>()
         for (n in nodes) {
-            if (!pendingRemove.contains(n) && n.texture.isNotEmpty()) activeTexNames.add(n.texture)
+            if (pendingRemove.contains(n)) continue
+            if (n.texture.isNotEmpty()) activeTexNames.add(n.texture)
+            if (n.atlas.isNotEmpty()) {
+                loadAtlasData(n.atlas)?.let { activeTexNames.add(it.imageFile) }
+            }
         }
         for (n in pendingAdd) {
             if (n.texture.isNotEmpty()) activeTexNames.add(n.texture)
+            if (n.atlas.isNotEmpty()) {
+                loadAtlasData(n.atlas)?.let { activeTexNames.add(it.imageFile) }
+            }
         }
         val toDelete = mutableListOf<String>()
         val ids = mutableListOf<Int>()
@@ -1796,7 +1909,6 @@ class ZeroEngineView(
     private fun isBoxInView(minX: Float, maxX: Float, minY: Float, maxY: Float): Boolean =
         maxX >= viewMinX && minX <= viewMaxX && maxY >= viewMinY && minY <= viewMaxY
 
-    // ==================== P5：UI 裁剪区（Scissor Rect）解析 ====================
     private fun resolveUiClipRect(n: GameNode): FloatArray? {
         var left = Float.NEGATIVE_INFINITY
         var top = Float.NEGATIVE_INFINITY
@@ -1844,7 +1956,6 @@ class ZeroEngineView(
         GLES20.glScissor(sx, sy, sw, sh)
     }
 
-    // ==================== 动态合批 + FBO 光照后处理 + UI 裁剪/九宫格 渲染管线 ====================
     private fun renderSceneFrame() {
         frameDrawCalls = 0
         frameCulled = 0
@@ -1967,7 +2078,6 @@ class ZeroEngineView(
             renderDebugOverlay(vpMatrix)
         }
 
-        // Pass 4：锐利 UI HUD 层（支持 P5 九宫格合批 + Scissor 矩形裁剪）
         val emptyUiArr = FloatArray(4)
         val uiNodes = nodes.filter { it.visible && it.layer == "UI" }.sortedBy { it.zIndex }
         if (uiNodes.isNotEmpty()) {
@@ -2018,26 +2128,49 @@ class ZeroEngineView(
             }
         }
 
-        val hf = max(1, n.hFrames)
-        val vf = max(1, n.vFrames)
-        val fi = n.currentFrame.coerceIn(0, hf * vf - 1)
-        val uScale = 1f / hf
-        val vScale = 1f / vf
+        // P6：优先检查纹理大图集（TextureAtlas）
+        val atlasData = if (n.atlas.isNotEmpty()) loadAtlasData(n.atlas) else null
+        val atlasFrame = atlasData?.frames?.get(n.atlasFrame)
+
         val u0: Float
         val u1: Float
-        val v0 = (fi / hf) * vScale
-        val v1 = v0 + vScale
-        if (isWorld && camMode == "2.5D" && n.nodeType == "Label2D") {
-            u0 = 1f; u1 = 0f
+        val v0: Float
+        val v1: Float
+        val texId: Int
+        val subTexW: Float
+        val subTexH: Float
+
+        if (atlasData != null && atlasFrame != null && atlasFrame.w > 0f && atlasFrame.h > 0f) {
+            texId = getImageTexture(atlasData.imageFile)
+            u0 = atlasFrame.x / atlasData.atlasW
+            u1 = (atlasFrame.x + atlasFrame.w) / atlasData.atlasW
+            v0 = atlasFrame.y / atlasData.atlasH
+            v1 = (atlasFrame.y + atlasFrame.h) / atlasData.atlasH
+            subTexW = atlasFrame.w
+            subTexH = atlasFrame.h
         } else {
-            u0 = (fi % hf) * uScale; u1 = u0 + uScale
+            val hf = max(1, n.hFrames)
+            val vf = max(1, n.vFrames)
+            val fi = n.currentFrame.coerceIn(0, hf * vf - 1)
+            val uScale = 1f / hf
+            val vScale = 1f / vf
+            if (isWorld && camMode == "2.5D" && n.nodeType == "Label2D") {
+                u0 = 1f; u1 = 0f
+            } else {
+                u0 = (fi % hf) * uScale; u1 = u0 + uScale
+            }
+            v0 = (fi / hf) * vScale
+            v1 = v0 + vScale
+            texId = when {
+                n.nodeType == "Label2D" -> getTextTexture(n.text, n.fontSize)
+                n.texture.isNotEmpty() -> getImageTexture(n.texture)
+                else -> whiteTexId
+            }
+            val texDim = textureSizes[n.texture]
+            subTexW = max(1f, (texDim?.first ?: max(1f, abs(w)).toInt()).toFloat()) / hf
+            subTexH = max(1f, (texDim?.second ?: max(1f, abs(h)).toInt()).toFloat()) / vf
         }
 
-        val texId = when {
-            n.nodeType == "Label2D" -> getTextTexture(n.text, n.fontSize)
-            n.texture.isNotEmpty() -> getImageTexture(n.texture)
-            else -> whiteTexId
-        }
         val flashVal = if (n.flashTimer > 0f) (n.flashTimer * 8f).coerceIn(0f, 1f) else 0f
 
         val isNineSlice = n.nodeType == "Sprite2D" &&
@@ -2059,14 +2192,10 @@ class ZeroEngineView(
             return
         }
 
-        // P5：九宫格合批绘制（9 块共用同一贴图与批次，0 额外 DrawCall）
         val absW = max(1f, abs(w))
         val absH = max(1f, abs(h))
         val signX = if (w < 0f) -1f else 1f
         val signY = if (h < 0f) -1f else 1f
-        val texDim = textureSizes[n.texture]
-        val texW = max(1f, (texDim?.first ?: absW.toInt()).toFloat()) / hf
-        val texH = max(1f, (texDim?.second ?: absH.toInt()).toFloat()) / vf
 
         val sl = max(0f, n.sliceLeft)
         val sr = max(0f, n.sliceRight)
@@ -2085,10 +2214,10 @@ class ZeroEngineView(
 
         val du = u1 - u0
         val dv = v1 - v0
-        val uL = (sl / texW).coerceIn(0f, 0.49f) * du
-        val uR = (sr / texW).coerceIn(0f, 0.49f) * du
-        val vT = (st / texH).coerceIn(0f, 0.49f) * dv
-        val vB = (sb / texH).coerceIn(0f, 0.49f) * dv
+        val uL = (sl / subTexW).coerceIn(0f, 0.49f) * du
+        val uR = (sr / subTexW).coerceIn(0f, 0.49f) * du
+        val vT = (st / subTexH).coerceIn(0f, 0.49f) * dv
+        val vB = (sb / subTexH).coerceIn(0f, 0.49f) * dv
         val us = floatArrayOf(u0, u0 + uL, u1 - uR, u1)
         val vs = floatArrayOf(v0, v0 + vT, v1 - vB, v1)
 
@@ -2870,17 +2999,36 @@ class ZeroEngineView(
         val flashVal = if (n.flashTimer > 0f) (n.flashTimer * 8f).coerceIn(0f, 1f) else 0f
         GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uFlash"), flashVal)
 
-        val hf = max(1, n.hFrames)
-        val vf = max(1, n.vFrames)
-        val fi = n.currentFrame.coerceIn(0, hf * vf - 1)
-        val uScale = 1f / hf
-        val vScale = 1f / vf
-        val uOffset = (fi % hf) * uScale
-        val vOffset = (fi / hf) * vScale
-        if (isWorld && camMode == "2.5D" && n.nodeType == "Label2D") {
-            GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uUvRect"), 1f, vOffset, -1f, vScale)
+        val atlasData = if (n.atlas.isNotEmpty()) loadAtlasData(n.atlas) else null
+        val atlasFrame = atlasData?.frames?.get(n.atlasFrame)
+        val texId: Int
+        if (atlasData != null && atlasFrame != null && atlasFrame.w > 0f && atlasFrame.h > 0f) {
+            texId = getImageTexture(atlasData.imageFile)
+            GLES20.glUniform4f(
+                GLES20.glGetUniformLocation(prog, "uUvRect"),
+                atlasFrame.x / atlasData.atlasW,
+                atlasFrame.y / atlasData.atlasH,
+                atlasFrame.w / atlasData.atlasW,
+                atlasFrame.h / atlasData.atlasH
+            )
         } else {
-            GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uUvRect"), uOffset, vOffset, uScale, vScale)
+            val hf = max(1, n.hFrames)
+            val vf = max(1, n.vFrames)
+            val fi = n.currentFrame.coerceIn(0, hf * vf - 1)
+            val uScale = 1f / hf
+            val vScale = 1f / vf
+            val uOffset = (fi % hf) * uScale
+            val vOffset = (fi / hf) * vScale
+            if (isWorld && camMode == "2.5D" && n.nodeType == "Label2D") {
+                GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uUvRect"), 1f, vOffset, -1f, vScale)
+            } else {
+                GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uUvRect"), uOffset, vOffset, uScale, vScale)
+            }
+            texId = when {
+                n.nodeType == "Label2D" -> getTextTexture(n.text, n.fontSize)
+                n.texture.isNotEmpty() -> getImageTexture(n.texture)
+                else -> whiteTexId
+            }
         }
 
         GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uEnableLight"), if (enableInlineLight) 1 else 0)
@@ -2893,11 +3041,6 @@ class ZeroEngineView(
             }
         }
 
-        val texId = when {
-            n.nodeType == "Label2D" -> getTextTexture(n.text, n.fontSize)
-            n.texture.isNotEmpty() -> getImageTexture(n.texture)
-            else -> whiteTexId
-        }
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uTexture"), 0)
@@ -3086,13 +3229,14 @@ class ZeroEngineView(
         }
     }
 
-    // ==================== Rhino JS SDK 绑定（P0～P5） ====================
+    // ==================== Rhino JS SDK 绑定（P0～P6） ====================
     private fun initRhinoVM() {
         rhino = RhinoContext.enter()
         rhino.optimizationLevel = -1
         globalScope = rhino.initStandardObjects()
         moduleCache.clear()
         dataTableCache.clear()
+        atlasCache.clear()
 
         ScriptableObject.putProperty(globalScope, "require", jsFunc { args ->
             val path = RhinoContext.toString(args.getOrNull(0) ?: "")
@@ -3111,6 +3255,19 @@ class ZeroEngineView(
         ScriptableObject.putProperty(engineApi, "clearModuleCache", jsFunc {
             moduleCache.clear()
             null
+        })
+
+        // P6：纹理大图集（TextureAtlas）API
+        ScriptableObject.putProperty(engineApi, "loadAtlas", jsFunc { args ->
+            val name = RhinoContext.toString(args.getOrNull(0) ?: "")
+            val data = loadAtlasData(name) ?: return@jsFunc null
+            val obj = rhino.newObject(globalScope)
+            ScriptableObject.putProperty(obj, "image", data.imageFile)
+            ScriptableObject.putProperty(obj, "width", data.atlasW.toDouble())
+            ScriptableObject.putProperty(obj, "height", data.atlasH.toDouble())
+            val frameNames = data.frames.keys.sorted().toTypedArray()
+            ScriptableObject.putProperty(obj, "frames", rhino.newArray(globalScope, frameNames))
+            obj
         })
 
         // P5：大世界状态标志 API（WorldFlags）
@@ -3272,6 +3429,7 @@ class ZeroEngineView(
             ScriptableObject.putProperty(obj, "spatialCells", spatialGrid.size)
             ScriptableObject.putProperty(obj, "cachedScenes", preloadedSceneCache.size)
             ScriptableObject.putProperty(obj, "modules", moduleCache.size)
+            ScriptableObject.putProperty(obj, "atlases", atlasCache.size)
             ScriptableObject.putProperty(obj, "flags", worldFlags.size)
             ScriptableObject.putProperty(obj, "tables", dataTableCache.size)
             ScriptableObject.putProperty(obj, "lang", currentLang)
@@ -3393,7 +3551,6 @@ class ZeroEngineView(
             activeTweens.add(TweenTask(n, prop, startVal, toVal, dur, ease))
             null
         })
-        // P5：多轨音频与独立音量总线
         ScriptableObject.putProperty(engineApi, "playTone", jsFunc { args ->
             val hz = (args.getOrNull(0) as? Number)?.toInt() ?: 440
             val ms = (args.getOrNull(1) as? Number)?.toInt() ?: 80
@@ -3489,6 +3646,8 @@ class ZeroEngineView(
                 billboard = getJsBool(cfg, "billboard", false),
                 zIndex = getJsInt(cfg, "zIndex", 0),
                 texture = getJsStr(cfg, "texture", ""),
+                atlas = getJsStr(cfg, "atlas", ""),
+                atlasFrame = getJsStr(cfg, "atlasFrame", ""),
                 text = getJsStr(cfg, "text", ""),
                 fontSize = getJsFloat(cfg, "fontSize", 44f),
                 r = getJsFloat(cfg, "r", 1f),
@@ -3655,6 +3814,15 @@ class ZeroEngineView(
         }
         n.jsObj = selfObj
 
+        // P6：便捷切换大图集帧
+        ScriptableObject.putProperty(selfObj, "setAtlas", jsFunc { args ->
+            val atlasName = RhinoContext.toString(args.getOrNull(0) ?: n.atlas)
+            val frameName = RhinoContext.toString(args.getOrNull(1) ?: "")
+            n.atlas = atlasName
+            n.atlasFrame = frameName
+            loadAtlasData(atlasName)
+            null
+        })
         ScriptableObject.putProperty(selfObj, "setNineSlice", jsFunc { args ->
             n.sliceLeft = (args.getOrNull(0) as? Number)?.toFloat() ?: 0f
             n.sliceRight = (args.getOrNull(1) as? Number)?.toFloat() ?: n.sliceLeft
@@ -4118,6 +4286,8 @@ class ZeroEngineView(
                     parallaxX = o.optDouble("parallaxX", 1.0).toFloat(),
                     parallaxY = o.optDouble("parallaxY", 1.0).toFloat(),
                     texture = o.optString("texture", ""),
+                    atlas = o.optString("atlas", ""),
+                    atlasFrame = o.optString("atlasFrame", ""),
                     text = o.optString("text", ""),
                     fontSize = o.optDouble("fontSize", 44.0).toFloat(),
                     r = o.optDouble("r", 1.0).toFloat(),
@@ -4291,6 +4461,7 @@ class ZeroEngineView(
             "x", "y", "z", "vx", "vy", "vz",
             "width", "height", "rotation", "tiltX", "scaleX", "scaleY",
             "parallaxX", "parallaxY",
+            "atlas", "atlasFrame",
             "sliceLeft", "sliceRight", "sliceTop", "sliceBottom",
             "clipChildren", "clipX", "clipY", "clipW", "clipH",
             "slopeType",
