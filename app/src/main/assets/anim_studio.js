@@ -401,4 +401,145 @@
       <div class="as-field"><label>重心偏移 X</label><input type="number" value="${f.offsetX}" oninput="AnimStudio.updFrame('offsetX',+this.value)"></div>
       <div class="as-field"><label>重心偏移 Y</label><input type="number" value="${f.offsetY}" oninput="AnimStudio.updFrame('offsetY',+this.value)"></div>
       <div class="as-field"><label>帧事件(Event)</label><input value="${escHtml(f.event || '')}" placeholder="sfx_hit" onchange="AnimStudio.updFrame('event',this.value)"></div>
-      <div class="as
+      <div class="as-row-full">
+        <label style="font-size:10px;display:flex;align-items:center;gap:4px;"><input type="checkbox" ${f.cancelable ? 'checked' : ''} onchange="AnimStudio.updFrame('cancelable',this.checked)">✂可取消窗口(Cancel)</label>
+        <button style="background:#7f1d1d;" onclick="AnimStudio.addBox('hitbox')">+🟥攻击框</button>
+        <button style="background:#14532d;" onclick="AnimStudio.addBox('hurtbox')">+🟩受击框</button>
+        ${b ? `<button class="danger" onclick="AnimStudio.delBox()">删当前框</button>` : ''}
+      </div>
+      ${boxHtml}`;
+  }
+
+  function tick(ts) {
+    if (!studioOpen || !isPlaying) return;
+    if (!lastTs) lastTs = ts;
+    const dtMs = Math.min(100, ts - lastTs) * playSpeed;
+    lastTs = ts;
+    const c = getCurClip();
+    if (c && c.frames.length > 0) {
+      frameAccumMs += dtMs;
+      const curDur = Math.max(16, c.frames[frameIdx].durationMs || 80);
+      if (frameAccumMs >= curDur) {
+        frameAccumMs -= curDur;
+        frameIdx++;
+        if (frameIdx >= c.frames.length) {
+          if (c.loop) frameIdx = 0;
+          else { frameIdx = c.frames.length - 1; isPlaying = false; }
+        }
+        renderUI();
+      }
+    }
+    if (isPlaying) rafId = requestAnimationFrame(tick);
+  }
+
+  window.AnimStudio = {
+    open() {
+      const n = getCurNode();
+      if (!n) { if (typeof showToast === 'function') showToast('请先在左侧选中一个角色节点'); return; }
+      injectStudioDOM();
+      studioOpen = true;
+      isPlaying = false;
+      clipIdx = 0; frameIdx = 0; boxIdx = 0;
+      document.getElementById('animStudioOverlay').style.display = 'flex';
+      setTimeout(() => { resizeStudioCanvas(); renderUI(); }, 30);
+    },
+    close() {
+      studioOpen = false;
+      isPlaying = false;
+      cancelAnimationFrame(rafId);
+      document.getElementById('animStudioOverlay').style.display = 'none';
+      if (typeof autoSave === 'function') autoSave();
+      if (typeof refreshAll === 'function') refreshAll();
+    },
+    selectClip(i) { clipIdx = i; frameIdx = 0; boxIdx = 0; renderUI(); },
+    addClip() {
+      const n = getCurNode(); if (!n) return;
+      const name = prompt('输入新动画片段名称 (如 idle / run / slash):', 'skill_' + (n.proClips.length + 1));
+      if (!name || !name.trim()) return;
+      n.proClips.push({ name: name.trim(), loop: true, speed: 1.0, frames: [{ frameIndex: 0, atlasFrame: '', durationMs: 80, offsetX: 0, offsetY: 0, event: '', cancelable: false, boxes: [] }], boneTracks: [] });
+      clipIdx = n.proClips.length - 1; frameIdx = 0; boxIdx = -1;
+      autoSave(); renderUI();
+    },
+    delClip() {
+      const n = getCurNode(); if (!n || n.proClips.length <= 1) return;
+      n.proClips.splice(clipIdx, 1);
+      clipIdx = Math.max(0, clipIdx - 1); frameIdx = 0;
+      autoSave(); renderUI();
+    },
+    selectFrame(i) { frameIdx = i; boxIdx = 0; renderUI(); },
+    addFrame() {
+      const c = getCurClip(); if (!c) return;
+      const nextFi = c.frames.length > 0 ? (c.frames[c.frames.length - 1].frameIndex + 1) : 0;
+      c.frames.push({ frameIndex: nextFi, atlasFrame: '', durationMs: 80, offsetX: 0, offsetY: 0, event: '', cancelable: false, boxes: [] });
+      frameIdx = c.frames.length - 1; boxIdx = -1;
+      autoSave(); renderUI();
+    },
+    dupFrame() {
+      const c = getCurClip(); const f = getCurFrame(); if (!c || !f) return;
+      c.frames.splice(frameIdx + 1, 0, JSON.parse(JSON.stringify(f)));
+      frameIdx++; autoSave(); renderUI();
+    },
+    delFrame() {
+      const c = getCurClip(); if (!c || c.frames.length <= 1) return;
+      c.frames.splice(frameIdx, 1);
+      frameIdx = Math.max(0, frameIdx - 1);
+      autoSave(); renderUI();
+    },
+    updFrame(k, v) { const f = getCurFrame(); if (!f) return; f[k] = v; autoSave(); drawStudio(); },
+    addBox(type) {
+      const f = getCurFrame(); if (!f) return;
+      if (!Array.isArray(f.boxes)) f.boxes = [];
+      f.boxes.push({ id: type + '_' + (f.boxes.length + 1), type, offsetX: type === 'hitbox' ? 60 : 0, offsetY: 0, width: 90, height: 80, damage: 20, knockbackX: 320, knockbackY: -220, hitstop: 0.05 });
+      boxIdx = f.boxes.length - 1; toolMode = 'box';
+      autoSave(); renderUI();
+    },
+    delBox() {
+      const f = getCurFrame(); if (!f || !f.boxes || boxIdx < 0) return;
+      f.boxes.splice(boxIdx, 1); boxIdx = f.boxes.length - 1;
+      autoSave(); renderUI();
+    },
+    updBox(k, v) { const f = getCurFrame(); if (!f || !f.boxes[boxIdx]) return; f.boxes[boxIdx][k] = v; autoSave(); drawStudio(); },
+    updBoxSize(str) {
+      const parts = String(str).toLowerCase().split('x');
+      if (parts.length === 2) {
+        const w = Math.max(16, parseFloat(parts[0]) || 80);
+        const h = Math.max(16, parseFloat(parts[1]) || 80);
+        const f = getCurFrame();
+        if (f && f.boxes[boxIdx]) { f.boxes[boxIdx].width = w; f.boxes[boxIdx].height = h; autoSave(); drawStudio(); }
+      }
+    },
+    addTr() {
+      const n = getCurNode(); if (!n) return;
+      n.fsmTransitions.push({ from: '*', to: n.proClips[0]?.name || 'attack', priority: 1, requireExitTime: false, requireCancelWindow: false, conditions: [{ param: 'attack', op: 'trigger', value: true }] });
+      autoSave(); renderProps();
+    },
+    delTr(i) { const n = getCurNode(); if (!n) return; n.fsmTransitions.splice(i, 1); autoSave(); renderProps(); },
+    updTr(i, k, v) { const n = getCurNode(); if (!n || !n.fsmTransitions[i]) return; n.fsmTransitions[i][k] = v; autoSave(); },
+    updTrCond(i, k, v) {
+      const n = getCurNode(); if (!n || !n.fsmTransitions[i]) return;
+      if (!n.fsmTransitions[i].conditions || !n.fsmTransitions[i].conditions[0]) n.fsmTransitions[i].conditions = [{ param: '', op: '==', value: 0 }];
+      const num = Number(v);
+      n.fsmTransitions[i].conditions[0][k] = (k === 'value' && v !== '' && !isNaN(num)) ? num : v;
+      autoSave();
+    },
+    togglePlay() {
+      isPlaying = !isPlaying; lastTs = 0; frameAccumMs = 0;
+      renderUI();
+      if (isPlaying) rafId = requestAnimationFrame(tick);
+    },
+    step(d) {
+      const c = getCurClip(); if (!c || !c.frames.length) return;
+      isPlaying = false;
+      frameIdx = (frameIdx + d + c.frames.length) % c.frames.length;
+      renderUI();
+    },
+    setSpeed(s) { playSpeed = s; },
+    toggleLoop(v) { const c = getCurClip(); if (c) { c.loop = v; autoSave(); } },
+    toggleOnion() { onionSkin = !onionSkin; renderUI(); },
+    toggleSubMode() { subMode = subMode === 'timeline' ? 'fsm' : 'timeline'; renderUI(); },
+    setTool(m) { toolMode = m; renderUI(); },
+    zoom(d) { viewScale = Math.max(0.5, Math.min(4.0, viewScale + d)); drawStudio(); }
+  };
+
+  window.addEventListener('resize', () => { if (studioOpen) resizeStudioCanvas(); });
+})();
