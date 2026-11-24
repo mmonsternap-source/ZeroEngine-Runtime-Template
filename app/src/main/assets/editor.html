@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>ZeroEngine Pro IDE v1.2</title>
+<title>ZeroEngine Pro IDE v1.3</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, sans-serif; }
   body { background: #0b0e14; color: #e2e8f0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; user-select: none; }
@@ -105,14 +105,14 @@
   </div>
   <div class="viewport" id="vpBox">
     <canvas id="stage"></canvas>
-    <div class="vp-hud" id="vpHud">v1.2 | 2.5D</div>
+    <div class="vp-hud" id="vpHud">v1.3 | 2.5D</div>
   </div>
 </div>
 
 <div class="bottom-dock">
   <div class="tabs">
     <div class="tab active" id="tab-inspector" onclick="switchTab('inspector')">检查器</div>
-    <div class="tab" id="tab-script" onclick="switchTab('script')">脚本(JS)</div>
+    <div class="tab" id="tab-script" onclick="switchTab('script')">脚本/数据</div>
     <div class="tab" id="tab-shader" onclick="switchTab('shader')">着色器</div>
     <div class="tab" id="tab-console" onclick="switchTab('console')">控制台</div>
     <div class="tab" id="tab-docs" onclick="switchTab('docs')">工程/API</div>
@@ -127,6 +127,7 @@
     <div style="font-size:11px;color:#94a3b8;">当前保存目录：<span id="newModalPathHint" style="color:#34d399;"></span></div>
     <button style="padding:8px;text-align:left;" onclick="chooseSaveFolderNative()">📂 更改工程保存文件夹 (选择手机目录)</button>
     <button style="padding:8px;text-align:left;" onclick="closeNewMenuModal();openCreateScriptModal()">📜 在当前工程新建外部 JS 模块 (scripts/*.js)</button>
+    <button style="padding:8px;text-align:left;" onclick="closeNewMenuModal();openCreateDataModal()">📊 在当前工程新建数据表/多语言 (data/*.json)</button>
     <button style="padding:8px;text-align:left;" onclick="closeNewMenuModal();openCreateSceneModal()">🗺️ 在当前工程新建关卡场景 (.scene)</button>
     <button style="padding:8px;text-align:left;" onclick="closeNewMenuModal();openCreateProjectModal('empty')">🆕 新建空白游戏工程 (全品类自由发挥)</button>
     <button style="padding:8px;text-align:left;" onclick="closeNewMenuModal();openCreateProjectModal('rpg25d')">🎮 新建 2.5D 俯视角探索模板 (HD-2D RPG)</button>
@@ -172,9 +173,12 @@ const ctx = canvas.getContext('2d');
 const imageCache = {};
 let audioAssets = [];
 let scriptAssets = [];
-let scriptTabMode = 'node'; // 'node' | 'module'
+let dataAssets = [];
+let scriptTabMode = 'node'; // 'node' | 'module' | 'data'
 let activeScriptFile = '';
 let activeScriptContent = '';
+let activeDataFile = '';
+let activeDataContent = '';
 
 let activeTab = 'inspector';
 let selectedIndex = 0;
@@ -225,6 +229,16 @@ function normalizeNode(n) {
   if (n.colMask === undefined) n.colMask = 65535;
   if (n.persistent === undefined) n.persistent = false;
   if (n.scriptFile === undefined) n.scriptFile = '';
+  // P5: 9-Slice & Scissor
+  if (n.sliceLeft === undefined) n.sliceLeft = 0;
+  if (n.sliceRight === undefined) n.sliceRight = 0;
+  if (n.sliceTop === undefined) n.sliceTop = 0;
+  if (n.sliceBottom === undefined) n.sliceBottom = 0;
+  if (n.clipChildren === undefined) n.clipChildren = false;
+  if (n.clipX === undefined) n.clipX = 0;
+  if (n.clipY === undefined) n.clipY = 0;
+  if (n.clipW === undefined) n.clipW = 0;
+  if (n.clipH === undefined) n.clipH = 0;
   return n;
 }
 
@@ -370,10 +384,17 @@ function copySavePath() {
   showToast("已复制存档路径");
 }
 
-function manualSave() {
+function flushActiveEditorsSilent() {
   if (activeTab === 'script' && scriptTabMode === 'module' && activeScriptFile) {
     saveActiveScriptModule(true);
   }
+  if (activeTab === 'script' && scriptTabMode === 'data' && activeDataFile) {
+    saveActiveDataFile(true);
+  }
+}
+
+function manualSave() {
+  flushActiveEditorsSilent();
   autoSave();
   const proj = (window.ZeroBridge && window.ZeroBridge.getCurrentProject) ? window.ZeroBridge.getCurrentProject() : 'DefaultProject';
   showToast(`💾 已保存: ${proj}/${currentScene}`);
@@ -496,6 +517,101 @@ function mountActiveModuleToNode() {
   showToast(`已将 ${activeScriptFile} 挂载到 ${nodes[selectedIndex].name}`);
 }
 
+// ==================== P5 数值数据表与多语言管理 (data/*.json) ====================
+function refreshDataList() {
+  if (!window.ZeroBridge || !window.ZeroBridge.listDataFiles) {
+    dataAssets = [];
+    return;
+  }
+  try {
+    dataAssets = JSON.parse(window.ZeroBridge.listDataFiles());
+  } catch (e) {
+    dataAssets = [];
+  }
+  if (dataAssets.length === 0) {
+    activeDataFile = '';
+    activeDataContent = '';
+  } else if (!dataAssets.includes(activeDataFile)) {
+    activeDataFile = dataAssets[0];
+    activeDataContent = window.ZeroBridge.loadDataFile(activeDataFile) || '';
+  }
+}
+
+function selectDataFile(fileName) {
+  activeDataFile = fileName;
+  if (window.ZeroBridge && window.ZeroBridge.loadDataFile && fileName) {
+    activeDataContent = window.ZeroBridge.loadDataFile(fileName) || '';
+  } else {
+    activeDataContent = '';
+  }
+  renderDock();
+}
+
+function openCreateDataModal() {
+  openInputModal("新建数据表 / 多语言 (data/*.json)", "weapons.json", (rawName) => {
+    let safe = rawName.replace(/[^\u4e00-\u9fa5a-zA-Z0-9._-]/g, '_');
+    if (!safe) { showToast("请输入有效的文件名"); return; }
+    if (!safe.toLowerCase().endsWith('.json')) safe += '.json';
+    const isI18n = safe.toLowerCase().startsWith('i18n');
+    const tpl = isI18n
+      ? JSON.stringify({ zh: { title: "苍白圣殿", boss_clear: "苍白织者已击败" }, en: { title: "Pale Sanctum", boss_clear: "Pale Weaver Defeated" } }, null, 2)
+      : JSON.stringify({ needle_lv1: { name: "骨针", dmg: 18, speed: 1.0 }, needle_lv2: { name: "丝钢长针", dmg: 32, speed: 1.15 } }, null, 2);
+    if (window.ZeroBridge && window.ZeroBridge.saveDataFile) {
+      const ok = window.ZeroBridge.saveDataFile(safe, tpl);
+      if (!ok) { showToast("创建数据表失败"); return; }
+    }
+    refreshDataList();
+    activeDataFile = safe;
+    activeDataContent = tpl;
+    scriptTabMode = 'data';
+    switchTab('script');
+    showToast(`📊 已创建: data/${safe}`);
+  });
+}
+
+function saveActiveDataFile(silent = false) {
+  if (!activeDataFile) return;
+  const ta = document.getElementById('dataEditor');
+  if (ta) activeDataContent = ta.value;
+  try {
+    JSON.parse(activeDataContent);
+  } catch (e) {
+    if (!silent) showToast("❌ JSON 语法错误: " + e.message);
+    return;
+  }
+  if (window.ZeroBridge && window.ZeroBridge.saveDataFile) {
+    window.ZeroBridge.saveDataFile(activeDataFile, activeDataContent);
+  }
+  if (!silent) showToast(`💾 已保存数据表: data/${activeDataFile}`);
+}
+
+function deleteActiveDataFile() {
+  if (!activeDataFile) return;
+  const target = activeDataFile;
+  if (window.ZeroBridge && window.ZeroBridge.deleteDataFile) {
+    window.ZeroBridge.deleteDataFile(target);
+  }
+  activeDataFile = '';
+  activeDataContent = '';
+  refreshDataList();
+  renderDock();
+  showToast(`已删除: data/${target}`);
+}
+
+function insertLoadTableToNode() {
+  if (!activeDataFile) { showToast("请先新建或选择一个数据表"); return; }
+  if (selectedIndex < 0 || !nodes[selectedIndex]) { showToast("请先在左侧选中一个节点"); return; }
+  const varName = activeDataFile.replace(/\.json$/i, '').replace(/[^a-zA-Z0-9_]/g, '_') || 'tbl';
+  const snippet = `var ${varName} = Engine.loadTable("${activeDataFile}");\n`;
+  recordUndoPoint();
+  nodes[selectedIndex].script = snippet + (nodes[selectedIndex].script || '');
+  scriptTabMode = 'node';
+  autoSave();
+  renderTree();
+  renderDock();
+  showToast(`已插入 loadTable("${activeDataFile}")`);
+}
+
 function defaultNodes() {
   return [
     normalizeNode({
@@ -528,7 +644,7 @@ function onReady() {
   Engine.setCameraMode("2.5D");
   Engine.setCameraTarget(self);
   self.play("idle");
-  Engine.log("ZeroEngine v1.2 通用引擎已就绪");
+  Engine.log("ZeroEngine v1.3 通用引擎已就绪");
 }
 function onProcess(dt) {
   if (Input.isTouching && Input.screenY < 1550) {
@@ -753,6 +869,7 @@ window.onload = () => {
     refreshProjectAndSceneLists();
     refreshAudioList();
     refreshScriptList();
+    refreshDataList();
     loadCurrentSceneFromDisk();
     if (window.ZeroBridge.hasCustomSaveLocation && !window.ZeroBridge.hasCustomSaveLocation()) {
       showSaveLocationModal(true);
@@ -837,13 +954,14 @@ function openCreateProjectModal(tplType) {
     }
     document.getElementById('modeBtn').textContent = cameraCfg.mode;
     selectedIndex = nodes.length > 0 ? 0 : -1;
-    activeScriptFile = '';
-    activeScriptContent = '';
+    activeScriptFile = ''; activeScriptContent = '';
+    activeDataFile = ''; activeDataContent = '';
     clearHistory();
     autoSave();
     refreshProjectAndSceneLists();
     refreshAudioList();
     refreshScriptList();
+    refreshDataList();
     refreshAll();
     showToast(`已创建工程 ${safeName}`);
   });
@@ -851,13 +969,15 @@ function openCreateProjectModal(tplType) {
 
 function switchProject(name) {
   if (!window.ZeroBridge) return;
+  flushActiveEditorsSilent();
   window.ZeroBridge.setProject(name);
   currentScene = 'main.scene';
-  activeScriptFile = '';
-  activeScriptContent = '';
+  activeScriptFile = ''; activeScriptContent = '';
+  activeDataFile = ''; activeDataContent = '';
   refreshProjectAndSceneLists();
   refreshAudioList();
   refreshScriptList();
+  refreshDataList();
   loadCurrentSceneFromDisk();
   refreshAll();
   showToast("已切换工程: " + name);
@@ -895,7 +1015,7 @@ function toggleSnap() {
 function resetView() { camX = 540; camY = 960; camZoom = 0.42; draw(); }
 
 function exportBundle() {
-  if (scriptTabMode === 'module' && activeScriptFile) saveActiveScriptModule(true);
+  flushActiveEditorsSilent();
   autoSave();
   if (window.ZeroBridge && window.ZeroBridge.exportProjectBundle) {
     window.ZeroBridge.exportProjectBundle();
@@ -954,7 +1074,7 @@ function autoSave() {
 }
 
 function playScene() {
-  if (scriptTabMode === 'module' && activeScriptFile) saveActiveScriptModule(true);
+  flushActiveEditorsSilent();
   autoSave();
   if (window.ZeroBridge) {
     window.ZeroBridge.runGame(JSON.stringify({ camera: cameraCfg, nodes: serializeNodesForEngine() }));
@@ -1207,7 +1327,7 @@ function hexToRgb(hex) {
 function draw() {
   const brushHint = (selectedIndex >= 0 && nodes[selectedIndex]?.nodeType === 'TileMap' && tileBrushMode !== 'off')
     ? ` | 🖌️${tileBrushMode === 'paint' ? '刷瓦片(#' + brushFrame + ')' : '橡皮擦'}` : '';
-  document.getElementById('vpHud').textContent = `v1.2 | ${cameraCfg.mode} | ${Math.round(camZoom * 100)}% | ${currentScene}${brushHint}`;
+  document.getElementById('vpHud').textContent = `v1.3 | ${cameraCfg.mode} | ${Math.round(camZoom * 100)}% | ${currentScene}${brushHint}`;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.save();
   ctx.translate(canvas.width / 2, canvas.height / 2);
@@ -1290,7 +1410,7 @@ function draw() {
 
     if (n.nodeType !== 'TileMap') {
       if (n.layer === 'UI') {
-        ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 3 / camZoom;
+        ctx.strokeStyle = n.clipChildren ? '#38bdf8' : '#f59e0b'; ctx.lineWidth = 3 / camZoom;
         ctx.strokeRect(-w / 2, -h / 2, w, h);
       } else if (n.isHitbox) {
         ctx.strokeStyle = '#f43f5e'; ctx.lineWidth = 4 / camZoom;
@@ -1348,13 +1468,14 @@ function selectNode(i) {
 }
 
 function switchTab(tab) {
-  if (activeTab === 'script' && scriptTabMode === 'module' && activeScriptFile) {
-    saveActiveScriptModule(true);
-  }
+  flushActiveEditorsSilent();
   activeTab = tab;
   document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
   document.getElementById(`tab-${tab}`).classList.add('active');
-  if (tab === 'script' || tab === 'inspector' || tab === 'docs') refreshScriptList();
+  if (tab === 'script' || tab === 'inspector' || tab === 'docs') {
+    refreshScriptList();
+    refreshDataList();
+  }
   renderDock();
 }
 
@@ -1394,10 +1515,8 @@ function insertCode(id, snip) {
   ta.value = ta.value.substring(0, s) + snip + ta.value.substring(e);
   ta.selectionStart = ta.selectionEnd = s + snip.length;
   ta.focus();
-  if (id === 'moduleEditor') {
-    activeScriptContent = ta.value;
-    return;
-  }
+  if (id === 'moduleEditor') { activeScriptContent = ta.value; return; }
+  if (id === 'dataEditor') { activeDataContent = ta.value; return; }
   recordUndoPoint();
   nodes[selectedIndex][id === 'shaderEditor' ? 'shader' : 'script'] = ta.value;
   autoSave(); renderTree();
@@ -1433,22 +1552,24 @@ function renderDock() {
   if (activeTab === 'docs') {
     refreshAudioList();
     refreshScriptList();
+    refreshDataList();
     const audioStr = audioAssets.length ? audioAssets.join(', ') : '(暂无导入音频，点击左上角 +音 导入)';
-    const scriptStr = scriptAssets.length ? scriptAssets.join(', ') : '(暂无外部模块，切到 脚本(JS) -> 模块库 新建)';
+    const scriptStr = scriptAssets.length ? scriptAssets.join(', ') : '(暂无外部模块，切到 脚本/数据 -> 模块库 新建)';
+    const dataStr = dataAssets.length ? dataAssets.join(', ') : '(暂无数据表，切到 脚本/数据 -> 数据表 新建)';
     body.innerHTML = `<div class="doc-box">
 <b>📂 当前工程 Save 文件夹位置：</b> <button style="padding:2px 6px;font-size:10px;" onclick="chooseSaveFolderNative()">更改目录</button><br>
 <span style="color:#34d399;">${escHtml(getSaveFolderPath())}</span><br><br>
-<b>ZeroEngine SDK v1.2 商业版手册 (P0~P4)</b><br>
+<b>ZeroEngine SDK v1.3 商业版手册 (P0~P5)</b><br>
 • <b>外部 JS 模块 (scripts/)</b>: ${escHtml(scriptStr)}<br>
-• <b>模块化引用</b>: var cfg = require("combat_config.js"); // 自动读取 scripts/ 并缓存<br>
-• <b>性能与合批统计</b>: Engine.getStats() // {fps, drawCalls, culled, lights, modules, fbo}<br>
-• <b>显存手动回收</b>: Engine.unloadUnusedTextures() // 切主场景也会自动清理旧贴图<br>
+• <b>数值数据表 (data/)</b>: ${escHtml(dataStr)}<br>
+• <b>大世界状态标志 (P5)</b>: Engine.setFlag("door_1", true) / hasFlag("door_1") / saveWorldFlags("main") / loadWorldFlags("main")<br>
+• <b>数据表与多语言 (P5)</b>: var w = Engine.loadTable("weapons.json") / Engine.setLanguage("en") / Engine.t("boss_clear")<br>
+• <b>多轨 BGM 混音 (P5)</b>: Engine.crossfadeBGM("boss.mp3", 1.5, true, 0.8) / Engine.setVolume("bgm", 0.6) / Engine.playSFX("hit.wav", 1, 0.9, 1.1)<br>
+• <b>UI 九宫格与裁剪 (P5)</b>: self.setNineSlice(16,16,16,16) / self.setClipRect(x,y,w,h) / self.clipChildren = true<br>
+• <b>模块化与合批 (P4)</b>: require("combat_config.js") / Engine.getStats() / Engine.unloadUnusedTextures()<br>
 • <b>FBO 后处理与转场</b>: Engine.setPostFX({bloom:0.4, vignette:0.35, chromatic:0}) / Engine.fadeToScene("room2.scene", 0.35)<br>
-• <b>多场景流与常驻</b>: Engine.preloadScene("r2") / Engine.loadSceneAdditive("hud",0,0) / self.persistent = true<br>
-• <b>三端统一输入</b>: Input.bindTouchZone("jump", 920, 1680, 200, 200) / Input.getAxis("move_left","move_right") / Input.isActionJustPressed("attack")<br>
-• <b>独立碰撞体与调试框</b>: Engine.setDebugDraw(true) / self.colWidth / self.colHeight / self.colOffsetX / self.colLayer / self.colMask<br>
-• <b>已导入音频</b>: ${escHtml(audioStr)}<br>
-• <b>射线与磁盘存档</b>: Engine.raycast(x1,y1,x2,y2,"player", mask) / Engine.saveDisk("slot_1", data) / Engine.loadDisk("slot_1")
+• <b>三端统一输入</b>: Input.bindTouchZone("jump", 920, 1680, 200, 200) / Input.getAxis("move_left","move_right")<br>
+• <b>已导入音频</b>: ${escHtml(audioStr)}
 </div>`;
     return;
   }
@@ -1464,23 +1585,23 @@ function renderDock() {
     return;
   }
 
-  // ==================== P4 升级：脚本(JS) 面板同时支持 [节点脚本] 与 [外部模块库 scripts/] ====================
+  // ==================== P4/P5 升级：脚本/数据 面板支持 [节点脚本] | [模块库 scripts/] | [数据表 data/] ====================
   if (activeTab === 'script') {
     const selNode = (selectedIndex >= 0 && nodes[selectedIndex]) ? nodes[selectedIndex] : null;
     const modeBar = `
       <div class="script-mode-bar">
-        <button class="${scriptTabMode === 'node' ? 'active-toggle' : ''}" onclick="if(scriptTabMode==='module'&&activeScriptFile)saveActiveScriptModule(true);scriptTabMode='node';renderDock();">节点脚本${selNode ? '(' + escHtml(selNode.name) + ')' : ''}</button>
-        <button class="${scriptTabMode === 'module' ? 'active-toggle' : ''}" onclick="refreshScriptList();scriptTabMode='module';renderDock();">模块库 (${scriptAssets.length})</button>
-        <button class="save-btn" onclick="openCreateScriptModal()">+新建.js</button>
+        <button class="${scriptTabMode === 'node' ? 'active-toggle' : ''}" onclick="flushActiveEditorsSilent();scriptTabMode='node';renderDock();">节点${selNode ? '(' + escHtml(selNode.name) + ')' : ''}</button>
+        <button class="${scriptTabMode === 'module' ? 'active-toggle' : ''}" onclick="flushActiveEditorsSilent();refreshScriptList();scriptTabMode='module';renderDock();">模块(${scriptAssets.length})</button>
+        <button class="${scriptTabMode === 'data' ? 'active-toggle' : ''}" onclick="flushActiveEditorsSilent();refreshDataList();scriptTabMode='data';renderDock();">数据表(${dataAssets.length})</button>
+        <button class="save-btn" onclick="${scriptTabMode === 'data' ? 'openCreateDataModal()' : 'openCreateScriptModal()'}">${scriptTabMode === 'data' ? '+.json' : '+.js'}</button>
       </div>`;
 
     if (scriptTabMode === 'module') {
       if (scriptAssets.length === 0) {
         body.innerHTML = modeBar + `
           <div style="color:#94a3b8;font-size:11px;text-align:center;margin-top:34px;line-height:1.7;">
-            当前工程 <span style="color:#34d399;font-family:monospace;">scripts/</span> 目录下还没有外部 JS 文件。<br>
-            点击右上角 <b>+新建.js</b> 即可直接创建（如 <span style="color:#38bdf8;">combat_config.js</span>），<br>
-            随后在任意节点中用 <b>require("combat_config.js")</b> 引入。
+            当前工程 <span style="color:#34d399;font-family:monospace;">scripts/</span> 下暂无外部 JS 模块。<br>
+            点击右上角 <b>+.js</b> 创建，随后在节点中用 <b>require("xxx.js")</b> 引入。
           </div>`;
         return;
       }
@@ -1497,8 +1618,30 @@ function renderDock() {
       return;
     }
 
+    if (scriptTabMode === 'data') {
+      if (dataAssets.length === 0) {
+        body.innerHTML = modeBar + `
+          <div style="color:#94a3b8;font-size:11px;text-align:center;margin-top:30px;line-height:1.7;">
+            当前工程 <span style="color:#34d399;font-family:monospace;">data/</span> 下暂无数据表或语言包。<br>
+            点击右上角 <b>+.json</b> 创建（如 <span style="color:#38bdf8;">weapons.json</span> 或 <span style="color:#38bdf8;">i18n.json</span>），<br>
+            在脚本中用 <b>Engine.loadTable("weapons.json")</b> 或 <b>Engine.t("key")</b> 读取。
+          </div>`;
+        return;
+      }
+      const dataOpts = dataAssets.map(f => `<option value="${escHtml(f)}" ${f === activeDataFile ? 'selected' : ''}>data/${escHtml(f)}</option>`).join('');
+      body.innerHTML = modeBar + `
+        <div class="script-mode-bar">
+          <select onchange="saveActiveDataFile(true);selectDataFile(this.value);">${dataOpts}</select>
+          <button class="save-btn" onclick="saveActiveDataFile(false)">💾校验保存</button>
+          <button onclick="insertLoadTableToNode()">+loadTable</button>
+          <button class="danger" onclick="deleteActiveDataFile()">删</button>
+        </div>
+        <textarea id="dataEditor" class="code-box" spellcheck="false" oninput="activeDataContent=this.value">${escHtml(activeDataContent)}</textarea>`;
+      return;
+    }
+
     if (!selNode) {
-      body.innerHTML = modeBar + '<div style="color:#64748b;font-size:12px;text-align:center;margin-top:35px;">请先在左侧选中一个节点来编辑节点脚本，或切到上方 <b>模块库</b> 编辑外部 .js 文件</div>';
+      body.innerHTML = modeBar + '<div style="color:#64748b;font-size:12px;text-align:center;margin-top:35px;">请先在左侧选中节点编辑脚本，或切到上方 <b>模块 / 数据表</b></div>';
       return;
     }
 
@@ -1508,14 +1651,14 @@ function renderDock() {
     body.innerHTML = modeBar + mountHint + `
       <div class="script-toolbar">
         <button onclick="insertCode('scriptEditor','var cfg = require(\\'combat_config.js\\');\\n')">require</button>
+        <button onclick="insertCode('scriptEditor','var tbl = Engine.loadTable(\\'weapons.json\\');\\n')">loadTable</button>
+        <button onclick="insertCode('scriptEditor','Engine.setFlag(\\'boss_1\\', true);\\n')">setFlag</button>
+        <button onclick="insertCode('scriptEditor','Engine.crossfadeBGM(\\'boss.mp3\\', 1.2, true, 0.8);\\n')">crossfadeBGM</button>
+        <button onclick="insertCode('scriptEditor','var txt = Engine.t(\\'title\\');\\n')">i18n</button>
         <button onclick="insertCode('scriptEditor','var s = Engine.getStats();\\n')">getStats</button>
         <button onclick="insertCode('scriptEditor','Engine.setPostFX({ bloom: 0.4, vignette: 0.35 });\\n')">PostFX</button>
         <button onclick="insertCode('scriptEditor','Input.bindTouchZone(\\'jump\\', 920, 1680, 200, 200);\\n')">TouchZone</button>
         <button onclick="insertCode('scriptEditor','Engine.setDebugDraw(true);\\n')">DebugDraw</button>
-        <button onclick="insertCode('scriptEditor','var ray = Engine.raycast(self.x, self.y, self.x + 500, self.y, \\'player\\');')">raycast</button>
-        <button onclick="insertCode('scriptEditor','Engine.saveDisk(\\'slot_1\\', { hp: 5 })')">saveDisk</button>
-        <button onclick="insertCode('scriptEditor','self.jump(950)')">self.jump</button>
-        <button onclick="insertCode('scriptEditor','Engine.hitstop(0.05)')">hitstop</button>
       </div>
       <textarea id="scriptEditor" class="code-box" spellcheck="false" oninput="updateProp('script', this.value, true)">${escHtml(selNode.script || '')}</textarea>`;
     return;
@@ -1644,6 +1787,19 @@ function renderDock() {
       ${extraFields}
       <div class="field"><label>挂载外部脚本 (scriptFile)</label><select onchange="updateProp('scriptFile', this.value)">${scriptFileOptions}</select></div>
       <div class="field row"><input type="checkbox" ${n.persistent ? 'checked' : ''} onchange="updateProp('persistent', this.checked)"><label>跨场景常驻 (Persistent)</label></div>
+
+      <div class="sec-title">🖼️ UI 九宫格 (9-Slice) 与裁剪区 (P5)</div>
+      <div class="field"><label>九宫格 左边距 (sliceLeft)</label><input type="number" min="0" value="${n.sliceLeft ?? 0}" oninput="updateProp('sliceLeft', Math.max(0,+this.value), true)"></div>
+      <div class="field"><label>九宫格 右边距 (sliceRight)</label><input type="number" min="0" value="${n.sliceRight ?? 0}" oninput="updateProp('sliceRight', Math.max(0,+this.value), true)"></div>
+      <div class="field"><label>九宫格 上边距 (sliceTop)</label><input type="number" min="0" value="${n.sliceTop ?? 0}" oninput="updateProp('sliceTop', Math.max(0,+this.value), true)"></div>
+      <div class="field"><label>九宫格 下边距 (sliceBottom)</label><input type="number" min="0" value="${n.sliceBottom ?? 0}" oninput="updateProp('sliceBottom', Math.max(0,+this.value), true)"></div>
+      <div class="field"><label>裁剪框 X (clipX)</label><input type="number" value="${n.clipX ?? 0}" oninput="updateProp('clipX', +this.value, true)"></div>
+      <div class="field"><label>裁剪框 Y (clipY)</label><input type="number" value="${n.clipY ?? 0}" oninput="updateProp('clipY', +this.value, true)"></div>
+      <div class="field"><label>裁剪框 宽 (0=不裁)</label><input type="number" min="0" value="${n.clipW ?? 0}" oninput="updateProp('clipW', Math.max(0,+this.value), true)"></div>
+      <div class="field"><label>裁剪框 高 (0=不裁)</label><input type="number" min="0" value="${n.clipH ?? 0}" oninput="updateProp('clipH', Math.max(0,+this.value), true)"></div>
+      <div class="field row"><input type="checkbox" ${n.clipChildren ? 'checked' : ''} onchange="updateProp('clipChildren', this.checked)"><label>裁剪子节点 (ClipChildren)</label></div>
+      <div class="field"></div>
+
       <div class="sec-title">⚙️ 物理、独立碰撞体 (P1) 与战斗组件</div>
       <div class="field"><label>物理模式 (BodyMode)</label>
         <select onchange="updateProp('bodyMode', this.value)">
