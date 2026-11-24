@@ -67,6 +67,7 @@ class MainActivity : Activity() {
             File(this, "textures").mkdirs()
             File(this, "audio").mkdirs()
             File(this, "scripts").mkdirs()
+            File(this, "data").mkdirs()
         }
     }
 
@@ -77,6 +78,15 @@ class MainActivity : Activity() {
             .replace(Regex("[^\\u4e00-\\u9fa5a-zA-Z0-9._-]"), "_")
         if (cleaned.isEmpty() || cleaned == ".js") return ""
         return if (cleaned.endsWith(".js", ignoreCase = true)) cleaned else "$cleaned.js"
+    }
+
+    private fun sanitizeDataName(rawName: String): String {
+        val cleaned = rawName.trim()
+            .replace("\\", "/")
+            .substringAfterLast("/")
+            .replace(Regex("[^\\u4e00-\\u9fa5a-zA-Z0-9._-]"), "_")
+        if (cleaned.isEmpty() || cleaned == ".json") return ""
+        return if (cleaned.endsWith(".json", ignoreCase = true)) cleaned else "$cleaned.json"
     }
 
     private fun syncFileToSaf(projName: String, subDir: String, fileName: String, bytes: ByteArray, mimeType: String) {
@@ -133,7 +143,8 @@ class MainActivity : Activity() {
             "scenes" to "application/json",
             "textures" to "image/png",
             "audio" to "audio/mpeg",
-            "scripts" to "text/javascript"
+            "scripts" to "text/javascript",
+            "data" to "application/json"
         ).forEach { (sub, mime) ->
             File(projDir, sub).listFiles()?.filter { it.isFile }?.forEach { f ->
                 syncFileToSaf(projName, sub, f.name, f.readBytes(), mime)
@@ -315,6 +326,49 @@ class MainActivity : Activity() {
             return ok
         }
 
+        // ==================== P5 数值数据表与多语言管理（data/*.json） ====================
+        @JavascriptInterface
+        fun listDataFiles(): String {
+            val dir = File(getProjectDir(), "data").apply { mkdirs() }
+            val list = dir.listFiles()?.filter { it.isFile && it.name.endsWith(".json", ignoreCase = true) }
+                ?.map { it.name }?.sorted() ?: emptyList()
+            return JSONArray(list).toString()
+        }
+
+        @JavascriptInterface
+        fun loadDataFile(fileName: String): String {
+            val safeName = sanitizeDataName(fileName)
+            if (safeName.isEmpty()) return ""
+            val f = File(getProjectDir(), "data/$safeName")
+            return if (f.exists()) f.readText() else ""
+        }
+
+        @JavascriptInterface
+        fun saveDataFile(fileName: String, content: String): Boolean {
+            val safeName = sanitizeDataName(fileName)
+            if (safeName.isEmpty()) return false
+            return try {
+                val dir = File(getProjectDir(), "data").apply { mkdirs() }
+                File(dir, safeName).writeText(content)
+                syncFileToSaf(currentProject, "data", safeName, content.toByteArray(Charsets.UTF_8), "application/json")
+                appendConsoleLog("[DATA] 已保存数据表: data/$safeName")
+                true
+            } catch (e: Exception) {
+                appendConsoleLog("[DATA 错误] ${e.message}")
+                false
+            }
+        }
+
+        @JavascriptInterface
+        fun deleteDataFile(fileName: String): Boolean {
+            val safeName = sanitizeDataName(fileName)
+            if (safeName.isEmpty()) return false
+            val f = File(getProjectDir(), "data/$safeName")
+            val ok = f.exists() && f.delete()
+            if (ok) appendConsoleLog("[DATA] 已删除数据表: data/$safeName")
+            return ok
+        }
+
         @JavascriptInterface
         fun saveSceneFile(sceneFileName: String, sceneJson: String) {
             val safeName = if (sceneFileName.endsWith(".scene")) sceneFileName else "$sceneFileName.scene"
@@ -490,7 +544,7 @@ class MainActivity : Activity() {
         if (isPlaying) return
         isPlaying = true
         consoleLogs.clear()
-        appendConsoleLog("[SYSTEM] Project [$currentProject] v0.5-Release Runtime started.")
+        appendConsoleLog("[SYSTEM] Project [$currentProject] v1.3-P5 Runtime started.")
 
         val projDir = getProjectDir()
         val surface = ZeroEngineView(
@@ -522,7 +576,7 @@ class MainActivity : Activity() {
             }
 
             val statusText = TextView(this).apply {
-                text = "ZeroEngine v0.5-Release | TileMap + Particles + Shadows"
+                text = "ZeroEngine v1.3-P5 | Batch + WorldFlags + 9-Slice + Audio"
                 textSize = 11f
                 typeface = Typeface.MONOSPACE
                 setTextColor(Color.parseColor("#34D399"))
