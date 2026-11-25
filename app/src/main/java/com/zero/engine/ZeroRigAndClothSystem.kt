@@ -3,89 +3,93 @@ package com.zero.engine
 import android.opengl.GLES20
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.nio.FloatBuffer
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.*
 
 /**
- * P9 商业级 2D 骨骼 IK 反向动力学 + Verlet 披风/丝带布料物理与动态网格渲染系统
+ * P17 GLES 3.0 GPU 布料飘带管线 + 2-Bone IK 反向运动学系统：
+ * - CPU 仅解算轻量的 Verlet 脊柱节点（最多 32 节）
+ * - 飘带几何网格一次性写入静态 GPU VBO，法线展开、丝绸高频风浪抖动与褶皱明暗全部在 GPU 顶点着色器完成
  */
 class ZeroRigAndClothSystem(
     private val onConsoleLog: (String) -> Unit
 ) {
-    data class VerletPoint(
+    private data class ClothNode(
         var x: Float,
         var y: Float,
         var oldX: Float,
         var oldY: Float
     )
 
-    data class ClothRibbon(
+    private class ClothStrip(
         val id: String,
-        var anchorNodeName: String,
-        var offsetX: Float = 0f,
-        var offsetY: Float = 0f,
-        val segments: Int = 10,
-        var segmentLen: Float = 18f,
-        var widthStart: Float = 38f,
-        var widthEnd: Float = 10f,
-        var r: Float = 0.88f,
-        var g: Float = 0.18f,
-        var b: Float = 0.24f,
-        var a: Float = 0.95f,
-        var gravityX: Float = 0f,
-        var gravityY: Float = 980f,
-        var windX: Float = -120f,
-        var windY: Float = 0f,
-        var turbulence: Float = 180f,
-        var damping: Float = 0.96f,
-        var zOffset: Float = -1f,
-        var texture: String = "",
-        var visible: Boolean = true,
-        val points: Array<VerletPoint>
+        val anchorNodeName: String,
+        val offsetX: Float,
+        val offsetY: Float,
+        val segmentLen: Float,
+        val widthStart: Float,
+        val widthEnd: Float,
+        val r: Float,
+        val g: Float,
+        val b: Float,
+        val a: Float,
+        val gravityY: Float,
+        val windX: Float,
+        val turbulence: Float,
+        val texture: String,
+        val nodes: Array<ClothNode>,
+        val uniformNodes: FloatArray = FloatArray(MAX_CLOTH_NODES * 4),
+        var vboId: Int = 0,
+        var vertexCount: Int = 0
     )
 
-    data class TwoBoneIkConstraint(
+    private data class IkChain(
         val id: String,
-        val rootNodeName: String,
-        val midNodeName: String,
-        var len1: Float,
-        var len2: Float,
+        val rootName: String,
+        val midName: String,
+        val len1: Float,
+        val len2: Float,
+        val flipBend: Boolean,
         var targetX: Float = 0f,
         var targetY: Float = 0f,
-        var flipBend: Boolean = false,
-        var enabled: Boolean = true
+        var active: Boolean = false
     )
 
-    private val cloths = LinkedHashMap<String, ClothRibbon>()
-    private val ikConstraints = LinkedHashMap<String, TwoBoneIkConstraint>()
-
+    private val cloths = ConcurrentHashMap<String, ClothStrip>()
+    private val ikChains = ConcurrentHashMap<String, IkChain>()
+    private var clothProgram = 0
     private var globalWindX = 0f
     private var globalWindY = 0f
-    private var simTime = 0f
-
-    private var ribbonProgram = 0
-    private val maxRibbonVerts = 128 // 支持单条丝带最高 63 段
-    private val ribbonData = FloatArray(maxRibbonVerts * 5)
-    private val ribbonBuffer: FloatBuffer = ByteBuffer.allocateDirect(ribbonData.size * 4)
-        .order(ByteOrder.nativeOrder()).asFloatBuffer()
+    private var elapsedTime = 0f
 
     val activeClothCount: Int get() = cloths.size
-    val activeIkCount: Int get() = ikConstraints.size
+    val activeIkCount: Int get() = ikChains.size
 
     fun initGL() {
-        ribbonProgram = ZeroShaders.buildShaderProgram(RIBBON_VS, RIBBON_FS, onConsoleLog)
+        clothProgram = ZeroShaders.buildShaderProgram(CLOTH_VS, CLOTH_FS, onConsoleLog)
     }
 
     fun releaseGL() {
-        if (ribbonProgram != 0) {
-            GLES20.glDeleteProgram(ribbonProgram)
-            ribbonProgram = 0
+        cloths.values.forEach { releaseClothVbo(it) }
+        cloths.clear()
+        ikChains.clear()
+        if (clothProgram != 0) {
+            GLES20.glDeleteProgram(clothProgram)
+            clothProgram = 0
         }
     }
 
     fun clearAll() {
+        cloths.values.forEach { releaseClothVbo(it) }
         cloths.clear()
-        ikConstraints.clear()
+        ikChains.clear()
+    }
+
+    private fun releaseClothVbo(c: ClothStrip) {
+        if (c.vboId != 0) {
+            GLES20.glDeleteBuffers(1, intArrayOf(c.vboId), 0)
+            c.vboId = 0
+        }
     }
 
     fun setGlobalWind(wx: Float, wy: Float) {
@@ -93,48 +97,53 @@ class ZeroRigAndClothSystem(
         globalWindY = wy
     }
 
-    // ==================== 1. 2D 两段骨骼解析 IK（Law of Cosines） ====================
+    fun createCloth(
+        id: String,
+        anchorNodeName: String,
+        startX: Float,
+        startY: Float,
+        offsetX: Float,
+        offsetY: Float,
+        segments: Int,
+        segmentLen: Float,
+        widthStart: Float,
+        widthEnd: Float,
+        r: Float,
+        g: Float,
+        b: Float,
+        a: Float,
+        gravityY: Float,
+        windX: Float,
+        turbulence: Float,
+        texture: String
+    ) {
+        removeCloth(id)
+        val segs = segments.coerceIn(2, MAX_CLOTH_NODES - 1)
+        val count = segs + 1
+        val sx = startX + offsetX
+        val sy = startY + offsetY
+        val nodes = Array(count) { i ->
+            ClothNode(sx, sy + i * segmentLen, sx, sy + i * segmentLen)
+        }
+        cloths[id] = ClothStrip(
+            id = id,
+            anchorNodeName = anchorNodeName,
+            offsetX = offsetX,
+            offsetY = offsetY,
+            segmentLen = max(2f, segmentLen),
+            widthStart = max(2f, widthStart),
+            widthEnd = max(1f, widthEnd),
+            r = r, g = g, b = b, a = a,
+            gravityY = gravityY,
+            windX = windX,
+            turbulence = turbulence,
+            texture = texture,
+            nodes = nodes
+        )
+    }
 
-    /**
-     * 单次即时求解两段骨骼 IK，直接写入 rootNode 与 midNode 的局部 rotation（角度制）
-     */
-    fun solveTwoBoneIK(
-        rootNode: ZeroEngineView.GameNode,
-        midNode: ZeroEngineView.GameNode,
-        targetX: Float,
-        targetY: Float,
-        len1: Float,
-        len2: Float,
-        flipBend: Boolean,
-        getGlobalTransform: (ZeroEngineView.GameNode) -> ZeroEngineView.GlobalTransform
-    ): Boolean {
-        val l1 = max(1f, len1)
-        val l2 = max(1f, len2)
-        val rootGt = getGlobalTransform(rootNode)
-
-        val dx = targetX - rootGt.gx
-        val dy = targetY - rootGt.gy
-        val rawDist = hypot(dx, dy)
-        val minReach = abs(l1 - l2) + 0.5f
-        val maxReach = (l1 + l2) - 0.5f
-        val dist = rawDist.coerceIn(minReach, maxReach)
-
-        val baseAngle = atan2(dy.toDouble(), dx.toDouble())
-        val cosA = ((l1 * l1 + dist * dist - l2 * l2) / (2.0 * l1 * dist)).coerceIn(-1.0, 1.0)
-        val cosB = ((l1 * l1 + l2 * l2 - dist * dist) / (2.0 * l1 * l2)).coerceIn(-1.0, 1.0)
-
-        val angleA = acos(cosA)
-        val angleB = acos(cosB)
-
-        val bendSign = if (flipBend) -1.0 else 1.0
-        val worldRootRad = baseAngle - angleA * bendSign
-        val localMidRad = (PI - angleB) * bendSign
-
-        // 减去父节点自身带来的世界旋转，换算回局部 rotation
-        val parentRotDeg = rootGt.gRot - rootNode.rotation
-        rootNode.rotation = Math.toDegrees(worldRootRad).toFloat() - parentRotDeg
-        midNode.rotation = Math.toDegrees(localMidRad).toFloat()
-        return rawDist <= (l1 + l2)
+    fun removeCloth(id: String) {
+        cloths.remove(id)?.let { releaseClothVbo(it) }
     }
 
     fun registerTwoBoneIK(
@@ -145,75 +154,51 @@ class ZeroRigAndClothSystem(
         len2: Float,
         flipBend: Boolean
     ) {
-        if (id.isBlank() || rootName.isBlank() || midName.isBlank()) return
-        ikConstraints[id] = TwoBoneIkConstraint(id, rootName, midName, max(1f, len1), max(1f, len2), 0f, 0f, flipBend, true)
+        if (id.isEmpty()) return
+        ikChains[id] = IkChain(id, rootName, midName, max(1f, len1), max(1f, len2), flipBend)
     }
 
-    fun setIkTarget(id: String, tx: Float, ty: Float, enabled: Boolean = true) {
-        ikConstraints[id]?.let {
-            it.targetX = tx
-            it.targetY = ty
-            it.enabled = enabled
+    fun setIkTarget(id: String, targetX: Float, targetY: Float, active: Boolean) {
+        ikChains[id]?.let {
+            it.targetX = targetX
+            it.targetY = targetY
+            it.active = active
         }
     }
 
     fun removeIk(id: String) {
-        ikConstraints.remove(id)
+        ikChains.remove(id)
     }
 
-    // ==================== 2. Verlet 2D 布料/披风/丝带物理 ====================
+    fun solveTwoBoneIK(
+        root: ZeroEngineView.GameNode,
+        mid: ZeroEngineView.GameNode,
+        targetX: Float,
+        targetY: Float,
+        len1: Float,
+        len2: Float,
+        flipBend: Boolean,
+        getGlobalTransform: (ZeroEngineView.GameNode) -> ZeroEngineView.GlobalTransform
+    ): Boolean {
+        val rGt = getGlobalTransform(root)
+        val dx = targetX - rGt.gx
+        val dy = targetY - rGt.gy
+        val l1 = max(1f, len1)
+        val l2 = max(1f, len2)
+        val dist = hypot(dx, dy).coerceIn(abs(l1 - l2) + 0.01f, l1 + l2 - 0.01f)
 
-    fun createCloth(
-        id: String,
-        anchorNodeName: String,
-        startX: Float,
-        startY: Float,
-        offsetX: Float = 0f,
-        offsetY: Float = 0f,
-        segments: Int = 10,
-        segmentLen: Float = 18f,
-        widthStart: Float = 38f,
-        widthEnd: Float = 10f,
-        r: Float = 0.88f,
-        g: Float = 0.18f,
-        b: Float = 0.24f,
-        a: Float = 0.95f,
-        gravityY: Float = 980f,
-        windX: Float = -120f,
-        turbulence: Float = 180f,
-        texture: String = ""
-    ): ClothRibbon {
-        val segs = segments.coerceIn(2, 60)
-        val sLen = max(2f, segmentLen)
-        val pts = Array(segs + 1) { i ->
-            val px = startX + offsetX
-            val py = startY + offsetY + i * sLen
-            VerletPoint(px, py, px, py)
-        }
-        val ribbon = ClothRibbon(
-            id = id,
-            anchorNodeName = anchorNodeName,
-            offsetX = offsetX,
-            offsetY = offsetY,
-            segments = segs,
-            segmentLen = sLen,
-            widthStart = max(1f, widthStart),
-            widthEnd = max(0.5f, widthEnd),
-            r = r, g = g, b = b, a = a,
-            gravityY = gravityY,
-            windX = windX,
-            turbulence = turbulence,
-            texture = texture,
-            points = pts
-        )
-        cloths[id] = ribbon
-        return ribbon
-    }
+        val baseAngle = atan2(dy, dx)
+        val cosA = ((l1 * l1 + dist * dist - l2 * l2) / (2f * l1 * dist)).coerceIn(-1f, 1f)
+        val cosB = ((l1 * l1 + l2 * l2 - dist * dist) / (2f * l1 * l2)).coerceIn(-1f, 1f)
+        val bendSign = if (flipBend) -1f else 1f
 
-    fun getCloth(id: String): ClothRibbon? = cloths[id]
+        val rootWorldRad = baseAngle + bendSign * acos(cosA)
+        val midRelRad = bendSign * (Math.PI.toFloat() - acos(cosB))
 
-    fun removeCloth(id: String) {
-        cloths.remove(id)
+        val parentRot = rGt.gRot - root.rotation
+        root.rotation = Math.toDegrees(rootWorldRad.toDouble()).toFloat() - parentRot
+        mid.rotation = Math.toDegrees(midRelRad.toDouble()).toFloat()
+        return true
     }
 
     fun update(
@@ -221,190 +206,228 @@ class ZeroRigAndClothSystem(
         nodes: List<ZeroEngineView.GameNode>,
         getGlobalTransform: (ZeroEngineView.GameNode) -> ZeroEngineView.GlobalTransform
     ) {
-        simTime += dt
+        elapsedTime += dt
+        if (cloths.isEmpty() && ikChains.isEmpty()) return
 
-        // 1. 求解所有已注册的常驻 IK 约束
-        if (ikConstraints.isNotEmpty()) {
-            for (c in ikConstraints.values) {
-                if (!c.enabled) continue
-                val root = nodes.find { it.name == c.rootNodeName } ?: continue
-                val mid = nodes.find { it.name == c.midNodeName } ?: continue
-                solveTwoBoneIK(root, mid, c.targetX, c.targetY, c.len1, c.len2, c.flipBend, getGlobalTransform)
-            }
+        val nodeMap = HashMap<String, ZeroEngineView.GameNode>(nodes.size)
+        nodes.forEach { nodeMap[it.name] = it }
+
+        // 1. 持续性 2-Bone IK 解算
+        ikChains.values.forEach { ik ->
+            if (!ik.active) return@forEach
+            val root = nodeMap[ik.rootName] ?: return@forEach
+            val mid = nodeMap[ik.midName] ?: return@forEach
+            solveTwoBoneIK(root, mid, ik.targetX, ik.targetY, ik.len1, ik.len2, ik.flipBend, getGlobalTransform)
         }
 
-        // 2. 步进所有 Verlet 布料/丝带
-        if (cloths.isEmpty()) return
-        val dtSq = dt * dt
+        // 2. 轻量 Verlet 脊柱物理积分
+        val stepDt = dt.coerceIn(0.001f, 0.033f)
+        val dtSq = stepDt * stepDt
 
-        for (cloth in cloths.values) {
-            if (!cloth.visible) continue
-            val anchor = nodes.find { it.name == cloth.anchorNodeName }
-            val anchorGt = anchor?.let { getGlobalTransform(it) }
-            val dirX = if (anchorGt != null && anchorGt.gSx < 0f) -1f else 1f
-            val pinX = (anchorGt?.gx ?: cloth.points[0].x) + cloth.offsetX * dirX
-            val pinY = (anchorGt?.gy ?: cloth.points[0].y) + cloth.offsetY
+        cloths.values.forEach { c ->
+            val anchor = if (c.anchorNodeName.isNotEmpty()) nodeMap[c.anchorNodeName] else null
+            if (anchor != null) {
+                val gt = getGlobalTransform(anchor)
+                val sx = if (gt.gSx < 0f) -1f else 1f
+                c.nodes[0].x = gt.gx + c.offsetX * sx
+                c.nodes[0].y = gt.gy + c.offsetY
+                c.nodes[0].oldX = c.nodes[0].x
+                c.nodes[0].oldY = c.nodes[0].y
+            }
 
-            val pts = cloth.points
-            // 根节点强制钉死在角色锚点上
-            pts[0].x = pinX; pts[0].y = pinY
-            pts[0].oldX = pinX; pts[0].oldY = pinY
+            val totalWindX = c.windX + globalWindX
+            val totalGravY = c.gravityY + globalWindY
+            val damping = 0.965f
 
-            // Verlet 积分
-            for (i in 1 until pts.size) {
-                val p = pts[i]
-                val vx = (p.x - p.oldX) * cloth.damping
-                val vy = (p.y - p.oldY) * cloth.damping
+            for (i in 1 until c.nodes.size) {
+                val p = c.nodes[i]
+                val vx = (p.x - p.oldX) * damping
+                val vy = (p.y - p.oldY) * damping
                 p.oldX = p.x
                 p.oldY = p.y
 
-                val wave = sin((simTime * 7.5f - i * 0.65f).toDouble()).toFloat() * cloth.turbulence
-                val ax = cloth.gravityX + cloth.windX * dirX + globalWindX + wave
-                val ay = cloth.gravityY + cloth.windY + globalWindY + wave * 0.35f
-
-                p.x += vx + ax * dtSq
-                p.y += vy + ay * dtSq
+                val turb = sin(elapsedTime * 5.2f + i * 0.75f) * c.turbulence
+                p.x += vx + (totalWindX + turb) * dtSq
+                p.y += vy + totalGravY * dtSq
             }
 
-            // 6 次距离约束松弛迭代，保证披风绝不被拉断或过度伸长
-            val segLen = cloth.segmentLen
-            repeat(6) {
-                pts[0].x = pinX
-                pts[0].y = pinY
-                for (i in 0 until pts.size - 1) {
-                    val p1 = pts[i]
-                    val p2 = pts[i + 1]
-                    val dx = p2.x - p1.x
-                    val dy = p2.y - p1.y
-                    val dist = hypot(dx, dy).coerceAtLeast(0.0001f)
-                    val diff = (dist - segLen) / dist
+            // 距离约束迭代（4 次足够稳定且极快）
+            repeat(4) {
+                for (i in 0 until c.nodes.size - 1) {
+                    val p0 = c.nodes[i]
+                    val p1 = c.nodes[i + 1]
+                    val dx = p1.x - p0.x
+                    val dy = p1.y - p0.y
+                    val d = hypot(dx, dy)
+                    if (d < 0.0001f) continue
+                    val diff = (d - c.segmentLen) / d
                     if (i == 0) {
-                        p2.x -= dx * diff
-                        p2.y -= dy * diff
+                        p1.x -= dx * diff
+                        p1.y -= dy * diff
                     } else {
                         val half = diff * 0.5f
-                        p1.x += dx * half
-                        p1.y += dy * half
-                        p2.x -= dx * half
-                        p2.y -= dy * half
+                        p0.x += dx * half; p0.y += dy * half
+                        p1.x -= dx * half; p1.y -= dy * half
                     }
                 }
+            }
+
+            // 打包为 GPU Uniform 数组（xy = 脊柱位置, z = 半宽, w = 归一化节比例）
+            val maxIdx = max(1, c.nodes.size - 1).toFloat()
+            for (i in c.nodes.indices) {
+                val t = i / maxIdx
+                val halfW = (c.widthStart + (c.widthEnd - c.widthStart) * t) * 0.5f
+                val off = i * 4
+                c.uniformNodes[off] = c.nodes[i].x
+                c.uniformNodes[off + 1] = c.nodes[i].y
+                c.uniformNodes[off + 2] = halfW
+                c.uniformNodes[off + 3] = t
             }
         }
     }
 
-    // ==================== 3. GPU 动态丝带/披风网格渲染 ====================
+    private fun ensureClothVbo(c: ClothStrip) {
+        if (c.vboId != 0) return
+        val count = c.nodes.size
+        // TRIANGLE_STRIP：每节左右 2 个顶点，共 count * 2 个顶点
+        // 属性 vec4(segIndex, side(-1/+1), u, v)
+        val vCount = count * 2
+        val data = FloatArray(vCount * 4)
+        val maxIdx = max(1, count - 1).toFloat()
+        var off = 0
+        for (i in 0 until count) {
+            val v = i / maxIdx
+            // 左侧顶点
+            data[off++] = i.toFloat(); data[off++] = -1f; data[off++] = 0f; data[off++] = v
+            // 右侧顶点
+            data[off++] = i.toFloat(); data[off++] = 1f; data[off++] = 1f; data[off++] = v
+        }
+
+        val buf = ByteBuffer.allocateDirect(data.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
+            put(data); position(0)
+        }
+        val ids = IntArray(1)
+        GLES20.glGenBuffers(1, ids, 0)
+        c.vboId = ids[0]
+        c.vertexCount = vCount
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, c.vboId)
+        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, data.size * 4, buf, GLES20.GL_STATIC_DRAW)
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+    }
 
     fun renderCloths(
         vpMatrix: FloatArray,
         nodes: List<ZeroEngineView.GameNode>,
         fadeAlpha: Float,
         whiteTexId: Int,
-        getTextureId: (String) -> Int,
+        getImageTexture: (String) -> Int,
         getGlobalTransform: (ZeroEngineView.GameNode) -> ZeroEngineView.GlobalTransform,
         onDrawCall: () -> Unit
     ) {
-        if (cloths.isEmpty() || ribbonProgram == 0 || fadeAlpha <= 0.001f) return
+        if (cloths.isEmpty() || clothProgram == 0 || fadeAlpha <= 0.001f) return
 
-        GLES20.glUseProgram(ribbonProgram)
-        val posLoc = GLES20.glGetAttribLocation(ribbonProgram, "aPosition")
-        val uvLoc = GLES20.glGetAttribLocation(ribbonProgram, "aTexCoord")
-        val vpLoc = GLES20.glGetUniformLocation(ribbonProgram, "uVP")
-        val colLoc = GLES20.glGetUniformLocation(ribbonProgram, "uColor")
-        val texLoc = GLES20.glGetUniformLocation(ribbonProgram, "uTexture")
+        val nodeMap = HashMap<String, ZeroEngineView.GameNode>(nodes.size)
+        nodes.forEach { nodeMap[it.name] = it }
 
-        GLES20.glUniformMatrix4fv(vpLoc, 1, false, vpMatrix, 0)
-        GLES20.glEnableVertexAttribArray(posLoc)
-        GLES20.glEnableVertexAttribArray(uvLoc)
+        GLES20.glUseProgram(clothProgram)
+        val uVpLoc = GLES20.glGetUniformLocation(clothProgram, "uVP")
+        val uZLoc = GLES20.glGetUniformLocation(clothProgram, "uZ")
+        val uCountLoc = GLES20.glGetUniformLocation(clothProgram, "uNodeCount")
+        val uNodesLoc = GLES20.glGetUniformLocation(clothProgram, "uNodes")
+        val uTimeLoc = GLES20.glGetUniformLocation(clothProgram, "uTime")
+        val uFlutterLoc = GLES20.glGetUniformLocation(clothProgram, "uFlutterAmp")
+        val uColorLoc = GLES20.glGetUniformLocation(clothProgram, "uColor")
+        val uTexLoc = GLES20.glGetUniformLocation(clothProgram, "uTexture")
 
-        for (cloth in cloths.values) {
-            if (!cloth.visible) continue
-            val pts = cloth.points
-            if (pts.size < 2) continue
+        GLES20.glUniformMatrix4fv(uVpLoc, 1, false, vpMatrix, 0)
+        GLES20.glUniform1f(uTimeLoc, elapsedTime)
+        GLES20.glEnableVertexAttribArray(0)
 
-            val anchor = nodes.find { it.name == cloth.anchorNodeName }
-            val baseZ = (anchor?.let { getGlobalTransform(it).gz } ?: 0f) + cloth.zOffset
+        cloths.values.forEach { c ->
+            val anchor = if (c.anchorNodeName.isNotEmpty()) nodeMap[c.anchorNodeName] else null
+            if (anchor != null && !anchor.visible) return@forEach
+            ensureClothVbo(c)
+            if (c.vboId == 0 || c.vertexCount < 4) return@forEach
 
-            var fPos = 0
-            val lastIdx = pts.size - 1
-            for (i in pts.indices) {
-                val t = i.toFloat() / lastIdx.toFloat()
-                val halfW = (cloth.widthStart + (cloth.widthEnd - cloth.widthStart) * t) * 0.5f
+            val z = (anchor?.let { getGlobalTransform(it).gz } ?: 0f) + 2f
+            val flutterAmp = (c.turbulence * 0.035f).coerceIn(0f, 14f)
 
-                // 计算当前节点的切线与垂直法线
-                val tx: Float
-                val ty: Float
-                when (i) {
-                    0 -> { tx = pts[1].x - pts[0].x; ty = pts[1].y - pts[0].y }
-                    lastIdx -> { tx = pts[lastIdx].x - pts[lastIdx - 1].x; ty = pts[lastIdx].y - pts[lastIdx - 1].y }
-                    else -> { tx = pts[i + 1].x - pts[i - 1].x; ty = pts[i + 1].y - pts[i - 1].y }
-                }
-                val tLen = hypot(tx, ty).coerceAtLeast(0.0001f)
-                val nx = -ty / tLen
-                val ny = tx / tLen
+            GLES20.glUniform1f(uZLoc, z)
+            GLES20.glUniform1i(uCountLoc, c.nodes.size)
+            GLES20.glUniform4fv(uNodesLoc, c.nodes.size, c.uniformNodes, 0)
+            GLES20.glUniform1f(uFlutterLoc, flutterAmp)
+            GLES20.glUniform4f(uColorLoc, c.r * fadeAlpha, c.g * fadeAlpha, c.b * fadeAlpha, c.a)
 
-                val px = pts[i].x
-                val py = pts[i].y
-
-                // 左边缘顶点
-                ribbonData[fPos++] = px + nx * halfW
-                ribbonData[fPos++] = py + ny * halfW
-                ribbonData[fPos++] = baseZ
-                ribbonData[fPos++] = 0f
-                ribbonData[fPos++] = t
-
-                // 右边缘顶点
-                ribbonData[fPos++] = px - nx * halfW
-                ribbonData[fPos++] = py - ny * halfW
-                ribbonData[fPos++] = baseZ
-                ribbonData[fPos++] = 1f
-                ribbonData[fPos++] = t
-            }
-
-            ribbonBuffer.clear()
-            ribbonBuffer.put(ribbonData, 0, fPos)
-
-            ribbonBuffer.position(0)
-            GLES20.glVertexAttribPointer(posLoc, 3, GLES20.GL_FLOAT, false, 20, ribbonBuffer)
-            ribbonBuffer.position(3)
-            GLES20.glVertexAttribPointer(uvLoc, 2, GLES20.GL_FLOAT, false, 20, ribbonBuffer)
-
-            val texId = if (cloth.texture.isNotEmpty()) getTextureId(cloth.texture) else whiteTexId
+            val texId = if (c.texture.isNotEmpty()) getImageTexture(c.texture) else whiteTexId
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId)
-            GLES20.glUniform1i(texLoc, 0)
-            GLES20.glUniform4f(colLoc, cloth.r, cloth.g, cloth.b, cloth.a * fadeAlpha)
+            GLES20.glUniform1i(uTexLoc, 0)
 
-            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, pts.size * 2)
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, c.vboId)
+            GLES20.glVertexAttribPointer(0, 4, GLES20.GL_FLOAT, false, 16, 0)
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, c.vertexCount)
             onDrawCall()
         }
 
-        GLES20.glDisableVertexAttribArray(posLoc)
-        GLES20.glDisableVertexAttribArray(uvLoc)
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+        GLES20.glDisableVertexAttribArray(0)
     }
 
     companion object {
-        private const val RIBBON_VS = """
-            attribute vec3 aPosition;
-            attribute vec2 aTexCoord;
-            uniform mat4 uVP;
-            varying vec2 vTexCoord;
-            void main() {
-                vTexCoord = aTexCoord;
-                gl_Position = uVP * vec4(aPosition, 1.0);
-            }
-        """
+        private const val MAX_CLOTH_NODES = 32
 
-        private const val RIBBON_FS = """
+        private val CLOTH_VS = """#version 300 es
+            precision highp float;
+
+            layout(location = 0) in vec4 aRibbonData; // x=segIdx, y=side(-1/+1), z=u, w=v
+
+            uniform mat4 uVP;
+            uniform float uZ;
+            uniform int uNodeCount;
+            uniform vec4 uNodes[32]; // xy=pos, z=halfWidth, w=ratio(0..1)
+            uniform float uTime;
+            uniform float uFlutterAmp;
+
+            out vec2 vTexCoord;
+            out float vShade;
+
+            void main() {
+                int idx = clamp(int(aRibbonData.x + 0.5), 0, max(0, uNodeCount - 1));
+                int prevIdx = max(0, idx - 1);
+                int nextIdx = min(max(0, uNodeCount - 1), idx + 1);
+
+                vec4 curr = uNodes[idx];
+                vec2 tangent = uNodes[nextIdx].xy - uNodes[prevIdx].xy;
+                float tLen = length(tangent);
+                vec2 dir = tLen > 0.0001 ? tangent / tLen : vec2(0.0, 1.0);
+                vec2 normal = vec2(-dir.y, dir.x);
+
+                // GPU 高频丝绸飘动与边缘微褶皱
+                float wave = sin(uTime * 11.5 - curr.w * 10.0 + aRibbonData.y * 0.85);
+                float flutter = wave * uFlutterAmp * curr.w;
+                vec2 worldPos = curr.xy + normal * (aRibbonData.y * curr.z + flutter);
+
+                vTexCoord = aRibbonData.zw;
+                vShade = 0.86 + 0.14 * wave * curr.w;
+                gl_Position = uVP * vec4(worldPos, uZ, 1.0);
+            }
+        """.trimIndent()
+
+        private val CLOTH_FS = """#version 300 es
             precision mediump float;
+
             uniform sampler2D uTexture;
             uniform vec4 uColor;
-            varying vec2 vTexCoord;
+
+            in vec2 vTexCoord;
+            in float vShade;
+            out vec4 fragColor;
+
             void main() {
-                vec4 base = texture2D(uTexture, vTexCoord) * uColor;
-                if (base.a < 0.01) discard;
-                gl_FragColor = base;
+                vec4 tex = texture(uTexture, vTexCoord) * uColor;
+                if (tex.a < 0.01) discard;
+                fragColor = vec4(tex.rgb * vShade, tex.a);
             }
-        """
+        """.trimIndent()
     }
 }
