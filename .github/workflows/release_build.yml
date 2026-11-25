@@ -27,6 +27,10 @@ on:
         description: 'Build Type (debug / release)'
         required: true
         default: 'debug'
+      screen_orientation:
+        description: 'Screen Orientation (sensor / landscape / portrait)'
+        required: true
+        default: 'sensor'
 
 jobs:
   build:
@@ -54,12 +58,13 @@ jobs:
             unzip -o game_bundle.zip -d app/src/main/assets/game
           fi
 
-      - name: Patch App Name, Package Name & Version
+      - name: Patch App Name, Package, Version, Icon & Orientation
         env:
           APP_NAME: ${{ github.event.inputs.app_name }}
           PKG_NAME: ${{ github.event.inputs.package_name }}
           VER_NAME: ${{ github.event.inputs.version_name }}
           VER_CODE: ${{ github.event.inputs.version_code }}
+          SCREEN_ORI: ${{ github.event.inputs.screen_orientation }}
         run: |
           mkdir -p app/src/main/res/values
           cat > app/src/main/res/values/strings.xml <<EOF
@@ -73,6 +78,58 @@ jobs:
           sed -i -E "s/(applicationId[[:space:]]*=?[[:space:]]*\")[^\"]+\"/\1${PKG_NAME}\"/" "$GRADLE_FILE"
           sed -i -E "s/(versionCode[[:space:]]*=?[[:space:]]*)[0-9]+/\1${VER_CODE}/" "$GRADLE_FILE"
           sed -i -E "s/(versionName[[:space:]]*=?[[:space:]]*\")[^\"]+\"/\1${VER_NAME}\"/" "$GRADLE_FILE"
+
+          # 1. 替换自定义桌面图标（若工程包含 app_icon.png）
+          HAS_CUSTOM_ICON="0"
+          if [ -f "app/src/main/assets/game/app_icon.png" ]; then
+            HAS_CUSTOM_ICON="1"
+            rm -rf app/src/main/res/mipmap-anydpi-v26
+            for d in mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi; do
+              mkdir -p "app/src/main/res/$d"
+              cp app/src/main/assets/game/app_icon.png "app/src/main/res/$d/ic_launcher.png"
+              cp app/src/main/assets/game/app_icon.png "app/src/main/res/$d/ic_launcher_round.png"
+            done
+            rm -f app/src/main/assets/game/app_icon.png
+          fi
+
+          # 2. 写入横屏/竖屏锁定配置与图标属性到 AndroidManifest.xml
+          HAS_CUSTOM_ICON="$HAS_CUSTOM_ICON" python3 - <<'PY'
+          import os, re
+          p = "app/src/main/AndroidManifest.xml"
+          if os.path.exists(p):
+              txt = open(p, encoding="utf-8").read()
+              ori = os.environ.get("SCREEN_ORI", "sensor")
+              ori_map = {
+                  "portrait": "portrait",
+                  "landscape": "sensorLandscape",
+                  "sensor": "unspecified"
+              }
+              val = ori_map.get(ori, "unspecified")
+
+              def patch_activity(m):
+                  tag = m.group(0)
+                  if "android:screenOrientation=" in tag:
+                      return re.sub(r'android:screenOrientation="[^"]*"', f'android:screenOrientation="{val}"', tag)
+                  if tag.endswith("/>"):
+                      return tag[:-2] + f' android:screenOrientation="{val}"/>'
+                  return tag[:-1] + f' android:screenOrientation="{val}">'
+
+              txt = re.sub(r'<activity\b[^>]*>', patch_activity, txt, count=1)
+
+              if os.environ.get("HAS_CUSTOM_ICON") == "1":
+                  def patch_app(m):
+                      tag = m.group(0)
+                      if "android:icon=" in tag:
+                          tag = re.sub(r'android:icon="[^"]*"', 'android:icon="@mipmap/ic_launcher"', tag)
+                      else:
+                          tag = tag[:-1] + ' android:icon="@mipmap/ic_launcher">'
+                      if "android:roundIcon=" in tag:
+                          tag = re.sub(r'android:roundIcon="[^"]*"', 'android:roundIcon="@mipmap/ic_launcher_round"', tag)
+                      return tag
+                  txt = re.sub(r'<application\b[^>]*>', patch_app, txt, count=1)
+
+              open(p, "w", encoding="utf-8").write(txt)
+          PY
 
       - name: Build APK & AAB (Debug or Unsigned Release)
         env:
