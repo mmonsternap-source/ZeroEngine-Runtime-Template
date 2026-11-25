@@ -20,6 +20,7 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
@@ -126,7 +127,15 @@ class ZeroEngineView(
     private var shakeIntensity = 0f; private var shakeTimer = 0f
     private var viewMinX = -99999f; private var viewMaxX = 99999f; private var viewMinY = -99999f; private var viewMaxY = 99999f
 
-    private var smoothedFps = 60f; private var frameDrawCalls = 0; private var lastFrameDrawCalls = 0; private var frameCulled = 0; private var lastFrameCulled = 0; private var lastFrameLights = 0
+    @Volatile private var smoothedFps = 60f
+    private var frameDrawCalls = 0
+    @Volatile private var lastFrameDrawCalls = 0
+    private var frameCulled = 0
+    @Volatile private var lastFrameCulled = 0
+    @Volatile private var lastFrameLights = 0
+    @Volatile private var lastFrameNodes = 0
+    @Volatile private var lastFrameTextures = 0
+
     private var hitstopTimer = 0f; private var timeScale = 1f
     private var ambientR = 0.52f; private var ambientG = 0.56f; private var ambientB = 0.68f
 
@@ -139,12 +148,13 @@ class ZeroEngineView(
 
     private var defaultLitProgram = 0; private var whiteTexId = 0; private var engineTime = 0f; private var lastFrameNs = 0L; private var surfaceW = 1080; private var surfaceH = 1920
 
-    // QuickJS 虚拟机与 4 个固定入口函数（零 JSObject 泄漏）
+    // QuickJS 虚拟机与固定入口函数（零 JSObject 泄漏）
     private var qjs: QuickJSContext? = null
     private var fnBindNode: JSFunction? = null
     private var fnDestroyNode: JSFunction? = null
     private var fnCallHook: JSFunction? = null
     private var fnDispatchTouch: JSFunction? = null
+    private var fnAdCallback: JSFunction? = null
 
     private val quadBuffer: FloatBuffer = ByteBuffer.allocateDirect(4 * 5 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
         put(floatArrayOf(-0.5f, -0.5f, 0f, 0f, 0f, 0.5f, -0.5f, 0f, 1f, 0f, -0.5f, 0.5f, 0f, 0f, 1f, 0.5f, 0.5f, 0f, 1f, 1f)); position(0)
@@ -161,6 +171,20 @@ class ZeroEngineView(
         setEGLContextClientVersion(2); setRenderer(this); renderMode = RENDERMODE_CONTINUOUSLY
     }
 
+    fun getPerfSummaryText(): String {
+        val rt = Runtime.getRuntime()
+        val usedMb = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024)
+        val maxMb = rt.maxMemory() / (1024 * 1024)
+        return String.format(
+            Locale.US,
+            "FPS: %.1f | DC: %d | 剔除: %d\n节点: %d | 光源: %d | 纹理: %d | 内存: %d/%dMB\nVM: QuickJS | GI: %s | 阴影: %s",
+            smoothedFps, lastFrameDrawCalls, lastFrameCulled,
+            lastFrameNodes, lastFrameLights, lastFrameTextures, usedMb, maxMb,
+            if (giSystem.isReady) "ON" else "OFF",
+            if (lightingSystem.sdfShadowEnabled) "ON" else "OFF"
+        )
+    }
+
     private fun normalizeSceneName(name: String): String = if (name.endsWith(".scene")) name else "$name.scene"
     private fun queryAtlas(name: String): TextureAtlasData? =
         ZeroShaders.loadAtlasData(projectDir, name, atlasCache, textureSizes, { getImageTexture(it) }, onConsoleLog)
@@ -170,7 +194,8 @@ class ZeroEngineView(
         try { fnDestroyNode?.release() } catch (_: Exception) {}
         try { fnCallHook?.release() } catch (_: Exception) {}
         try { fnDispatchTouch?.release() } catch (_: Exception) {}
-        fnBindNode = null; fnDestroyNode = null; fnCallHook = null; fnDispatchTouch = null
+        try { fnAdCallback?.release() } catch (_: Exception) {}
+        fnBindNode = null; fnDestroyNode = null; fnCallHook = null; fnDispatchTouch = null; fnAdCallback = null
         try { qjs?.destroy() } catch (_: Exception) {}
         qjs = null
     }
@@ -239,6 +264,7 @@ class ZeroEngineView(
         rigSystem.initGL()
         meshSystem.initGL()
         giSystem.initGL()
+        ZeroAdBridge.init(context, onConsoleLog)
         initQuickJsVM(); dataStore.loadI18nFromDiskIfNeeded(dataStore.currentLang)
         loadSceneContent(sceneJson, groupName = "main", additive = false); lastFrameNs = System.nanoTime()
     }
@@ -484,7 +510,10 @@ class ZeroEngineView(
             spriteBatch.end()
         }
         if (physicsSystem.debugDrawEnabled) renderTouchZonesDebugOverlay(uiVpMatrix)
-        lastFrameDrawCalls = frameDrawCalls; lastFrameCulled = frameCulled
+        lastFrameDrawCalls = frameDrawCalls
+        lastFrameCulled = frameCulled
+        lastFrameNodes = nodes.size
+        lastFrameTextures = textureCache.size
     }
 
     private fun canBatchNode(n: GameNode): Boolean =
@@ -1295,6 +1324,21 @@ class ZeroEngineView(
         g.setProperty("__zNodeSet", JSCallFunction { args -> nodeById[toJsInt(args.getOrNull(0), -1)]?.let { setNodeProp(it, toJsStr(args.getOrNull(1), ""), args.getOrNull(2)) }; null })
         g.setProperty("__zNodeCall", JSCallFunction { args -> nodeById[toJsInt(args.getOrNull(0), -1)]?.let { invokeNodeMethod(it, toJsStr(args.getOrNull(1), ""), args) } })
         g.setProperty("__zEngineCall", JSCallFunction { args -> invokeEngineMethod(toJsStr(args.getOrNull(0), ""), args) })
+        g.setProperty("__zAdReady", JSCallFunction { args -> ZeroAdBridge.isReady(toJsStr(args.getOrNull(0), "reward")) })
+        g.setProperty("__zAdShowInter", JSCallFunction { args ->
+            val cbId = toJsInt(args.getOrNull(0), -1)
+            ZeroAdBridge.showInterstitial(context) { ok ->
+                if (cbId >= 0) queueEvent { try { fnAdCallback?.call(cbId, ok) } catch (_: Exception) {} }
+            }
+            null
+        })
+        g.setProperty("__zAdShowReward", JSCallFunction { args ->
+            val cbId = toJsInt(args.getOrNull(0), -1)
+            ZeroAdBridge.showRewarded(context) { ok ->
+                if (cbId >= 0) queueEvent { try { fnAdCallback?.call(cbId, ok) } catch (_: Exception) {} }
+            }
+            null
+        })
         g.setProperty("__zInputGet", JSCallFunction { args ->
             when (toJsStr(args.getOrNull(0), "")) {
                 "isTouching" -> isTouching || inputSystem.getTouchCount() > 0
@@ -1331,6 +1375,7 @@ class ZeroEngineView(
         fnDestroyNode = g.getJSFunction("__zDestroyNode")
         fnCallHook = g.getJSFunction("__zCallHook")
         fnDispatchTouch = g.getJSFunction("__zDispatchTouch")
+        fnAdCallback = g.getJSFunction("__zOnAdResult")
         onConsoleLog("[VM] QuickJS ES6+ 高性能脚本引擎已启动")
     }
 
@@ -1466,6 +1511,8 @@ class ZeroEngineView(
               const __zTables = Object.create(null);
               const __zGlobals = Object.create(null);
               const __zEvents = Object.create(null);
+              const __zAdCbs = Object.create(null);
+              let __zAdCbSeq = 1;
 
               const nid = (n) => (n && typeof n === "object" && n.__zid) ? n.__zid : -1;
               const arrJson = (v) => JSON.stringify(Array.isArray(v) ? v.map(String) : (v != null ? [String(v)] : []));
@@ -1475,6 +1522,29 @@ class ZeroEngineView(
                 log: (...a) => __zLog("[LOG] " + fmtArgs(a)),
                 warn: (...a) => __zLog("[WARN] " + fmtArgs(a)),
                 error: (...a) => __zLog("[ERR] " + fmtArgs(a))
+              };
+
+              globalThis.__zOnAdResult = function(cbId, ok) {
+                const fn = __zAdCbs[cbId];
+                delete __zAdCbs[cbId];
+                if (typeof fn === "function") {
+                  try { fn(!!ok); } catch (e) { __zLog("[ADS 回调错误] " + (e && e.message ? e.message : e)); }
+                }
+              };
+
+              globalThis.ZeroAds = {
+                isReady: (type) => !!__zAdReady(String(type || "reward")),
+                showInterstitial: (cb) => {
+                  let id = -1;
+                  if (typeof cb === "function") { id = __zAdCbSeq++; __zAdCbs[id] = cb; }
+                  __zAdShowInter(id);
+                },
+                showReward: (cb) => {
+                  let id = -1;
+                  if (typeof cb === "function") { id = __zAdCbSeq++; __zAdCbs[id] = cb; }
+                  __zAdShowReward(id);
+                },
+                showRewarded: (cb) => globalThis.ZeroAds.showReward(cb)
               };
 
               const nodeProto = {
