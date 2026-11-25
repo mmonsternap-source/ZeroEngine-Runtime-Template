@@ -111,6 +111,7 @@ class ZeroScriptBridge(
             return
         }
         ctx.evaluate(bootstrap, "zero_bootstrap.js")
+        ctx.evaluate(P18_AI_JS_SHIM, "zero_p18_ai.js")
         fnBindNode = g.getJSFunction("__zBindNode")
         fnDestroyNode = g.getJSFunction("__zDestroyNode")
         fnCallHook = g.getJSFunction("__zCallHook")
@@ -300,6 +301,82 @@ class ZeroScriptBridge(
 
     private fun invokeEngineMethod(method: String, args: Array<out Any?>): Any? {
         return when (method) {
+            "bakeNavGrid" -> engine.aiNavSystem.bakeNavGrid(
+                nodes = engine.nodes,
+                pendingRemove = engine.pendingRemove,
+                requestedCellSize = toJsFloat(args.getOrNull(1), 48f),
+                agentPadding = toJsFloat(args.getOrNull(2), 12f),
+                colMask = toJsInt(args.getOrNull(3), 0xFFFF),
+                physicsSystem = engine.physicsSystem,
+                getGlobalTransform = { engine.getGlobalTransform(it) }
+            )
+            "findPath" -> {
+                val path = engine.aiNavSystem.findPath(
+                    startX = toJsFloat(args.getOrNull(1), 0f),
+                    startY = toJsFloat(args.getOrNull(2), 0f),
+                    goalX = toJsFloat(args.getOrNull(3), 0f),
+                    goalY = toJsFloat(args.getOrNull(4), 0f),
+                    allowDiagonal = toJsBool(args.getOrNull(5), true)
+                )
+                val arr = JSONArray()
+                path.forEach { (px, py) ->
+                    arr.put(JSONObject().put("x", px.toDouble()).put("y", py.toDouble()))
+                }
+                arr.toString()
+            }
+            "isWalkable" -> engine.aiNavSystem.isWalkable(
+                toJsFloat(args.getOrNull(1), 0f),
+                toJsFloat(args.getOrNull(2), 0f)
+            )
+            "canSee" -> {
+                val viewer = engine.findNodeByName(toJsStr(args.getOrNull(1), "")) ?: return false
+                val target = engine.findNodeByName(toJsStr(args.getOrNull(2), "")) ?: return false
+                engine.aiNavSystem.canSee(
+                    viewer = viewer,
+                    target = target,
+                    range = toJsFloat(args.getOrNull(3), 500f),
+                    fovDeg = toJsFloat(args.getOrNull(4), 90f),
+                    facingDegOverride = toJsFloat(args.getOrNull(5), 999999f),
+                    wallMask = toJsInt(args.getOrNull(6), 0xFFFF),
+                    nodes = engine.nodes,
+                    pendingRemove = engine.pendingRemove,
+                    physicsSystem = engine.physicsSystem,
+                    getGlobalTransform = { engine.getGlobalTransform(it) }
+                )
+            }
+            "emitSound" -> {
+                engine.aiNavSystem.emitSound(
+                    x = toJsFloat(args.getOrNull(1), 0f),
+                    y = toJsFloat(args.getOrNull(2), 0f),
+                    radius = toJsFloat(args.getOrNull(3), 360f),
+                    tag = toJsStr(args.getOrNull(4), "noise"),
+                    sourceName = toJsStr(args.getOrNull(5), ""),
+                    duration = toJsFloat(args.getOrNull(6), 0.8f)
+                )
+                null
+            }
+            "hearSounds" -> {
+                val list = engine.aiNavSystem.hearSounds(
+                    listenerX = toJsFloat(args.getOrNull(1), 0f),
+                    listenerY = toJsFloat(args.getOrNull(2), 0f),
+                    hearingMul = toJsFloat(args.getOrNull(3), 1.0f),
+                    filterTag = toJsStr(args.getOrNull(4), "")
+                )
+                val arr = JSONArray()
+                list.forEach { s ->
+                    arr.put(
+                        JSONObject()
+                            .put("x", s.x.toDouble())
+                            .put("y", s.y.toDouble())
+                            .put("radius", s.radius.toDouble())
+                            .put("tag", s.tag)
+                            .put("source", s.sourceName)
+                            .put("dist", s.dist.toDouble())
+                    )
+                }
+                arr.toString()
+            }
+            "clearSounds" -> { engine.aiNavSystem.clearSounds(); null }
             "drawInstanced" -> {
                 engine.scriptInstances.add(
                     ZeroEngineView.ScriptInstanceCmd(
@@ -445,6 +522,7 @@ class ZeroScriptBridge(
                 put("nodes", engine.nodes.size); put("lights", engine.lastFrameLights); put("occluders", engine.lightingSystem.activeOccluderCount)
                 put("cloths", engine.rigSystem.activeClothCount); put("iks", engine.rigSystem.activeIkCount); put("skinnedMeshes", engine.meshSystem.activeMeshCount)
                 put("gi", engine.giSystem.isReady); put("jfa", engine.giSystem.isJfaReady); put("sdfShadow", engine.lightingSystem.sdfShadowEnabled); put("spatialCells", engine.physicsSystem.spatialCellsCount)
+                put("navReady", engine.aiNavSystem.isBaked); put("sounds", engine.aiNavSystem.activeSoundCount)
                 put("atlases", engine.atlasCache.size); put("flags", engine.dataStore.worldFlags.size); put("lang", engine.dataStore.currentLang)
                 put("fbo", engine.postFxEnabled && engine.fboReady); put("touches", engine.inputSystem.getTouchCount()); put("textures", engine.textureCache.size)
             }.toString()
@@ -605,5 +683,53 @@ class ZeroScriptBridge(
 
     companion object {
         @Volatile private var qjsLibInited = false
+
+        private val P18_AI_JS_SHIM = """
+            (function() {
+              if (typeof Engine === "undefined") return;
+              Engine.bakeNavGrid = function(cellSize, pad, mask) {
+                return __zEngineCall("bakeNavGrid",
+                  cellSize !== undefined ? cellSize : 48,
+                  pad !== undefined ? pad : 12,
+                  mask !== undefined ? mask : 65535);
+              };
+              Engine.findPath = function(x1, y1, x2, y2, allowDiag) {
+                var raw = __zEngineCall("findPath", x1, y1, x2, y2, allowDiag !== false);
+                return raw ? JSON.parse(raw) : [];
+              };
+              Engine.isWalkable = function(x, y) {
+                return !!__zEngineCall("isWalkable", x, y);
+              };
+              Engine.canSee = function(viewer, target, range, fovDeg, facingDeg, wallMask) {
+                var vName = (typeof viewer === "string") ? viewer : (viewer && viewer.name ? viewer.name : "");
+                var tName = (typeof target === "string") ? target : (target && target.name ? target.name : "");
+                var fDeg = (facingDeg !== undefined && facingDeg !== null) ? facingDeg : 999999;
+                return !!__zEngineCall("canSee",
+                  vName, tName,
+                  range !== undefined ? range : 500,
+                  fovDeg !== undefined ? fovDeg : 90,
+                  fDeg,
+                  wallMask !== undefined ? wallMask : 65535);
+              };
+              Engine.emitSound = function(x, y, radius, tag, sourceName, duration) {
+                __zEngineCall("emitSound",
+                  x, y,
+                  radius !== undefined ? radius : 360,
+                  tag || "noise",
+                  sourceName || "",
+                  duration !== undefined ? duration : 0.8);
+              };
+              Engine.hearSounds = function(x, y, hearingMul, filterTag) {
+                var raw = __zEngineCall("hearSounds",
+                  x, y,
+                  hearingMul !== undefined ? hearingMul : 1.0,
+                  filterTag || "");
+                return raw ? JSON.parse(raw) : [];
+              };
+              Engine.clearSounds = function() {
+                __zEngineCall("clearSounds");
+              };
+            })();
+        """.trimIndent()
     }
 }

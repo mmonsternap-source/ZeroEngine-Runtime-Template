@@ -84,6 +84,7 @@ class ZeroEngineView(
     internal val rigSystem = ZeroRigAndClothSystem(onConsoleLog)
     internal val meshSystem = ZeroMeshSkinningSystem(onConsoleLog)
     internal val giSystem = ZeroGlobalIlluminationSystem(onConsoleLog)
+    internal val aiNavSystem = ZeroAiNavSystem(onConsoleLog)
     private val scriptBridge = ZeroScriptBridge(this)
 
     internal val atlasCache = ConcurrentHashMap<String, TextureAtlasData>()
@@ -189,6 +190,18 @@ class ZeroEngineView(
         )
     }
 
+    fun hotReloadScene() {
+        queueEvent {
+            nodes.forEach { it.persistent = false }
+            preloadedSceneCache.clear()
+            dataStore.clearRuntimeCaches()
+            scriptBridge.initVM()
+            dataStore.loadI18nFromDiskIfNeeded(dataStore.currentLang)
+            loadSceneContent(sceneJson, groupName = "main", additive = false)
+            onConsoleLog("[HOT-RELOAD] 场景、脚本与数据表已热重载")
+        }
+    }
+
     internal fun findNodeByName(name: String): GameNode? {
         if (name.isEmpty()) return null
         val cached = nodeByName[name]
@@ -218,6 +231,7 @@ class ZeroEngineView(
             releaseFbos(); releaseSceneGpuResources(includePersistent = true)
             instancedBatch.releaseGL()
             lightingSystem.releaseGL(); rigSystem.releaseGL(); meshSystem.releaseGL(); giSystem.releaseGL()
+            aiNavSystem.clear()
             val texIds = (textureCache.values + textTextureCache.values).filter { it != 0 && it != whiteTexId }.toIntArray()
             if (texIds.isNotEmpty()) GLES20.glDeleteTextures(texIds.size, texIds, 0)
             textureCache.clear(); textureSizes.clear(); textTextureCache.clear()
@@ -276,7 +290,7 @@ class ZeroEngineView(
         ZeroAdBridge.init(context, onConsoleLog)
         scriptBridge.initVM(); dataStore.loadI18nFromDiskIfNeeded(dataStore.currentLang)
         loadSceneContent(sceneJson, groupName = "main", additive = false); lastFrameNs = System.nanoTime()
-        onConsoleLog("[GPU] OpenGL ES 3.0 + GPU Instancing + JFA Radiance GI 已就绪")
+        onConsoleLog("[GPU] OpenGL ES 3.0 + GPU Instancing + JFA GI + AI Nav 已就绪")
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -309,6 +323,7 @@ class ZeroEngineView(
             nodeById.clear(); nodeByName.clear(); kept.forEach { indexNode(it) }
             pendingAdd.removeAll { !it.persistent }; pendingRemove.clear(); scriptInstances.clear()
             activeTweens.removeAll { !it.node.persistent }; physicsSystem.clearRays(); rigSystem.clearAll(); meshSystem.clearAll()
+            aiNavSystem.clear()
             if (camTarget?.persistent != true) camTarget = null; camBoundsEnabled = false
         }
         val newNodes = mutableListOf<GameNode>()
@@ -388,6 +403,7 @@ class ZeroEngineView(
         }
         rigSystem.update(dt, nodes) { getGlobalTransform(it) }
         meshSystem.update(dt, nodes) { getGlobalTransform(it) }
+        aiNavSystem.update(dt)
 
         physicsSystem.rebuildSpatialIndex(nodes, pendingRemove) { getGlobalTransform(it) }
         physicsSystem.processCombatOverlaps(
@@ -751,6 +767,7 @@ class ZeroEngineView(
             drawDebugShape(posLoc, uvLoc, colLoc, floatArrayOf(ray.x1, ray.y1, ray.x2, ray.y2), GLES20.GL_LINES, 10f, 1f, if (ray.hit) 0.25f else 0.9f, if (ray.hit) 0.85f else 0.2f, 0.95f)
         }
         meshSystem.renderDebugWireframe(posLoc, uvLoc, colLoc, nodes, { getGlobalTransform(it) }) { frameDrawCalls++ }
+        aiNavSystem.renderDebug(posLoc, uvLoc, colLoc) { frameDrawCalls++ }
         GLES20.glDisableVertexAttribArray(posLoc); GLES20.glDisableVertexAttribArray(uvLoc)
     }
 
