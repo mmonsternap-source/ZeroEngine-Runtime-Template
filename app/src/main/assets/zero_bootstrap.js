@@ -123,6 +123,7 @@
   };
 
   globalThis.Engine = {
+    drawInstanced: (tex, x, y, w, h, rot, r, g, b, a, additive, z) => __zEngineCall("drawInstanced", tex || "", x, y, w, h, rot || 0, r ?? 1, g ?? 1, b ?? 1, a ?? 1, !!additive, z || 2),
     log: (...a) => __zLog("[LOG] " + fmtArgs(a)),
     unloadUnusedTextures: () => __zEngineCall("unloadUnusedTextures"),
     clearModuleCache: () => { for (const k in __zModules) delete __zModules[k]; },
