@@ -1,11 +1,6 @@
 package com.zero.engine
 
 import org.json.JSONObject
-import org.mozilla.javascript.Callable
-import org.mozilla.javascript.Context as RhinoContext
-import org.mozilla.javascript.NativeJSON
-import org.mozilla.javascript.Scriptable
-import org.mozilla.javascript.ScriptableObject
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
@@ -13,46 +8,27 @@ class ZeroDataStore(
     private val projectDir: File,
     private val onConsoleLog: (String) -> Unit
 ) {
-    val moduleCache = mutableMapOf<String, Any?>()
     val worldFlags = ConcurrentHashMap<String, Any>()
-    val dataTableCache = mutableMapOf<String, Any?>()
     var currentLang = "zh"
         private set
     private val i18nDicts = mutableMapOf<String, MutableMap<String, String>>()
 
     fun clearRuntimeCaches() {
-        moduleCache.clear()
-        dataTableCache.clear()
+        // 模块与数据表缓存已迁移至 QuickJS 原生堆，释放更快
     }
 
-    fun requireScriptModule(rhino: RhinoContext, globalScope: ScriptableObject, rawPath: String): Any? {
+    fun readScriptModuleText(rawPath: String): Pair<String, String>? {
         val cleaned = rawPath.trim().replace("\\", "/").removePrefix("./")
         if (cleaned.isEmpty() || cleaned.contains("..")) return null
         val normPath = if (cleaned.endsWith(".js")) cleaned else "$cleaned.js"
-        if (moduleCache.containsKey(normPath)) return moduleCache[normPath]
-
         val file = File(File(projectDir, "scripts"), normPath)
         if (!file.exists()) {
             onConsoleLog("[MODULE 错误] 找不到脚本模块: scripts/$normPath")
             return null
         }
         return try {
-            val code = file.readText()
-            val modScope = rhino.newObject(globalScope)
-            modScope.prototype = globalScope
-            val exportsObj = rhino.newObject(modScope)
-            val moduleObj = rhino.newObject(modScope)
-            ScriptableObject.putProperty(moduleObj, "exports", exportsObj)
-            ScriptableObject.putProperty(modScope, "module", moduleObj)
-            ScriptableObject.putProperty(modScope, "exports", exportsObj)
-
-            moduleCache[normPath] = exportsObj
-            rhino.evaluateString(modScope, code, "scripts/$normPath", 1, null)
-            val finalExports = ScriptableObject.getProperty(moduleObj, "exports")
-            moduleCache[normPath] = finalExports
-            finalExports
+            normPath to file.readText()
         } catch (e: Exception) {
-            moduleCache.remove(normPath)
             onConsoleLog("[MODULE 错误 @ $normPath] ${e.message}")
             null
         }
@@ -105,19 +81,10 @@ class ZeroDataStore(
         false
     }
 
-    fun parseJsonStringToJs(rhino: RhinoContext, globalScope: ScriptableObject, raw: String): Any? {
-        val reviver = object : Callable {
-            override fun call(cx: RhinoContext?, scope: Scriptable?, thisObj: Scriptable?, args: Array<out Any?>): Any? = args.getOrNull(1)
-        }
-        return NativeJSON.parse(rhino, globalScope, raw, reviver)
-    }
-
-    fun loadDataTable(rhino: RhinoContext, globalScope: ScriptableObject, tableName: String): Any? {
+    fun readDataTableJson(tableName: String): Pair<String, String>? {
         val cleaned = tableName.trim().replace("\\", "/").removePrefix("./")
         if (cleaned.isEmpty() || cleaned.contains("..")) return null
         val norm = if (cleaned.endsWith(".json", ignoreCase = true)) cleaned else "$cleaned.json"
-        if (dataTableCache.containsKey(norm)) return dataTableCache[norm]
-
         val dataDir = File(projectDir, "data").apply { mkdirs() }
         val file = File(dataDir, norm)
         if (!file.exists()) {
@@ -125,11 +92,9 @@ class ZeroDataStore(
             return null
         }
         return try {
-            val parsed = parseJsonStringToJs(rhino, globalScope, file.readText())
-            dataTableCache[norm] = parsed
-            parsed
+            norm to file.readText()
         } catch (e: Exception) {
-            onConsoleLog("[DATA 解析错误 @ $norm] ${e.message}")
+            onConsoleLog("[DATA 读取错误 @ $norm] ${e.message}")
             null
         }
     }
@@ -143,14 +108,18 @@ class ZeroDataStore(
         return currentLang
     }
 
-    fun setI18nDict(lang: String, obj: Scriptable) {
+    fun setI18nDictJson(lang: String, jsonStr: String) {
         val clean = lang.trim().lowercase()
         val dict = i18nDicts.getOrPut(clean) { mutableMapOf() }
-        for (id in obj.ids) {
-            val k = id.toString()
-            val v = ScriptableObject.getProperty(obj, k)
-            if (v != null && v !== Scriptable.NOT_FOUND) dict[k] = RhinoContext.toString(v)
-        }
+        try {
+            val obj = JSONObject(jsonStr)
+            val it = obj.keys()
+            while (it.hasNext()) {
+                val k = it.next()
+                val v = obj.opt(k)
+                if (v != null && v !== JSONObject.NULL) dict[k] = v.toString()
+            }
+        } catch (_: Exception) {}
     }
 
     fun loadI18nFromDiskIfNeeded(lang: String) {
@@ -182,22 +151,17 @@ class ZeroDataStore(
         return if (fallback.isNotEmpty()) fallback else key
     }
 
-    fun saveDiskSlot(rhino: RhinoContext, globalScope: ScriptableObject, slotName: String, dataObj: Any?): Boolean = try {
+    fun saveDiskSlotJson(slotName: String, jsonStr: String): Boolean = try {
         val safeName = slotName.replace(Regex("[^a-zA-Z0-9_\\-\\u4e00-\\u9fa5]"), "_")
         val savesDir = File(projectDir, "saves").apply { mkdirs() }
-        val jsonStr = when (dataObj) {
-            is String -> dataObj
-            null -> "{}"
-            else -> RhinoContext.toString(NativeJSON.stringify(rhino, globalScope, dataObj, null, null))
-        }
-        File(savesDir, "$safeName.json").writeText(jsonStr)
+        File(savesDir, "$safeName.json").writeText(jsonStr.ifBlank { "{}" })
         true
     } catch (_: Exception) { false }
 
-    fun loadDiskSlot(rhino: RhinoContext, globalScope: ScriptableObject, slotName: String): Any? = try {
+    fun loadDiskSlotJson(slotName: String): String? = try {
         val safeName = slotName.replace(Regex("[^a-zA-Z0-9_\\-\\u4e00-\\u9fa5]"), "_")
         val file = File(File(projectDir, "saves"), "$safeName.json")
-        if (file.exists()) parseJsonStringToJs(rhino, globalScope, file.readText()) else null
+        if (file.exists()) file.readText() else null
     } catch (_: Exception) { null }
 
     fun deleteDiskSlot(slotName: String): Boolean = try {

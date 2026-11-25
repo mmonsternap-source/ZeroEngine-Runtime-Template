@@ -10,19 +10,19 @@ import android.opengl.GLSurfaceView
 import android.opengl.Matrix
 import android.view.KeyEvent
 import android.view.MotionEvent
+import com.whl.quickjs.android.QuickJSLoader
+import com.whl.quickjs.wrapper.JSCallFunction
+import com.whl.quickjs.wrapper.JSFunction
+import com.whl.quickjs.wrapper.QuickJSContext
 import org.json.JSONArray
 import org.json.JSONObject
-import org.mozilla.javascript.Context as RhinoContext
-import org.mozilla.javascript.Function
-import org.mozilla.javascript.NativeJSON
-import org.mozilla.javascript.Scriptable
-import org.mozilla.javascript.ScriptableObject
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.*
@@ -71,72 +71,8 @@ class ZeroEngineView(
         var emitRate: Float = 24f, var particleLife: Float = 1.1f, var particleSpeed: Float = 160f, var particleSize: Float = 16f,
         var particleGravity: Float = -60f, var emitAccum: Float = 0f, val particles: Array<Particle> = Array(240) { Particle() },
         var vx: Float = 0f, var vy: Float = 0f, var vz: Float = 0f, var shader: String = "", var script: String = "",
-        var jsObj: Scriptable? = null, var customProgram: Int = 0
+        val nodeId: Int = nextNodeId.incrementAndGet(), var customProgram: Int = 0
     )
-
-    private inner class GameNodeJsProxy(val n: GameNode) : ScriptableObject() {
-        override fun getClassName() = "GameNode"
-        override fun has(name: String?, start: Scriptable?): Boolean = if (name != null && name in BRIDGED_PROPS) true else super.has(name, start)
-        override fun get(name: String?, start: Scriptable?): Any? = when (name) {
-            "name" -> n.name; "tag" -> n.tag; "sceneGroup" -> n.sceneGroup; "persistent" -> n.persistent
-            "x" -> n.x.toDouble(); "y" -> n.y.toDouble(); "z" -> n.z.toDouble()
-            "vx" -> n.vx.toDouble(); "vy" -> n.vy.toDouble(); "vz" -> n.vz.toDouble()
-            "width" -> n.width.toDouble(); "height" -> n.height.toDouble(); "rotation" -> n.rotation.toDouble()
-            "tiltX" -> n.tiltX.toDouble(); "scaleX" -> n.scaleX.toDouble(); "scaleY" -> n.scaleY.toDouble()
-            "parallaxX" -> n.parallaxX.toDouble(); "parallaxY" -> n.parallaxY.toDouble()
-            "atlas" -> n.atlas; "atlasFrame" -> n.atlasFrame
-            "normalMap" -> n.normalMap; "normalStrength" -> n.normalStrength.toDouble(); "specular" -> n.specular.toDouble()
-            "sliceLeft" -> n.sliceLeft.toDouble(); "sliceRight" -> n.sliceRight.toDouble()
-            "sliceTop" -> n.sliceTop.toDouble(); "sliceBottom" -> n.sliceBottom.toDouble()
-            "clipChildren" -> n.clipChildren; "clipX" -> n.clipX.toDouble(); "clipY" -> n.clipY.toDouble()
-            "clipW" -> n.clipW.toDouble(); "clipH" -> n.clipH.toDouble()
-            "slopeType" -> n.slopeType; "colOffsetX" -> n.colOffsetX.toDouble(); "colOffsetY" -> n.colOffsetY.toDouble()
-            "colWidth" -> n.colWidth.toDouble(); "colHeight" -> n.colHeight.toDouble()
-            "colLayer" -> n.colLayer; "colMask" -> n.colMask; "bodyMode" -> n.bodyMode
-            "gravity" -> n.gravity.toDouble(); "fallMultiplier" -> n.fallMultiplier.toDouble(); "maxJumps" -> n.maxJumps
-            "isGrounded" -> n.isGrounded; "isHitbox" -> n.isHitbox; "isHurtbox" -> n.isHurtbox
-            "damage" -> n.damage.toDouble(); "invulnTimer" -> n.invulnTimer.toDouble()
-            "r" -> n.r.toDouble(); "g" -> n.g.toDouble(); "b" -> n.b.toDouble(); "a" -> n.a.toDouble()
-            "visible" -> n.visible; "text" -> n.text
-            "currentClip" -> n.animator.currentClip?.name ?: n.currentClipName
-            "lightRadius" -> n.lightRadius.toDouble(); "lightIntensity" -> n.lightIntensity.toDouble()
-            else -> super.get(name, start)
-        }
-        override fun put(name: String?, start: Scriptable?, value: Any?) {
-            when (name) {
-                "tag" -> n.tag = toJsStr(value, n.tag); "persistent" -> n.persistent = toJsBool(value, n.persistent)
-                "x" -> n.x = toJsFloat(value, n.x); "y" -> n.y = toJsFloat(value, n.y); "z" -> n.z = toJsFloat(value, n.z)
-                "vx" -> n.vx = toJsFloat(value, n.vx); "vy" -> n.vy = toJsFloat(value, n.vy); "vz" -> n.vz = toJsFloat(value, n.vz)
-                "width" -> n.width = toJsFloat(value, n.width); "height" -> n.height = toJsFloat(value, n.height)
-                "rotation" -> n.rotation = toJsFloat(value, n.rotation); "tiltX" -> n.tiltX = toJsFloat(value, n.tiltX)
-                "scaleX" -> n.scaleX = toJsFloat(value, n.scaleX); "scaleY" -> n.scaleY = toJsFloat(value, n.scaleY)
-                "parallaxX" -> n.parallaxX = toJsFloat(value, n.parallaxX); "parallaxY" -> n.parallaxY = toJsFloat(value, n.parallaxY)
-                "atlas" -> n.atlas = toJsStr(value, n.atlas); "atlasFrame" -> n.atlasFrame = toJsStr(value, n.atlasFrame)
-                "normalMap" -> n.normalMap = toJsStr(value, n.normalMap)
-                "normalStrength" -> n.normalStrength = toJsFloat(value, n.normalStrength)
-                "specular" -> n.specular = toJsFloat(value, n.specular)
-                "sliceLeft" -> n.sliceLeft = toJsFloat(value, n.sliceLeft); "sliceRight" -> n.sliceRight = toJsFloat(value, n.sliceRight)
-                "sliceTop" -> n.sliceTop = toJsFloat(value, n.sliceTop); "sliceBottom" -> n.sliceBottom = toJsFloat(value, n.sliceBottom)
-                "clipChildren" -> n.clipChildren = toJsBool(value, n.clipChildren)
-                "clipX" -> n.clipX = toJsFloat(value, n.clipX); "clipY" -> n.clipY = toJsFloat(value, n.clipY)
-                "clipW" -> n.clipW = toJsFloat(value, n.clipW); "clipH" -> n.clipH = toJsFloat(value, n.clipH)
-                "slopeType" -> n.slopeType = toJsStr(value, n.slopeType)
-                "colOffsetX" -> n.colOffsetX = toJsFloat(value, n.colOffsetX); "colOffsetY" -> n.colOffsetY = toJsFloat(value, n.colOffsetY)
-                "colWidth" -> n.colWidth = toJsFloat(value, n.colWidth); "colHeight" -> n.colHeight = toJsFloat(value, n.colHeight)
-                "colLayer" -> n.colLayer = toJsInt(value, n.colLayer); "colMask" -> n.colMask = toJsInt(value, n.colMask)
-                "bodyMode" -> n.bodyMode = toJsStr(value, n.bodyMode)
-                "gravity" -> n.gravity = toJsFloat(value, n.gravity); "fallMultiplier" -> n.fallMultiplier = toJsFloat(value, n.fallMultiplier)
-                "maxJumps" -> n.maxJumps = toJsInt(value, n.maxJumps)
-                "isHitbox" -> n.isHitbox = toJsBool(value, n.isHitbox); "isHurtbox" -> n.isHurtbox = toJsBool(value, n.isHurtbox)
-                "damage" -> n.damage = toJsFloat(value, n.damage); "invulnTimer" -> n.invulnTimer = toJsFloat(value, n.invulnTimer)
-                "r" -> n.r = toJsFloat(value, n.r); "g" -> n.g = toJsFloat(value, n.g); "b" -> n.b = toJsFloat(value, n.b); "a" -> n.a = toJsFloat(value, n.a)
-                "visible" -> n.visible = toJsBool(value, n.visible); "text" -> n.text = toJsStr(value, n.text)
-                "lightRadius" -> n.lightRadius = toJsFloat(value, n.lightRadius); "lightIntensity" -> n.lightIntensity = toJsFloat(value, n.lightIntensity)
-                "name", "sceneGroup", "isGrounded", "currentClip" -> Unit
-                else -> super.put(name, start, value)
-            }
-        }
-    }
 
     private val audioSystem = ZeroAudioSystem(projectDir, onConsoleLog)
     private val inputSystem = ZeroInputSystem()
@@ -150,15 +86,14 @@ class ZeroEngineView(
 
     private val atlasCache = ConcurrentHashMap<String, TextureAtlasData>()
     private val nodes = mutableListOf<GameNode>()
+    private val nodeById = HashMap<Int, GameNode>(256)
     private val pendingAdd = mutableListOf<GameNode>()
     private val pendingRemove = mutableSetOf<GameNode>()
     private val activeTweens = mutableListOf<TweenTask>()
     private val textureCache = ConcurrentHashMap<String, Int>()
     private val textureSizes = ConcurrentHashMap<String, Pair<Int, Int>>()
-    private val eventListeners = mutableMapOf<String, MutableList<Function>>()
     private val identityMatrix = FloatArray(16).apply { Matrix.setIdentityM(this, 0) }
 
-    private val globalDataStore = ConcurrentHashMap<String, Any?>()
     private val preloadedSceneCache = ConcurrentHashMap<String, String>()
     private val sceneIoExecutor = Executors.newSingleThreadExecutor()
     @Volatile private var pendingSceneLoad: String? = null
@@ -203,7 +138,13 @@ class ZeroEngineView(
     private val modelMatrix = FloatArray(16); private val subModelMatrix = FloatArray(16); private val mvpMatrix = FloatArray(16); private val uiVpMatrix = FloatArray(16)
 
     private var defaultLitProgram = 0; private var whiteTexId = 0; private var engineTime = 0f; private var lastFrameNs = 0L; private var surfaceW = 1080; private var surfaceH = 1920
-    private lateinit var rhino: RhinoContext; private lateinit var globalScope: ScriptableObject
+
+    // QuickJS 虚拟机与 4 个固定入口函数（零 JSObject 泄漏）
+    private var qjs: QuickJSContext? = null
+    private var fnBindNode: JSFunction? = null
+    private var fnDestroyNode: JSFunction? = null
+    private var fnCallHook: JSFunction? = null
+    private var fnDispatchTouch: JSFunction? = null
 
     private val quadBuffer: FloatBuffer = ByteBuffer.allocateDirect(4 * 5 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
         put(floatArrayOf(-0.5f, -0.5f, 0f, 0f, 0f, 0.5f, -0.5f, 0f, 1f, 0f, -0.5f, 0.5f, 0f, 0f, 1f, 0.5f, 0.5f, 0f, 1f, 1f)); position(0)
@@ -224,10 +165,21 @@ class ZeroEngineView(
     private fun queryAtlas(name: String): TextureAtlasData? =
         ZeroShaders.loadAtlasData(projectDir, name, atlasCache, textureSizes, { getImageTexture(it) }, onConsoleLog)
 
+    private fun destroyQuickJsVM() {
+        try { fnBindNode?.release() } catch (_: Exception) {}
+        try { fnDestroyNode?.release() } catch (_: Exception) {}
+        try { fnCallHook?.release() } catch (_: Exception) {}
+        try { fnDispatchTouch?.release() } catch (_: Exception) {}
+        fnBindNode = null; fnDestroyNode = null; fnCallHook = null; fnDispatchTouch = null
+        try { qjs?.destroy() } catch (_: Exception) {}
+        qjs = null
+    }
+
     fun releaseResources() {
         try { sceneIoExecutor.shutdownNow() } catch (_: Exception) {}
         inputSystem.clearAllPointers()
         queueEvent {
+            destroyQuickJsVM()
             releaseFbos(); releaseSceneGpuResources(includePersistent = true)
             lightingSystem.releaseGL(); rigSystem.releaseGL(); meshSystem.releaseGL(); giSystem.releaseGL()
             val texIds = (textureCache.values + textTextureCache.values).filter { it != 0 && it != whiteTexId }.toIntArray()
@@ -287,7 +239,7 @@ class ZeroEngineView(
         rigSystem.initGL()
         meshSystem.initGL()
         giSystem.initGL()
-        initRhinoVM(); dataStore.loadI18nFromDiskIfNeeded(dataStore.currentLang)
+        initQuickJsVM(); dataStore.loadI18nFromDiskIfNeeded(dataStore.currentLang)
         loadSceneContent(sceneJson, groupName = "main", additive = false); lastFrameNs = System.nanoTime()
     }
 
@@ -316,6 +268,10 @@ class ZeroEngineView(
     private fun loadSceneContent(rawJson: String, groupName: String, additive: Boolean, offsetX: Float = 0f, offsetY: Float = 0f) {
         if (!additive) {
             releaseSceneGpuResources(includePersistent = false)
+            nodes.filter { !it.persistent }.forEach {
+                nodeById.remove(it.nodeId)
+                try { fnDestroyNode?.call(it.nodeId) } catch (_: Exception) {}
+            }
             val kept = nodes.filter { it.persistent }
             nodes.clear(); nodes.addAll(kept); pendingAdd.removeAll { !it.persistent }; pendingRemove.clear()
             activeTweens.removeAll { !it.node.persistent }; physicsSystem.clearRays(); rigSystem.clearAll(); meshSystem.clearAll()
@@ -327,6 +283,7 @@ class ZeroEngineView(
             newNodes.forEach { if (it.parent.isEmpty() && it.layer == "World") { it.x += offsetX; it.y += offsetY } }
         }
         nodes.addAll(newNodes)
+        newNodes.forEach { nodeById[it.nodeId] = it }
         if (!additive) unloadUnusedTextures()
         newNodes.forEach { bindNodeScript(it) }
         physicsSystem.rebuildSpatialIndex(nodes, pendingRemove) { getGlobalTransform(it) }
@@ -367,6 +324,7 @@ class ZeroEngineView(
 
         if (pendingAdd.isNotEmpty()) {
             val added = pendingAdd.toList(); pendingAdd.clear(); nodes.addAll(added)
+            added.forEach { nodeById[it.nodeId] = it }
             added.forEach { bindNodeScript(it); callLifecycle(it, "onReady") }
         }
         physicsSystem.rebuildSpatialIndex(nodes, pendingRemove) { getGlobalTransform(it) }
@@ -382,18 +340,28 @@ class ZeroEngineView(
                 }
                 if (n.animator.clips.isNotEmpty() || n.animator.currentClip != null) updateProAnimator(n, dt) else updateSpriteAnimation(n, dt)
                 if (n.nodeType == "ParticleEmitter") updateParticleEmitter(n, dt)
-                callLifecycle(n, "onProcess", dt)
+                callLifecycle(n, "onProcess", dt.toDouble())
             }
         }
         rigSystem.update(dt, nodes) { getGlobalTransform(it) }
         meshSystem.update(dt, nodes) { getGlobalTransform(it) }
 
         physicsSystem.rebuildSpatialIndex(nodes, pendingRemove) { getGlobalTransform(it) }
-        physicsSystem.processCombatOverlaps(nodes, pendingRemove, rhino, { getGlobalTransform(it) }, { node, fn, arg -> callLifecycle(node, fn, arg) }) { hs ->
-            hitstopTimer = max(hitstopTimer, hs.coerceIn(0f, 0.35f))
-        }
+        physicsSystem.processCombatOverlaps(
+            nodes = nodes,
+            pendingRemove = pendingRemove,
+            getGlobalTransform = { getGlobalTransform(it) },
+            onHit = { attacker, hurt -> callNodeEvent(attacker, "onHit", hurt) },
+            onHurt = { hurt, attacker, dmg, kbX, kbY -> callHurtCallback(hurt, attacker, dmg, kbX, kbY) },
+            addHitstop = { hs -> hitstopTimer = max(hitstopTimer, hs.coerceIn(0f, 0.35f)) }
+        )
         if (pendingRemove.isNotEmpty()) {
-            pendingRemove.forEach { releaseNodeGpuResources(it); meshSystem.removeMesh(it.name) }
+            pendingRemove.forEach {
+                releaseNodeGpuResources(it)
+                meshSystem.removeMesh(it.name)
+                nodeById.remove(it.nodeId)
+                try { fnDestroyNode?.call(it.nodeId) } catch (_: Exception) {}
+            }
             nodes.removeAll(pendingRemove); pendingRemove.clear()
         }
         renderSceneFrame()
@@ -405,13 +373,6 @@ class ZeroEngineView(
         n.animator.activeBonePoses.forEach { pose ->
             val target = nodes.find { it.name == pose.targetNodeName && (it.parent == n.name || it === n) } ?: nodes.find { it.name == pose.targetNodeName }
             target?.let { t -> pose.x?.let { t.x = it }; pose.y?.let { t.y = it }; pose.rotation?.let { t.rotation = it }; pose.scaleX?.let { t.scaleX = it }; pose.scaleY?.let { t.scaleY = it } }
-        }
-    }
-
-    private fun callFrameEvent(n: GameNode, clipName: String, evName: String) {
-        val scope = n.jsObj?.prototype ?: return
-        (ScriptableObject.getProperty(scope, "onFrameEvent") as? Function)?.let {
-            try { it.call(rhino, scope, n.jsObj, arrayOf(clipName, evName)) } catch (e: Exception) { onConsoleLog("[JS 错误 @ ${n.name}.onFrameEvent] ${e.message}") }
         }
     }
 
@@ -478,7 +439,6 @@ class ZeroEngineView(
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0); GLES20.glViewport(0, 0, surfaceW, surfaceH)
             GLES20.glClearColor(0f, 0f, 0f, 1f); GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT); renderPostComposite()
 
-            // P11：2D 实时全局光照（1/4 分辨率 16 方向光线反弹 + 高斯降噪 + 滤色柔光合成）
             giSystem.renderAndComposite(sceneColorTex, lightMapTex, surfaceW, surfaceH, 1f - postFade, engineTime) { frameDrawCalls++ }
 
             if (normalNodes.isNotEmpty() && postFade < 0.99f) {
@@ -901,270 +861,517 @@ class ZeroEngineView(
         return floatArrayOf(u0, v0, u0 + uS, v0 + vS)
     }
 
-    private fun extractStringList(raw: Any?): List<String> {
+    private fun parseJsonStringList(rawJson: String): List<String> {
         val list = mutableListOf<String>()
-        if (raw is Scriptable) {
-            val len = (ScriptableObject.getProperty(raw, "length") as? Number)?.toInt() ?: 0
-            for (i in 0 until len) ScriptableObject.getProperty(raw, i)?.takeIf { it !== Scriptable.NOT_FOUND }?.let { list.add(RhinoContext.toString(it)) }
-        } else if (raw != null && raw !== Scriptable.NOT_FOUND) {
-            list.add(RhinoContext.toString(raw))
+        if (rawJson.isBlank()) return list
+        try {
+            val arr = JSONArray(rawJson)
+            for (i in 0 until arr.length()) {
+                val s = arr.optString(i, "")
+                if (s.isNotEmpty()) list.add(s)
+            }
+        } catch (_: Exception) {
+            list.add(rawJson)
         }
         return list
     }
 
-    private fun createClothFromJsConfig(cfg: Scriptable, defaultAnchor: String): String {
-        val anchorName = getJsStr(cfg, "anchor", defaultAnchor)
-        val id = getJsStr(cfg, "id", "${anchorName}_cloth_${System.nanoTime() % 1000}")
+    private fun createClothFromJson(cfgJson: String, defaultAnchor: String): String {
+        val cfg = try { JSONObject(cfgJson) } catch (_: Exception) { JSONObject() }
+        val anchorName = cfg.optString("anchor", defaultAnchor)
+        val id = cfg.optString("id", "${anchorName}_cloth_${System.nanoTime() % 1000}")
         val anchorNode = nodes.find { it.name == anchorName }
         val gt = anchorNode?.let { getGlobalTransform(it) }
         rigSystem.createCloth(
             id = id,
             anchorNodeName = anchorName,
-            startX = gt?.gx ?: getJsFloat(cfg, "x", 540f),
-            startY = gt?.gy ?: getJsFloat(cfg, "y", 960f),
-            offsetX = getJsFloat(cfg, "offsetX", 0f),
-            offsetY = getJsFloat(cfg, "offsetY", 0f),
-            segments = getJsInt(cfg, "segments", 10),
-            segmentLen = getJsFloat(cfg, "segmentLen", 18f),
-            widthStart = getJsFloat(cfg, "widthStart", 38f),
-            widthEnd = getJsFloat(cfg, "widthEnd", 10f),
-            r = getJsFloat(cfg, "r", 0.88f),
-            g = getJsFloat(cfg, "g", 0.18f),
-            b = getJsFloat(cfg, "b", 0.24f),
-            a = getJsFloat(cfg, "a", 0.95f),
-            gravityY = getJsFloat(cfg, "gravityY", 980f),
-            windX = getJsFloat(cfg, "windX", -120f),
-            turbulence = getJsFloat(cfg, "turbulence", 180f),
-            texture = getJsStr(cfg, "texture", "")
+            startX = gt?.gx ?: cfg.optDouble("x", 540.0).toFloat(),
+            startY = gt?.gy ?: cfg.optDouble("y", 960.0).toFloat(),
+            offsetX = cfg.optDouble("offsetX", 0.0).toFloat(),
+            offsetY = cfg.optDouble("offsetY", 0.0).toFloat(),
+            segments = cfg.optInt("segments", 10),
+            segmentLen = cfg.optDouble("segmentLen", 18.0).toFloat(),
+            widthStart = cfg.optDouble("widthStart", 38.0).toFloat(),
+            widthEnd = cfg.optDouble("widthEnd", 10.0).toFloat(),
+            r = cfg.optDouble("r", 0.88).toFloat(),
+            g = cfg.optDouble("g", 0.18).toFloat(),
+            b = cfg.optDouble("b", 0.24).toFloat(),
+            a = cfg.optDouble("a", 0.95).toFloat(),
+            gravityY = cfg.optDouble("gravityY", 980.0).toFloat(),
+            windX = cfg.optDouble("windX", -120.0).toFloat(),
+            turbulence = cfg.optDouble("turbulence", 180.0).toFloat(),
+            texture = cfg.optString("texture", "")
         )
         return id
     }
 
-    private fun initRhinoVM() {
-        rhino = RhinoContext.enter().apply { optimizationLevel = -1 }; globalScope = rhino.initStandardObjects(); dataStore.clearRuntimeCaches(); atlasCache.clear()
-        ScriptableObject.putProperty(globalScope, "require", jsFunc { args -> dataStore.requireScriptModule(rhino, globalScope, RhinoContext.toString(args.getOrNull(0) ?: "")) })
-        val engineApi = rhino.newObject(globalScope)
-        ScriptableObject.putProperty(engineApi, "log", jsFunc { args -> onConsoleLog("[LOG] ${args.joinToString(" ") { RhinoContext.toString(it) }}"); null })
-        ScriptableObject.putProperty(engineApi, "unloadUnusedTextures", jsFunc { unloadUnusedTextures() })
-        ScriptableObject.putProperty(engineApi, "clearModuleCache", jsFunc { dataStore.moduleCache.clear(); null })
-        ScriptableObject.putProperty(engineApi, "setSdfShadow", jsFunc { args ->
-            lightingSystem.sdfShadowEnabled = (args.getOrNull(0) as? Boolean) ?: true
-            (args.getOrNull(1) as? Number)?.toFloat()?.let { lightingSystem.shadowSoftness = it.coerceIn(1f, 40f) }
-            (args.getOrNull(2) as? Number)?.toFloat()?.let { lightingSystem.shadowMinLight = it.coerceIn(0f, 1f) }
-            null
-        })
-        // P11：2D 实时全局光照 GI 参数控制
-        ScriptableObject.putProperty(engineApi, "setGI", jsFunc { args ->
-            when (val a0 = args.getOrNull(0)) {
-                is Boolean -> giSystem.enabled = a0
-                is Scriptable -> {
-                    giSystem.enabled = getJsBool(a0, "enabled", giSystem.enabled)
-                    giSystem.intensity = getJsFloat(a0, "intensity", giSystem.intensity).coerceIn(0f, 3f)
-                    giSystem.radius = getJsFloat(a0, "radius", giSystem.radius).coerceIn(0.02f, 0.45f)
-                    giSystem.threshold = getJsFloat(a0, "threshold", giSystem.threshold).coerceIn(0f, 1.5f)
-                    giSystem.saturation = getJsFloat(a0, "saturation", giSystem.saturation).coerceIn(0f, 3f)
-                    giSystem.skyR = getJsFloat(a0, "skyR", giSystem.skyR).coerceIn(0f, 1f)
-                    giSystem.skyG = getJsFloat(a0, "skyG", giSystem.skyG).coerceIn(0f, 1f)
-                    giSystem.skyB = getJsFloat(a0, "skyB", giSystem.skyB).coerceIn(0f, 1f)
-                }
-            }
-            null
-        })
-        // P9：2D 骨骼 IK 与 Verlet 布料物理 API
-        ScriptableObject.putProperty(engineApi, "createCloth", jsFunc { args ->
-            val cfg = args.getOrNull(0) as? Scriptable ?: return@jsFunc ""
-            createClothFromJsConfig(cfg, "")
-        })
-        ScriptableObject.putProperty(engineApi, "removeCloth", jsFunc { args -> rigSystem.removeCloth(RhinoContext.toString(args.getOrNull(0) ?: "")); null })
-        ScriptableObject.putProperty(engineApi, "setGlobalWind", jsFunc { args ->
-            rigSystem.setGlobalWind((args.getOrNull(0) as? Number)?.toFloat() ?: 0f, (args.getOrNull(1) as? Number)?.toFloat() ?: 0f); null
-        })
-        ScriptableObject.putProperty(engineApi, "solveIK", jsFunc { args ->
-            val root = nodes.find { it.name == RhinoContext.toString(args.getOrNull(0) ?: "") } ?: return@jsFunc false
-            val mid = nodes.find { it.name == RhinoContext.toString(args.getOrNull(1) ?: "") } ?: return@jsFunc false
-            rigSystem.solveTwoBoneIK(root, mid, (args.getOrNull(2) as? Number)?.toFloat() ?: 0f, (args.getOrNull(3) as? Number)?.toFloat() ?: 0f, (args.getOrNull(4) as? Number)?.toFloat() ?: 80f, (args.getOrNull(5) as? Number)?.toFloat() ?: 80f, (args.getOrNull(6) as? Boolean) ?: false) { getGlobalTransform(it) }
-        })
-        ScriptableObject.putProperty(engineApi, "registerIK", jsFunc { args ->
-            rigSystem.registerTwoBoneIK(RhinoContext.toString(args.getOrNull(0) ?: ""), RhinoContext.toString(args.getOrNull(1) ?: ""), RhinoContext.toString(args.getOrNull(2) ?: ""), (args.getOrNull(3) as? Number)?.toFloat() ?: 80f, (args.getOrNull(4) as? Number)?.toFloat() ?: 80f, (args.getOrNull(5) as? Boolean) ?: false); null
-        })
-        ScriptableObject.putProperty(engineApi, "setIKTarget", jsFunc { args ->
-            rigSystem.setIkTarget(RhinoContext.toString(args.getOrNull(0) ?: ""), (args.getOrNull(1) as? Number)?.toFloat() ?: 0f, (args.getOrNull(2) as? Number)?.toFloat() ?: 0f, (args.getOrNull(3) as? Boolean) ?: true); null
-        })
-        ScriptableObject.putProperty(engineApi, "removeIK", jsFunc { args -> rigSystem.removeIk(RhinoContext.toString(args.getOrNull(0) ?: "")); null })
+    // ==================== QuickJS 核心初始化与属性/方法桥接 ====================
+    private fun getNodeProp(n: GameNode, name: String): Any? = when (name) {
+        "name" -> n.name; "tag" -> n.tag; "sceneGroup" -> n.sceneGroup; "persistent" -> n.persistent
+        "x" -> n.x.toDouble(); "y" -> n.y.toDouble(); "z" -> n.z.toDouble()
+        "vx" -> n.vx.toDouble(); "vy" -> n.vy.toDouble(); "vz" -> n.vz.toDouble()
+        "width" -> n.width.toDouble(); "height" -> n.height.toDouble(); "rotation" -> n.rotation.toDouble()
+        "tiltX" -> n.tiltX.toDouble(); "scaleX" -> n.scaleX.toDouble(); "scaleY" -> n.scaleY.toDouble()
+        "parallaxX" -> n.parallaxX.toDouble(); "parallaxY" -> n.parallaxY.toDouble()
+        "atlas" -> n.atlas; "atlasFrame" -> n.atlasFrame
+        "normalMap" -> n.normalMap; "normalStrength" -> n.normalStrength.toDouble(); "specular" -> n.specular.toDouble()
+        "sliceLeft" -> n.sliceLeft.toDouble(); "sliceRight" -> n.sliceRight.toDouble()
+        "sliceTop" -> n.sliceTop.toDouble(); "sliceBottom" -> n.sliceBottom.toDouble()
+        "clipChildren" -> n.clipChildren; "clipX" -> n.clipX.toDouble(); "clipY" -> n.clipY.toDouble()
+        "clipW" -> n.clipW.toDouble(); "clipH" -> n.clipH.toDouble()
+        "slopeType" -> n.slopeType; "colOffsetX" -> n.colOffsetX.toDouble(); "colOffsetY" -> n.colOffsetY.toDouble()
+        "colWidth" -> n.colWidth.toDouble(); "colHeight" -> n.colHeight.toDouble()
+        "colLayer" -> n.colLayer; "colMask" -> n.colMask; "bodyMode" -> n.bodyMode
+        "gravity" -> n.gravity.toDouble(); "fallMultiplier" -> n.fallMultiplier.toDouble(); "maxJumps" -> n.maxJumps
+        "isGrounded" -> n.isGrounded; "isHitbox" -> n.isHitbox; "isHurtbox" -> n.isHurtbox
+        "damage" -> n.damage.toDouble(); "invulnTimer" -> n.invulnTimer.toDouble()
+        "r" -> n.r.toDouble(); "g" -> n.g.toDouble(); "b" -> n.b.toDouble(); "a" -> n.a.toDouble()
+        "visible" -> n.visible; "text" -> n.text
+        "currentClip" -> n.animator.currentClip?.name ?: n.currentClipName
+        "lightRadius" -> n.lightRadius.toDouble(); "lightIntensity" -> n.lightIntensity.toDouble()
+        else -> null
+    }
 
-        // P10：2D 骨骼蒙皮与网格变形 API
-        ScriptableObject.putProperty(engineApi, "createSkinnedMesh", jsFunc { args ->
-            val target = nodes.find { it.name == RhinoContext.toString(args.getOrNull(0) ?: "") } ?: return@jsFunc false
-            val uv = resolveNodeUvRect(target)
-            meshSystem.createGridMesh(target, (args.getOrNull(1) as? Number)?.toInt() ?: 8, (args.getOrNull(2) as? Number)?.toInt() ?: 12, uv[0], uv[1], uv[2], uv[3]) { getGlobalTransform(it) }
-            true
-        })
-        ScriptableObject.putProperty(engineApi, "bindBones", jsFunc { args ->
-            val ownerName = RhinoContext.toString(args.getOrNull(0) ?: "")
-            val boneList = extractStringList(args.getOrNull(1))
-            val smooth = (args.getOrNull(2) as? Number)?.toFloat() ?: 2.2f
-            meshSystem.bindBones(ownerName, boneList, nodes, smooth) { getGlobalTransform(it) }
-        })
-        ScriptableObject.putProperty(engineApi, "setMeshWave", jsFunc { args ->
-            meshSystem.setMeshWave(RhinoContext.toString(args.getOrNull(0) ?: ""), (args.getOrNull(1) as? Number)?.toFloat() ?: 0f, (args.getOrNull(2) as? Number)?.toFloat() ?: 0f, (args.getOrNull(3) as? Number)?.toFloat() ?: 6f, (args.getOrNull(4) as? Number)?.toFloat() ?: 4f); null
-        })
-        ScriptableObject.putProperty(engineApi, "removeSkinnedMesh", jsFunc { args -> meshSystem.removeMesh(RhinoContext.toString(args.getOrNull(0) ?: "")); null })
-
-        ScriptableObject.putProperty(engineApi, "loadAtlas", jsFunc { args ->
-            val d = queryAtlas(RhinoContext.toString(args.getOrNull(0) ?: "")) ?: return@jsFunc null
-            rhino.newObject(globalScope).apply {
-                ScriptableObject.putProperty(this, "image", d.imageFile); ScriptableObject.putProperty(this, "width", d.atlasW.toDouble()); ScriptableObject.putProperty(this, "height", d.atlasH.toDouble())
-                ScriptableObject.putProperty(this, "frames", rhino.newArray(globalScope, d.frames.keys.sorted().toTypedArray()))
-            }
-        })
-        ScriptableObject.putProperty(engineApi, "setFlag", jsFunc { args -> val k = RhinoContext.toString(args.getOrNull(0) ?: ""); if (k.isNotEmpty()) { val v = if (args.size >= 2) args[1] else true; dataStore.worldFlags[k] = when (v) { is Boolean -> v; is Number -> v.toDouble(); null -> false; else -> RhinoContext.toString(v) } }; null })
-        ScriptableObject.putProperty(engineApi, "getFlag", jsFunc { args -> dataStore.worldFlags[RhinoContext.toString(args.getOrNull(0) ?: "")] ?: if (args.size >= 2) args[1] else false })
-        ScriptableObject.putProperty(engineApi, "hasFlag", jsFunc { args -> when (val v = dataStore.worldFlags[RhinoContext.toString(args.getOrNull(0) ?: "")]) { null -> false; is Boolean -> v; is Number -> v.toDouble() != 0.0; is String -> v.isNotEmpty(); else -> true } })
-        ScriptableObject.putProperty(engineApi, "clearFlag", jsFunc { args -> dataStore.worldFlags.remove(RhinoContext.toString(args.getOrNull(0) ?: "")); null })
-        ScriptableObject.putProperty(engineApi, "clearAllFlags", jsFunc { dataStore.worldFlags.clear(); null })
-        ScriptableObject.putProperty(engineApi, "getAllFlags", jsFunc { rhino.newObject(globalScope).apply { dataStore.worldFlags.forEach { (k, v) -> ScriptableObject.putProperty(this, k, v) } } })
-        ScriptableObject.putProperty(engineApi, "saveWorldFlags", jsFunc { args -> dataStore.saveWorldFlagsToDisk(RhinoContext.toString(args.getOrNull(0) ?: "world_flags")) })
-        ScriptableObject.putProperty(engineApi, "loadWorldFlags", jsFunc { args -> dataStore.loadWorldFlagsFromDisk(RhinoContext.toString(args.getOrNull(0) ?: "world_flags")) })
-        ScriptableObject.putProperty(engineApi, "loadTable", jsFunc { args -> dataStore.loadDataTable(rhino, globalScope, RhinoContext.toString(args.getOrNull(0) ?: "")) })
-        ScriptableObject.putProperty(engineApi, "reloadTables", jsFunc { dataStore.dataTableCache.clear(); null })
-        ScriptableObject.putProperty(engineApi, "setLanguage", jsFunc { args -> dataStore.setLanguage(RhinoContext.toString(args.getOrNull(0) ?: "zh")) })
-        ScriptableObject.putProperty(engineApi, "getLanguage", jsFunc { dataStore.currentLang })
-        ScriptableObject.putProperty(engineApi, "setI18nDict", jsFunc { args -> (args.getOrNull(1) as? Scriptable)?.let { dataStore.setI18nDict(RhinoContext.toString(args.getOrNull(0) ?: "zh"), it) }; null })
-        ScriptableObject.putProperty(engineApi, "t", jsFunc { args -> dataStore.translateKey(RhinoContext.toString(args.getOrNull(0) ?: ""), if (args.size >= 2 && args[1] != null) RhinoContext.toString(args[1]) else "") })
-        ScriptableObject.putProperty(engineApi, "setDebugDraw", jsFunc { args -> physicsSystem.debugDrawEnabled = (args.getOrNull(0) as? Boolean) ?: false; null })
-        ScriptableObject.putProperty(engineApi, "isDebugDraw", jsFunc { physicsSystem.debugDrawEnabled })
-        ScriptableObject.putProperty(engineApi, "setPostFX", jsFunc { args -> (args.getOrNull(0) as? Scriptable)?.let { cfg -> postFxEnabled = getJsBool(cfg, "enabled", postFxEnabled); postBloom = getJsFloat(cfg, "bloom", postBloom).coerceIn(0f, 3f); postVignette = getJsFloat(cfg, "vignette", postVignette).coerceIn(0f, 2f); postChromatic = getJsFloat(cfg, "chromatic", postChromatic).coerceIn(0f, 3f); postFade = getJsFloat(cfg, "fade", postFade).coerceIn(0f, 1f) }; null })
-        ScriptableObject.putProperty(engineApi, "setFade", jsFunc { args -> val tg = ((args.getOrNull(0) as? Number)?.toFloat() ?: 0f).coerceIn(0f, 1f); val d = (args.getOrNull(1) as? Number)?.toFloat() ?: 0.3f; pendingFadeScene = null; if (d <= 0.01f) { postFade = tg; fadeTarget = tg; fadeSpeed = 0f } else { fadeTarget = tg; fadeSpeed = abs(tg - postFade) / d }; null })
-        ScriptableObject.putProperty(engineApi, "fadeToScene", jsFunc { args -> val s = RhinoContext.toString(args.getOrNull(0) ?: ""); val d = ((args.getOrNull(1) as? Number)?.toFloat() ?: 0.35f).coerceAtLeast(0.05f); if (s.isNotEmpty()) { preloadSceneAsync(s); pendingFadeScene = normalizeSceneName(s); fadeSceneDur = d; fadeTarget = 1f; fadeSpeed = 1f / d }; null })
-        ScriptableObject.putProperty(engineApi, "preloadScene", jsFunc { args -> val s = RhinoContext.toString(args.getOrNull(0) ?: ""); if (s.isNotEmpty()) preloadSceneAsync(s); null })
-        ScriptableObject.putProperty(engineApi, "loadSceneAdditive", jsFunc { args -> val s = RhinoContext.toString(args.getOrNull(0) ?: ""); if (s.isNotEmpty()) pendingAdditiveLoads.add(AdditiveLoadReq(normalizeSceneName(s), (args.getOrNull(1) as? Number)?.toFloat() ?: 0f, (args.getOrNull(2) as? Number)?.toFloat() ?: 0f)); null })
-        ScriptableObject.putProperty(engineApi, "unloadScene", jsFunc { args -> val s = RhinoContext.toString(args.getOrNull(0) ?: ""); if (s.isNotEmpty()) pendingUnloadScenes.add(normalizeSceneName(s)); null })
-        ScriptableObject.putProperty(engineApi, "clearSceneCache", jsFunc { preloadedSceneCache.clear(); null })
-        ScriptableObject.putProperty(engineApi, "getStats", jsFunc {
-            rhino.newObject(globalScope).apply {
-                ScriptableObject.putProperty(this, "fps", smoothedFps.toDouble()); ScriptableObject.putProperty(this, "drawCalls", lastFrameDrawCalls); ScriptableObject.putProperty(this, "culled", lastFrameCulled)
-                ScriptableObject.putProperty(this, "nodes", nodes.size); ScriptableObject.putProperty(this, "lights", lastFrameLights); ScriptableObject.putProperty(this, "occluders", lightingSystem.activeOccluderCount)
-                ScriptableObject.putProperty(this, "cloths", rigSystem.activeClothCount); ScriptableObject.putProperty(this, "iks", rigSystem.activeIkCount); ScriptableObject.putProperty(this, "skinnedMeshes", meshSystem.activeMeshCount)
-                ScriptableObject.putProperty(this, "gi", giSystem.isReady); ScriptableObject.putProperty(this, "sdfShadow", lightingSystem.sdfShadowEnabled); ScriptableObject.putProperty(this, "spatialCells", physicsSystem.spatialCellsCount)
-                ScriptableObject.putProperty(this, "modules", dataStore.moduleCache.size); ScriptableObject.putProperty(this, "atlases", atlasCache.size); ScriptableObject.putProperty(this, "flags", dataStore.worldFlags.size)
-                ScriptableObject.putProperty(this, "tables", dataStore.dataTableCache.size); ScriptableObject.putProperty(this, "lang", dataStore.currentLang); ScriptableObject.putProperty(this, "fbo", postFxEnabled && fboReady)
-                ScriptableObject.putProperty(this, "touches", inputSystem.getTouchCount()); ScriptableObject.putProperty(this, "textures", textureCache.size)
-            }
-        })
-        ScriptableObject.putProperty(engineApi, "loadScene", jsFunc { args -> val s = RhinoContext.toString(args.getOrNull(0) ?: ""); if (s.isNotEmpty()) pendingSceneLoad = normalizeSceneName(s); null })
-        ScriptableObject.putProperty(engineApi, "setGlobal", jsFunc { args -> val k = RhinoContext.toString(args.getOrNull(0) ?: ""); if (k.isNotEmpty()) globalDataStore[k] = args.getOrNull(1); null })
-        ScriptableObject.putProperty(engineApi, "getGlobal", jsFunc { args -> globalDataStore[RhinoContext.toString(args.getOrNull(0) ?: "")] ?: args.getOrNull(1) })
-        ScriptableObject.putProperty(engineApi, "saveDisk", jsFunc { args -> dataStore.saveDiskSlot(rhino, globalScope, RhinoContext.toString(args.getOrNull(0) ?: "slot_1"), args.getOrNull(1)) })
-        ScriptableObject.putProperty(engineApi, "loadDisk", jsFunc { args -> dataStore.loadDiskSlot(rhino, globalScope, RhinoContext.toString(args.getOrNull(0) ?: "slot_1")) })
-        ScriptableObject.putProperty(engineApi, "deleteDisk", jsFunc { args -> dataStore.deleteDiskSlot(RhinoContext.toString(args.getOrNull(0) ?: "slot_1")) })
-        ScriptableObject.putProperty(engineApi, "raycast", jsFunc { args -> physicsSystem.raycast(rhino, globalScope, (args.getOrNull(0) as? Number)?.toFloat() ?: 0f, (args.getOrNull(1) as? Number)?.toFloat() ?: 0f, (args.getOrNull(2) as? Number)?.toFloat() ?: 0f, (args.getOrNull(3) as? Number)?.toFloat() ?: 0f, args.getOrNull(4)?.takeIf { it !== Scriptable.NOT_FOUND }?.toString() ?: "", (args.getOrNull(5) as? Number)?.toInt() ?: 0xFFFF) { getGlobalTransform(it) } })
-        ScriptableObject.putProperty(engineApi, "hitstop", jsFunc { args -> hitstopTimer = max(hitstopTimer, ((args.getOrNull(0) as? Number)?.toFloat() ?: 0.05f).coerceIn(0f, 0.5f)); null })
-        ScriptableObject.putProperty(engineApi, "setTimeScale", jsFunc { args -> timeScale = ((args.getOrNull(0) as? Number)?.toFloat() ?: 1f).coerceIn(0.05f, 4f); null })
-        ScriptableObject.putProperty(engineApi, "setCameraMode", jsFunc { args -> camMode = RhinoContext.toString(args.getOrNull(0) ?: "2.5D"); null })
-        ScriptableObject.putProperty(engineApi, "setCameraTilt", jsFunc { args -> camPitch = (args.getOrNull(0) as? Number)?.toFloat() ?: camPitch; camDistance = (args.getOrNull(1) as? Number)?.toFloat() ?: camDistance; camFov = (args.getOrNull(2) as? Number)?.toFloat() ?: camFov; null })
-        ScriptableObject.putProperty(engineApi, "setCameraTarget", jsFunc { args -> val t = args.getOrNull(0) as? Scriptable; camTarget = (t as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === t }; null })
-        ScriptableObject.putProperty(engineApi, "setCameraDeadzone", jsFunc { args -> camDeadzoneX = (args.getOrNull(0) as? Number)?.toFloat() ?: 0f; camDeadzoneY = (args.getOrNull(1) as? Number)?.toFloat() ?: 0f; null })
-        ScriptableObject.putProperty(engineApi, "setCameraLookAhead", jsFunc { args -> camLookAheadX = (args.getOrNull(0) as? Number)?.toFloat() ?: 0f; camLookAheadY = (args.getOrNull(1) as? Number)?.toFloat() ?: 0f; null })
-        ScriptableObject.putProperty(engineApi, "setCameraBounds", jsFunc { args -> camBoundsEnabled = true; camMinX = (args.getOrNull(0) as? Number)?.toFloat() ?: -99999f; camMinY = (args.getOrNull(1) as? Number)?.toFloat() ?: -99999f; camMaxX = (args.getOrNull(2) as? Number)?.toFloat() ?: 99999f; camMaxY = (args.getOrNull(3) as? Number)?.toFloat() ?: 99999f; null })
-        ScriptableObject.putProperty(engineApi, "clearCameraBounds", jsFunc { camBoundsEnabled = false; null })
-        ScriptableObject.putProperty(engineApi, "getCamera", jsFunc { rhino.newObject(globalScope).apply { ScriptableObject.putProperty(this, "x", camX.toDouble()); ScriptableObject.putProperty(this, "y", camY.toDouble()); ScriptableObject.putProperty(this, "pitch", camPitch.toDouble()); ScriptableObject.putProperty(this, "mode", camMode) } })
-        ScriptableObject.putProperty(engineApi, "setAmbientLight", jsFunc { args -> ambientR = (args.getOrNull(0) as? Number)?.toFloat() ?: 0.52f; ambientG = (args.getOrNull(1) as? Number)?.toFloat() ?: 0.56f; ambientB = (args.getOrNull(2) as? Number)?.toFloat() ?: 0.68f; null })
-        ScriptableObject.putProperty(engineApi, "shake", jsFunc { args -> shakeIntensity = (args.getOrNull(0) as? Number)?.toFloat() ?: 12f; shakeTimer = (args.getOrNull(1) as? Number)?.toFloat() ?: 0.15f; null })
-        ScriptableObject.putProperty(engineApi, "tween", jsFunc { args -> val o = args.getOrNull(0) as? Scriptable ?: return@jsFunc null; val p = RhinoContext.toString(args.getOrNull(1) ?: ""); val tv = (args.getOrNull(2) as? Number)?.toFloat() ?: return@jsFunc null; val n = (o as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === o } ?: return@jsFunc null; activeTweens.removeAll { it.node === n && it.prop == p }; activeTweens.add(TweenTask(n, p, readTweenProperty(n, p), tv, (args.getOrNull(3) as? Number)?.toFloat() ?: 0.25f, RhinoContext.toString(args.getOrNull(4) ?: "easeOut"))); null })
-        ScriptableObject.putProperty(engineApi, "playTone", jsFunc { args -> audioSystem.playToneAsync((args.getOrNull(0) as? Number)?.toInt() ?: 440, (args.getOrNull(1) as? Number)?.toInt() ?: 80); null })
-        ScriptableObject.putProperty(engineApi, "playBGM", jsFunc { args -> val f = RhinoContext.toString(args.getOrNull(0) ?: ""); if (f.isNotEmpty()) audioSystem.playBGM(f, (args.getOrNull(1) as? Boolean) ?: true, (args.getOrNull(2) as? Number)?.toFloat() ?: 0.8f); null })
-        ScriptableObject.putProperty(engineApi, "crossfadeBGM", jsFunc { args -> val f = RhinoContext.toString(args.getOrNull(0) ?: ""); if (f.isNotEmpty()) audioSystem.crossfadeBGM(f, (args.getOrNull(1) as? Number)?.toFloat() ?: 1.2f, (args.getOrNull(2) as? Boolean) ?: true, (args.getOrNull(3) as? Number)?.toFloat() ?: 0.8f); null })
-        ScriptableObject.putProperty(engineApi, "stopBGM", jsFunc { args -> audioSystem.stopBGM((args.getOrNull(0) as? Number)?.toFloat() ?: 0f); null })
-        ScriptableObject.putProperty(engineApi, "playSFX", jsFunc { args -> val f = RhinoContext.toString(args.getOrNull(0) ?: ""); val pMin = (args.getOrNull(2) as? Number)?.toFloat() ?: 1.0f; if (f.isNotEmpty()) audioSystem.playSFX(f, (args.getOrNull(1) as? Number)?.toFloat() ?: 1.0f, pMin, (args.getOrNull(3) as? Number)?.toFloat() ?: pMin); null })
-        ScriptableObject.putProperty(engineApi, "setVolume", jsFunc { args -> audioSystem.setVolume(RhinoContext.toString(args.getOrNull(0) ?: "master"), (args.getOrNull(1) as? Number)?.toFloat() ?: 1.0f); null })
-        ScriptableObject.putProperty(engineApi, "getVolume", jsFunc { args -> audioSystem.getVolume(RhinoContext.toString(args.getOrNull(0) ?: "master")).toDouble() })
-        ScriptableObject.putProperty(engineApi, "moveAndSlide", jsFunc { args -> val o = args.getOrNull(0) as? Scriptable ?: return@jsFunc null; val n = (o as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === o } ?: return@jsFunc null; physicsSystem.moveAndSlide(n, (args.getOrNull(1) as? Number)?.toFloat() ?: 0.016f, pendingRemove, { getGlobalTransform(it) }) { nd, fn, ag -> callLifecycle(nd, fn, ag) }; null })
-        ScriptableObject.putProperty(engineApi, "distance", jsFunc { args -> val a = (args.getOrNull(0) as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === (args.getOrNull(0) as? Scriptable) }; val b = (args.getOrNull(1) as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === (args.getOrNull(1) as? Scriptable) }; if (a != null && b != null) { val ga = getGlobalTransform(a); val gb = getGlobalTransform(b); hypot(ga.gx - gb.gx, ga.gy - gb.gy).toDouble() } else 999999.0 })
-        ScriptableObject.putProperty(engineApi, "angleTo", jsFunc { args -> val a = (args.getOrNull(0) as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === (args.getOrNull(0) as? Scriptable) }; val b = (args.getOrNull(1) as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === (args.getOrNull(1) as? Scriptable) }; if (a != null && b != null) { val ga = getGlobalTransform(a); val gb = getGlobalTransform(b); Math.toDegrees(atan2((gb.gy - ga.gy).toDouble(), (gb.gx - ga.gx).toDouble())) } else 0.0 })
-        ScriptableObject.putProperty(engineApi, "spawn", jsFunc { args ->
-            val cfg = args.getOrNull(0) as? Scriptable ?: return@jsFunc null; val rawLayer = getJsStr(cfg, "layer", "World")
-            val sp = GameNode(name = getJsStr(cfg, "name", "Spawn_${System.nanoTime() % 10000}"), nodeType = getJsStr(cfg, "nodeType", "Sprite2D"), layer = if (rawLayer.startsWith("UI", ignoreCase = true)) "UI" else "World", parent = RhinoContext.toString(args.getOrNull(1) ?: ""), tag = getJsStr(cfg, "tag", "default"), persistent = getJsBool(cfg, "persistent", false), x = getJsFloat(cfg, "x", 0f), y = getJsFloat(cfg, "y", 0f), z = getJsFloat(cfg, "z", 0f), width = getJsFloat(cfg, "width", 64f), height = getJsFloat(cfg, "height", 64f), tiltX = getJsFloat(cfg, "tiltX", 0f), billboard = getJsBool(cfg, "billboard", false), zIndex = getJsInt(cfg, "zIndex", 0), texture = getJsStr(cfg, "texture", ""), atlas = getJsStr(cfg, "atlas", ""), atlasFrame = getJsStr(cfg, "atlasFrame", ""), normalMap = getJsStr(cfg, "normalMap", ""), normalStrength = getJsFloat(cfg, "normalStrength", 1.0f), specular = getJsFloat(cfg, "specular", 0.25f), text = getJsStr(cfg, "text", ""), fontSize = getJsFloat(cfg, "fontSize", 44f), r = getJsFloat(cfg, "r", 1f), g = getJsFloat(cfg, "g", 1f), b = getJsFloat(cfg, "b", 1f), a = getJsFloat(cfg, "a", 1f), sliceLeft = getJsFloat(cfg, "sliceLeft", 0f), sliceRight = getJsFloat(cfg, "sliceRight", 0f), sliceTop = getJsFloat(cfg, "sliceTop", 0f), sliceBottom = getJsFloat(cfg, "sliceBottom", 0f), clipChildren = getJsBool(cfg, "clipChildren", false), clipX = getJsFloat(cfg, "clipX", 0f), clipY = getJsFloat(cfg, "clipY", 0f), clipW = getJsFloat(cfg, "clipW", 0f), clipH = getJsFloat(cfg, "clipH", 0f), collider = getJsBool(cfg, "collider", false), isTrigger = getJsBool(cfg, "isTrigger", false), oneWay = getJsBool(cfg, "oneWay", false), slopeType = getJsStr(cfg, "slopeType", "none"), colOffsetX = getJsFloat(cfg, "colOffsetX", 0f), colOffsetY = getJsFloat(cfg, "colOffsetY", 0f), colWidth = getJsFloat(cfg, "colWidth", 0f), colHeight = getJsFloat(cfg, "colHeight", 0f), colLayer = getJsInt(cfg, "colLayer", 1), colMask = getJsInt(cfg, "colMask", 0xFFFF), bodyMode = getJsStr(cfg, "bodyMode", "kinematic"), isHitbox = getJsBool(cfg, "isHitbox", false), isHurtbox = getJsBool(cfg, "isHurtbox", false), damage = getJsFloat(cfg, "damage", 10f), shadowCaster = getJsBool(cfg, "shadowCaster", false), lightRadius = getJsFloat(cfg, "lightRadius", 400f), lightIntensity = getJsFloat(cfg, "lightIntensity", 1.5f), script = dataStore.resolveNodeScriptText(getJsStr(cfg, "script", ""), getJsStr(cfg, "scriptFile", "")))
-            pendingAdd.add(sp); bindNodeScript(sp); sp.jsObj
-        })
-        ScriptableObject.putProperty(engineApi, "instantiate", jsFunc { args -> val txt = readSceneText(RhinoContext.toString(args.getOrNull(0) ?: "")) ?: return@jsFunc null; val loaded = mutableListOf<GameNode>(); parseSceneJson(txt, loaded, normalizeSceneName(RhinoContext.toString(args.getOrNull(0) ?: "")), false); val sx = (args.getOrNull(1) as? Number)?.toFloat() ?: 0f; val sy = (args.getOrNull(2) as? Number)?.toFloat() ?: 0f; val sz = (args.getOrNull(3) as? Number)?.toFloat() ?: 0f; loaded.forEach { if (it.parent.isEmpty()) { it.x += sx; it.y += sy; it.z += sz }; pendingAdd.add(it); bindNodeScript(it) }; loaded.firstOrNull()?.jsObj })
-        ScriptableObject.putProperty(engineApi, "destroy", jsFunc { args -> val t = args.getOrNull(0) as? Scriptable; ((t as? GameNodeJsProxy)?.n ?: nodes.find { it.jsObj === t })?.let { pendingRemove.add(it) }; null })
-        ScriptableObject.putProperty(engineApi, "findNode", jsFunc { args -> nodes.find { it.name == RhinoContext.toString(args.getOrNull(0) ?: "") }?.jsObj })
-        ScriptableObject.putProperty(engineApi, "findNodesByTag", jsFunc { args -> val tg = RhinoContext.toString(args.getOrNull(0) ?: ""); rhino.newArray(globalScope, nodes.filter { it.tag == tg && !pendingRemove.contains(it) }.mapNotNull { it.jsObj }.toTypedArray()) })
-        ScriptableObject.putProperty(engineApi, "on", jsFunc { args -> val ev = RhinoContext.toString(args.getOrNull(0) ?: ""); val fn = args.getOrNull(1) as? Function; if (ev.isNotEmpty() && fn != null) eventListeners.getOrPut(ev) { mutableListOf() }.add(fn); null })
-        ScriptableObject.putProperty(engineApi, "emit", jsFunc { args -> eventListeners[RhinoContext.toString(args.getOrNull(0) ?: "")]?.toList()?.forEach { try { it.call(rhino, globalScope, globalScope, arrayOf(args.getOrNull(1))) } catch (_: Exception) {} }; null })
-        ScriptableObject.putProperty(globalScope, "Engine", engineApi)
-
-        val inputApi = object : ScriptableObject() {
-            override fun getClassName() = "Input"
-            override fun get(name: String?, start: Scriptable?): Any? = when (name) { "isTouching" -> isTouching || inputSystem.getTouchCount() > 0; "touchCount" -> inputSystem.getTouchCount(); "screenX", "touchX" -> touchScreenX.toDouble(); "screenY", "touchY" -> touchScreenY.toDouble(); "worldX" -> touchWorldX.toDouble(); "worldY" -> touchWorldY.toDouble(); else -> super.get(name, start) }
+    private fun setNodeProp(n: GameNode, name: String, value: Any?) {
+        when (name) {
+            "tag" -> n.tag = toJsStr(value, n.tag); "persistent" -> n.persistent = toJsBool(value, n.persistent)
+            "x" -> n.x = toJsFloat(value, n.x); "y" -> n.y = toJsFloat(value, n.y); "z" -> n.z = toJsFloat(value, n.z)
+            "vx" -> n.vx = toJsFloat(value, n.vx); "vy" -> n.vy = toJsFloat(value, n.vy); "vz" -> n.vz = toJsFloat(value, n.vz)
+            "width" -> n.width = toJsFloat(value, n.width); "height" -> n.height = toJsFloat(value, n.height)
+            "rotation" -> n.rotation = toJsFloat(value, n.rotation); "tiltX" -> n.tiltX = toJsFloat(value, n.tiltX)
+            "scaleX" -> n.scaleX = toJsFloat(value, n.scaleX); "scaleY" -> n.scaleY = toJsFloat(value, n.scaleY)
+            "parallaxX" -> n.parallaxX = toJsFloat(value, n.parallaxX); "parallaxY" -> n.parallaxY = toJsFloat(value, n.parallaxY)
+            "atlas" -> n.atlas = toJsStr(value, n.atlas); "atlasFrame" -> n.atlasFrame = toJsStr(value, n.atlasFrame)
+            "normalMap" -> n.normalMap = toJsStr(value, n.normalMap)
+            "normalStrength" -> n.normalStrength = toJsFloat(value, n.normalStrength)
+            "specular" -> n.specular = toJsFloat(value, n.specular)
+            "sliceLeft" -> n.sliceLeft = toJsFloat(value, n.sliceLeft); "sliceRight" -> n.sliceRight = toJsFloat(value, n.sliceRight)
+            "sliceTop" -> n.sliceTop = toJsFloat(value, n.sliceTop); "sliceBottom" -> n.sliceBottom = toJsFloat(value, n.sliceBottom)
+            "clipChildren" -> n.clipChildren = toJsBool(value, n.clipChildren)
+            "clipX" -> n.clipX = toJsFloat(value, n.clipX); "clipY" -> n.clipY = toJsFloat(value, n.clipY)
+            "clipW" -> n.clipW = toJsFloat(value, n.clipW); "clipH" -> n.clipH = toJsFloat(value, n.clipH)
+            "slopeType" -> n.slopeType = toJsStr(value, n.slopeType)
+            "colOffsetX" -> n.colOffsetX = toJsFloat(value, n.colOffsetX); "colOffsetY" -> n.colOffsetY = toJsFloat(value, n.colOffsetY)
+            "colWidth" -> n.colWidth = toJsFloat(value, n.colWidth); "colHeight" -> n.colHeight = toJsFloat(value, n.colHeight)
+            "colLayer" -> n.colLayer = toJsInt(value, n.colLayer); "colMask" -> n.colMask = toJsInt(value, n.colMask)
+            "bodyMode" -> n.bodyMode = toJsStr(value, n.bodyMode)
+            "gravity" -> n.gravity = toJsFloat(value, n.gravity); "fallMultiplier" -> n.fallMultiplier = toJsFloat(value, n.fallMultiplier)
+            "maxJumps" -> n.maxJumps = toJsInt(value, n.maxJumps)
+            "isHitbox" -> n.isHitbox = toJsBool(value, n.isHitbox); "isHurtbox" -> n.isHurtbox = toJsBool(value, n.isHurtbox)
+            "damage" -> n.damage = toJsFloat(value, n.damage); "invulnTimer" -> n.invulnTimer = toJsFloat(value, n.invulnTimer)
+            "r" -> n.r = toJsFloat(value, n.r); "g" -> n.g = toJsFloat(value, n.g); "b" -> n.b = toJsFloat(value, n.b); "a" -> n.a = toJsFloat(value, n.a)
+            "visible" -> n.visible = toJsBool(value, n.visible); "text" -> n.text = toJsStr(value, n.text)
+            "lightRadius" -> n.lightRadius = toJsFloat(value, n.lightRadius); "lightIntensity" -> n.lightIntensity = toJsFloat(value, n.lightIntensity)
         }
-        ScriptableObject.putProperty(inputApi, "isActionPressed", jsFunc { args -> inputSystem.isActionPressed(RhinoContext.toString(args.getOrNull(0) ?: "")) })
-        ScriptableObject.putProperty(inputApi, "isActionJustPressed", jsFunc { args -> inputSystem.isActionJustPressed(RhinoContext.toString(args.getOrNull(0) ?: "")) })
-        ScriptableObject.putProperty(inputApi, "isActionJustReleased", jsFunc { args -> inputSystem.isActionJustReleased(RhinoContext.toString(args.getOrNull(0) ?: "")) })
-        ScriptableObject.putProperty(inputApi, "getAxis", jsFunc { args -> inputSystem.getAxis(RhinoContext.toString(args.getOrNull(0) ?: "move_left"), RhinoContext.toString(args.getOrNull(1) ?: "move_right")).toDouble() })
-        ScriptableObject.putProperty(inputApi, "bindAction", jsFunc { args -> val act = RhinoContext.toString(args.getOrNull(0) ?: ""); val list = extractStringList(args.getOrNull(1)); if (act.isNotEmpty() && list.isNotEmpty()) inputSystem.bindAction(act, list); null })
-        ScriptableObject.putProperty(inputApi, "setVirtualAction", jsFunc { args -> val act = RhinoContext.toString(args.getOrNull(0) ?: ""); if (act.isNotEmpty()) inputSystem.setVirtualAction(act, (args.getOrNull(1) as? Boolean) ?: false); null })
-        ScriptableObject.putProperty(inputApi, "bindTouchZone", jsFunc { args -> val act = RhinoContext.toString(args.getOrNull(0) ?: ""); if (act.isNotEmpty()) inputSystem.bindTouchZone(act, (args.getOrNull(1) as? Number)?.toFloat() ?: 0f, (args.getOrNull(2) as? Number)?.toFloat() ?: 0f, (args.getOrNull(3) as? Number)?.toFloat() ?: 160f, (args.getOrNull(4) as? Number)?.toFloat() ?: 160f); null })
-        ScriptableObject.putProperty(inputApi, "clearTouchZones", jsFunc { inputSystem.clearTouchZones(); null })
-        ScriptableObject.putProperty(globalScope, "Input", inputApi)
+    }
+
+    private fun invokeNodeMethod(n: GameNode, method: String, args: Array<out Any?>): Any? {
+        return when (method) {
+            "createSkinnedMesh" -> {
+                val uv = resolveNodeUvRect(n)
+                meshSystem.createGridMesh(n, toJsInt(args.getOrNull(2), 8), toJsInt(args.getOrNull(3), 12), uv[0], uv[1], uv[2], uv[3]) { getGlobalTransform(it) }
+                true
+            }
+            "bindBones" -> {
+                val boneList = parseJsonStringList(toJsStr(args.getOrNull(2), "[]"))
+                val smooth = toJsFloat(args.getOrNull(3), 2.2f)
+                meshSystem.bindBones(n.name, boneList, nodes, smooth) { getGlobalTransform(it) }
+            }
+            "setMeshWave" -> {
+                meshSystem.setMeshWave(n.name, toJsFloat(args.getOrNull(2), 0f), toJsFloat(args.getOrNull(3), 0f), toJsFloat(args.getOrNull(4), 6f), toJsFloat(args.getOrNull(5), 4f)); null
+            }
+            "removeSkinnedMesh" -> { meshSystem.removeMesh(n.name); null }
+            "attachCloth" -> createClothFromJson(toJsStr(args.getOrNull(2), "{}"), n.name)
+            "setNormalMap" -> {
+                n.normalMap = toJsStr(args.getOrNull(2), "")
+                (args.getOrNull(3) as? Number)?.toFloat()?.let { n.normalStrength = it }
+                (args.getOrNull(4) as? Number)?.toFloat()?.let { n.specular = it }
+                null
+            }
+            "setAnimFloat" -> { n.animator.fsm.setFloat(toJsStr(args.getOrNull(2), ""), toJsFloat(args.getOrNull(3), 0f)); null }
+            "setAnimBool" -> { n.animator.fsm.setBool(toJsStr(args.getOrNull(2), ""), toJsBool(args.getOrNull(3), false)); null }
+            "triggerAnim" -> { n.animator.fsm.setTrigger(toJsStr(args.getOrNull(2), "")); null }
+            "setAnimSpeed" -> { n.animator.speedScale = toJsFloat(args.getOrNull(2), 1f).coerceIn(0.05f, 8f); null }
+            "getAnimState" -> n.animator.fsm.currentState.ifEmpty { n.currentClipName }
+            "isAnimCancelable" -> n.animator.activeFrame?.cancelable == true
+            "addAnimTransition" -> {
+                val from = toJsStr(args.getOrNull(2), "*")
+                val to = toJsStr(args.getOrNull(3), "")
+                val param = toJsStr(args.getOrNull(4), "")
+                val op = toJsStr(args.getOrNull(5), "trigger")
+                val cmpVal = args.getOrNull(6)
+                val prio = toJsInt(args.getOrNull(7), 0)
+                val hasExit = toJsBool(args.getOrNull(8), false)
+                val onlyCancel = toJsBool(args.getOrNull(9), false)
+                if (to.isNotEmpty()) {
+                    n.animator.fsm.addTransition(StateTransition(from, to, prio, hasExit, onlyCancel, if (param.isNotEmpty()) listOf(StateCondition(param, op, cmpVal)) else emptyList()))
+                }
+                null
+            }
+            "registerProClip" -> {
+                val s = toJsStr(args.getOrNull(2), "")
+                if (s.isBlank()) false else try {
+                    ZeroAnimator.parseInto(n.animator, JSONObject().put("proClips", JSONArray().put(JSONObject(s)))); true
+                } catch (e: Exception) { onConsoleLog("[ANIM 错误 @ ${n.name}] ${e.message}"); false }
+            }
+            "setAtlas" -> { n.atlas = toJsStr(args.getOrNull(2), n.atlas); n.atlasFrame = toJsStr(args.getOrNull(3), ""); queryAtlas(n.atlas); null }
+            "setNineSlice" -> {
+                val l = toJsFloat(args.getOrNull(2), 0f)
+                n.sliceLeft = l; n.sliceRight = toJsFloat(args.getOrNull(3), l); n.sliceTop = toJsFloat(args.getOrNull(4), l); n.sliceBottom = toJsFloat(args.getOrNull(5), n.sliceTop); null
+            }
+            "setClipRect" -> {
+                n.clipX = toJsFloat(args.getOrNull(2), 0f); n.clipY = toJsFloat(args.getOrNull(3), 0f); n.clipW = toJsFloat(args.getOrNull(4), 0f); n.clipH = toJsFloat(args.getOrNull(5), 0f); null
+            }
+            "jump" -> {
+                val jf = toJsFloat(args.getOrNull(2), 920f)
+                if (n.isGrounded || n.coyoteTimer > 0f) { n.vy = -abs(jf); n.isGrounded = false; n.coyoteTimer = 0f; n.jumpCount = 1; true }
+                else if (n.jumpCount < n.maxJumps) { n.vy = -abs(jf) * 0.9f; n.jumpCount++; true }
+                else false
+            }
+            "dropThrough" -> { n.dropThroughTimer = toJsFloat(args.getOrNull(2), 0.22f); n.isGrounded = false; null }
+            "bounce" -> { (args.getOrNull(2) as? Number)?.toFloat()?.let { n.vx = it }; n.vy = toJsFloat(args.getOrNull(3), -760f); n.isGrounded = false; n.jumpCount = 1; null }
+            "play" -> {
+                val cn = toJsStr(args.getOrNull(2), ""); val fr = toJsBool(args.getOrNull(3), false)
+                if (n.animator.play(cn, fr)) { n.currentClipName = cn }
+                else n.clips[cn]?.let { c ->
+                    if (!fr && n.animPlaying && n.currentClipName == cn) return null
+                    n.currentClipName = cn; n.animStart = c.start; n.animEnd = c.end; n.animFps = c.fps; n.animLoop = c.loop; n.currentFrame = c.start; n.animTimer = 0f; n.animPlaying = true
+                } ?: onConsoleLog("[ANIM 警告 @ ${n.name}] 未找到: $cn")
+                null
+            }
+            "playAnim" -> {
+                n.animator.stop(); n.currentClipName = ""
+                n.animStart = toJsInt(args.getOrNull(2), 0); n.animEnd = toJsInt(args.getOrNull(3), 0)
+                n.animFps = toJsFloat(args.getOrNull(4), 12f); n.animLoop = toJsBool(args.getOrNull(5), true)
+                n.currentFrame = n.animStart; n.animTimer = 0f; n.animPlaying = true; null
+            }
+            "stopAnim" -> { n.animator.stop(); n.animPlaying = false; n.currentClipName = ""; null }
+            "flash" -> { n.flashTimer = toJsFloat(args.getOrNull(2), 0.12f); null }
+            "emitBurst" -> { val cnt = toJsInt(args.getOrNull(2), 24).coerceIn(1, 120); val gt = getGlobalTransform(n); repeat(cnt) { spawnSingleParticle(n, gt.gx, gt.gy) }; null }
+            else -> null
+        }
+    }
+
+    private fun invokeEngineMethod(method: String, args: Array<out Any?>): Any? {
+        return when (method) {
+            "unloadUnusedTextures" -> unloadUnusedTextures()
+            "setSdfShadow" -> {
+                lightingSystem.sdfShadowEnabled = toJsBool(args.getOrNull(1), true)
+                (args.getOrNull(2) as? Number)?.toFloat()?.let { lightingSystem.shadowSoftness = it.coerceIn(1f, 40f) }
+                (args.getOrNull(3) as? Number)?.toFloat()?.let { lightingSystem.shadowMinLight = it.coerceIn(0f, 1f) }
+                null
+            }
+            "setGI" -> {
+                val raw = toJsStr(args.getOrNull(1), "")
+                if (raw == "true" || raw == "false") {
+                    giSystem.enabled = raw == "true"
+                } else if (raw.startsWith("{")) {
+                    try {
+                        val o = JSONObject(raw)
+                        giSystem.enabled = o.optBoolean("enabled", giSystem.enabled)
+                        giSystem.intensity = o.optDouble("intensity", giSystem.intensity.toDouble()).toFloat().coerceIn(0f, 3f)
+                        giSystem.radius = o.optDouble("radius", giSystem.radius.toDouble()).toFloat().coerceIn(0.02f, 0.45f)
+                        giSystem.threshold = o.optDouble("threshold", giSystem.threshold.toDouble()).toFloat().coerceIn(0f, 1.5f)
+                        giSystem.saturation = o.optDouble("saturation", giSystem.saturation.toDouble()).toFloat().coerceIn(0f, 3f)
+                        giSystem.skyR = o.optDouble("skyR", giSystem.skyR.toDouble()).toFloat().coerceIn(0f, 1f)
+                        giSystem.skyG = o.optDouble("skyG", giSystem.skyG.toDouble()).toFloat().coerceIn(0f, 1f)
+                        giSystem.skyB = o.optDouble("skyB", giSystem.skyB.toDouble()).toFloat().coerceIn(0f, 1f)
+                    } catch (_: Exception) {}
+                }
+                null
+            }
+            "createCloth" -> createClothFromJson(toJsStr(args.getOrNull(1), "{}"), "")
+            "removeCloth" -> { rigSystem.removeCloth(toJsStr(args.getOrNull(1), "")); null }
+            "setGlobalWind" -> { rigSystem.setGlobalWind(toJsFloat(args.getOrNull(1), 0f), toJsFloat(args.getOrNull(2), 0f)); null }
+            "solveIK" -> {
+                val root = nodes.find { it.name == toJsStr(args.getOrNull(1), "") } ?: return false
+                val mid = nodes.find { it.name == toJsStr(args.getOrNull(2), "") } ?: return false
+                rigSystem.solveTwoBoneIK(root, mid, toJsFloat(args.getOrNull(3), 0f), toJsFloat(args.getOrNull(4), 0f), toJsFloat(args.getOrNull(5), 80f), toJsFloat(args.getOrNull(6), 80f), toJsBool(args.getOrNull(7), false)) { getGlobalTransform(it) }
+            }
+            "registerIK" -> {
+                rigSystem.registerTwoBoneIK(toJsStr(args.getOrNull(1), ""), toJsStr(args.getOrNull(2), ""), toJsStr(args.getOrNull(3), ""), toJsFloat(args.getOrNull(4), 80f), toJsFloat(args.getOrNull(5), 80f), toJsBool(args.getOrNull(6), false)); null
+            }
+            "setIKTarget" -> { rigSystem.setIkTarget(toJsStr(args.getOrNull(1), ""), toJsFloat(args.getOrNull(2), 0f), toJsFloat(args.getOrNull(3), 0f), toJsBool(args.getOrNull(4), true)); null }
+            "removeIK" -> { rigSystem.removeIk(toJsStr(args.getOrNull(1), "")); null }
+            "createSkinnedMesh" -> {
+                val target = nodes.find { it.name == toJsStr(args.getOrNull(1), "") } ?: return false
+                val uv = resolveNodeUvRect(target)
+                meshSystem.createGridMesh(target, toJsInt(args.getOrNull(2), 8), toJsInt(args.getOrNull(3), 12), uv[0], uv[1], uv[2], uv[3]) { getGlobalTransform(it) }
+                true
+            }
+            "bindBones" -> {
+                meshSystem.bindBones(toJsStr(args.getOrNull(1), ""), parseJsonStringList(toJsStr(args.getOrNull(2), "[]")), nodes, toJsFloat(args.getOrNull(3), 2.2f)) { getGlobalTransform(it) }
+            }
+            "setMeshWave" -> {
+                meshSystem.setMeshWave(toJsStr(args.getOrNull(1), ""), toJsFloat(args.getOrNull(2), 0f), toJsFloat(args.getOrNull(3), 0f), toJsFloat(args.getOrNull(4), 6f), toJsFloat(args.getOrNull(5), 4f)); null
+            }
+            "removeSkinnedMesh" -> { meshSystem.removeMesh(toJsStr(args.getOrNull(1), "")); null }
+            "loadAtlas" -> {
+                val d = queryAtlas(toJsStr(args.getOrNull(1), "")) ?: return null
+                JSONObject().apply {
+                    put("image", d.imageFile); put("width", d.atlasW.toDouble()); put("height", d.atlasH.toDouble())
+                    put("frames", JSONArray(d.frames.keys.sorted()))
+                }.toString()
+            }
+            "setFlag" -> {
+                val k = toJsStr(args.getOrNull(1), "")
+                if (k.isNotEmpty()) {
+                    val v = if (args.size >= 3) args[2] else true
+                    dataStore.worldFlags[k] = when (v) { is Boolean -> v; is Number -> v.toDouble(); null -> false; else -> v.toString() }
+                }
+                null
+            }
+            "getFlag" -> dataStore.worldFlags[toJsStr(args.getOrNull(1), "")] ?: if (args.size >= 3) args[2] else false
+            "hasFlag" -> when (val v = dataStore.worldFlags[toJsStr(args.getOrNull(1), "")]) {
+                null -> false; is Boolean -> v; is Number -> v.toDouble() != 0.0; is String -> v.isNotEmpty(); else -> true
+            }
+            "clearFlag" -> { dataStore.worldFlags.remove(toJsStr(args.getOrNull(1), "")); null }
+            "clearAllFlags" -> { dataStore.worldFlags.clear(); null }
+            "getAllFlags" -> JSONObject().apply { dataStore.worldFlags.forEach { (k, v) -> put(k, v) } }.toString()
+            "saveWorldFlags" -> dataStore.saveWorldFlagsToDisk(toJsStr(args.getOrNull(1), "world_flags"))
+            "loadWorldFlags" -> dataStore.loadWorldFlagsFromDisk(toJsStr(args.getOrNull(1), "world_flags"))
+            "readTable" -> dataStore.readDataTableJson(toJsStr(args.getOrNull(1), ""))?.second
+            "setLanguage" -> dataStore.setLanguage(toJsStr(args.getOrNull(1), "zh"))
+            "getLanguage" -> dataStore.currentLang
+            "setI18nDict" -> { dataStore.setI18nDictJson(toJsStr(args.getOrNull(1), "zh"), toJsStr(args.getOrNull(2), "{}")); null }
+            "t" -> dataStore.translateKey(toJsStr(args.getOrNull(1), ""), toJsStr(args.getOrNull(2), ""))
+            "setDebugDraw" -> { physicsSystem.debugDrawEnabled = toJsBool(args.getOrNull(1), false); null }
+            "isDebugDraw" -> physicsSystem.debugDrawEnabled
+            "setPostFX" -> {
+                try {
+                    val cfg = JSONObject(toJsStr(args.getOrNull(1), "{}"))
+                    postFxEnabled = cfg.optBoolean("enabled", postFxEnabled)
+                    postBloom = cfg.optDouble("bloom", postBloom.toDouble()).toFloat().coerceIn(0f, 3f)
+                    postVignette = cfg.optDouble("vignette", postVignette.toDouble()).toFloat().coerceIn(0f, 2f)
+                    postChromatic = cfg.optDouble("chromatic", postChromatic.toDouble()).toFloat().coerceIn(0f, 3f)
+                    postFade = cfg.optDouble("fade", postFade.toDouble()).toFloat().coerceIn(0f, 1f)
+                } catch (_: Exception) {}
+                null
+            }
+            "setFade" -> {
+                val tg = toJsFloat(args.getOrNull(1), 0f).coerceIn(0f, 1f); val d = toJsFloat(args.getOrNull(2), 0.3f)
+                pendingFadeScene = null
+                if (d <= 0.01f) { postFade = tg; fadeTarget = tg; fadeSpeed = 0f } else { fadeTarget = tg; fadeSpeed = abs(tg - postFade) / d }
+                null
+            }
+            "fadeToScene" -> {
+                val s = toJsStr(args.getOrNull(1), ""); val d = toJsFloat(args.getOrNull(2), 0.35f).coerceAtLeast(0.05f)
+                if (s.isNotEmpty()) { preloadSceneAsync(s); pendingFadeScene = normalizeSceneName(s); fadeSceneDur = d; fadeTarget = 1f; fadeSpeed = 1f / d }
+                null
+            }
+            "preloadScene" -> { val s = toJsStr(args.getOrNull(1), ""); if (s.isNotEmpty()) preloadSceneAsync(s); null }
+            "loadSceneAdditive" -> {
+                val s = toJsStr(args.getOrNull(1), "")
+                if (s.isNotEmpty()) pendingAdditiveLoads.add(AdditiveLoadReq(normalizeSceneName(s), toJsFloat(args.getOrNull(2), 0f), toJsFloat(args.getOrNull(3), 0f)))
+                null
+            }
+            "unloadScene" -> { val s = toJsStr(args.getOrNull(1), ""); if (s.isNotEmpty()) pendingUnloadScenes.add(normalizeSceneName(s)); null }
+            "clearSceneCache" -> { preloadedSceneCache.clear(); null }
+            "getStats" -> JSONObject().apply {
+                put("vm", "QuickJS")
+                put("fps", smoothedFps.toDouble()); put("drawCalls", lastFrameDrawCalls); put("culled", lastFrameCulled)
+                put("nodes", nodes.size); put("lights", lastFrameLights); put("occluders", lightingSystem.activeOccluderCount)
+                put("cloths", rigSystem.activeClothCount); put("iks", rigSystem.activeIkCount); put("skinnedMeshes", meshSystem.activeMeshCount)
+                put("gi", giSystem.isReady); put("sdfShadow", lightingSystem.sdfShadowEnabled); put("spatialCells", physicsSystem.spatialCellsCount)
+                put("atlases", atlasCache.size); put("flags", dataStore.worldFlags.size); put("lang", dataStore.currentLang)
+                put("fbo", postFxEnabled && fboReady); put("touches", inputSystem.getTouchCount()); put("textures", textureCache.size)
+            }.toString()
+            "loadScene" -> { val s = toJsStr(args.getOrNull(1), ""); if (s.isNotEmpty()) pendingSceneLoad = normalizeSceneName(s); null }
+            "saveDisk" -> dataStore.saveDiskSlotJson(toJsStr(args.getOrNull(1), "slot_1"), toJsStr(args.getOrNull(2), "{}"))
+            "loadDisk" -> dataStore.loadDiskSlotJson(toJsStr(args.getOrNull(1), "slot_1"))
+            "deleteDisk" -> dataStore.deleteDiskSlot(toJsStr(args.getOrNull(1), "slot_1"))
+            "raycast" -> {
+                val r = physicsSystem.raycast(
+                    toJsFloat(args.getOrNull(1), 0f), toJsFloat(args.getOrNull(2), 0f),
+                    toJsFloat(args.getOrNull(3), 0f), toJsFloat(args.getOrNull(4), 0f),
+                    toJsStr(args.getOrNull(5), ""), toJsInt(args.getOrNull(6), 0xFFFF)
+                ) { getGlobalTransform(it) }
+                JSONObject().apply {
+                    put("hit", r.hit); put("x", r.x.toDouble()); put("y", r.y.toDouble()); put("distance", r.distance.toDouble())
+                    put("nodeId", r.node?.nodeId ?: -1)
+                }.toString()
+            }
+            "hitstop" -> { hitstopTimer = max(hitstopTimer, toJsFloat(args.getOrNull(1), 0.05f).coerceIn(0f, 0.5f)); null }
+            "setTimeScale" -> { timeScale = toJsFloat(args.getOrNull(1), 1f).coerceIn(0.05f, 4f); null }
+            "setCameraMode" -> { camMode = toJsStr(args.getOrNull(1), "2.5D"); null }
+            "setCameraTilt" -> {
+                camPitch = toJsFloat(args.getOrNull(1), camPitch); camDistance = toJsFloat(args.getOrNull(2), camDistance); camFov = toJsFloat(args.getOrNull(3), camFov); null
+            }
+            "setCameraTarget" -> { camTarget = nodeById[toJsInt(args.getOrNull(1), -1)]; null }
+            "setCameraDeadzone" -> { camDeadzoneX = toJsFloat(args.getOrNull(1), 0f); camDeadzoneY = toJsFloat(args.getOrNull(2), 0f); null }
+            "setCameraLookAhead" -> { camLookAheadX = toJsFloat(args.getOrNull(1), 0f); camLookAheadY = toJsFloat(args.getOrNull(2), 0f); null }
+            "setCameraBounds" -> {
+                camBoundsEnabled = true; camMinX = toJsFloat(args.getOrNull(1), -99999f); camMinY = toJsFloat(args.getOrNull(2), -99999f)
+                camMaxX = toJsFloat(args.getOrNull(3), 99999f); camMaxY = toJsFloat(args.getOrNull(4), 99999f); null
+            }
+            "clearCameraBounds" -> { camBoundsEnabled = false; null }
+            "getCamera" -> JSONObject().apply { put("x", camX.toDouble()); put("y", camY.toDouble()); put("pitch", camPitch.toDouble()); put("mode", camMode) }.toString()
+            "setAmbientLight" -> { ambientR = toJsFloat(args.getOrNull(1), 0.52f); ambientG = toJsFloat(args.getOrNull(2), 0.56f); ambientB = toJsFloat(args.getOrNull(3), 0.68f); null }
+            "shake" -> { shakeIntensity = toJsFloat(args.getOrNull(1), 12f); shakeTimer = toJsFloat(args.getOrNull(2), 0.15f); null }
+            "tween" -> {
+                val n = nodeById[toJsInt(args.getOrNull(1), -1)] ?: return null
+                val p = toJsStr(args.getOrNull(2), ""); val tv = (args.getOrNull(3) as? Number)?.toFloat() ?: return null
+                activeTweens.removeAll { it.node === n && it.prop == p }
+                activeTweens.add(TweenTask(n, p, readTweenProperty(n, p), tv, toJsFloat(args.getOrNull(4), 0.25f), toJsStr(args.getOrNull(5), "easeOut"))); null
+            }
+            "playTone" -> { audioSystem.playToneAsync(toJsInt(args.getOrNull(1), 440), toJsInt(args.getOrNull(2), 80)); null }
+            "playBGM" -> { val f = toJsStr(args.getOrNull(1), ""); if (f.isNotEmpty()) audioSystem.playBGM(f, toJsBool(args.getOrNull(2), true), toJsFloat(args.getOrNull(3), 0.8f)); null }
+            "crossfadeBGM" -> { val f = toJsStr(args.getOrNull(1), ""); if (f.isNotEmpty()) audioSystem.crossfadeBGM(f, toJsFloat(args.getOrNull(2), 1.2f), toJsBool(args.getOrNull(3), true), toJsFloat(args.getOrNull(4), 0.8f)); null }
+            "stopBGM" -> { audioSystem.stopBGM(toJsFloat(args.getOrNull(1), 0f)); null }
+            "playSFX" -> { val f = toJsStr(args.getOrNull(1), ""); val pMin = toJsFloat(args.getOrNull(3), 1.0f); if (f.isNotEmpty()) audioSystem.playSFX(f, toJsFloat(args.getOrNull(2), 1.0f), pMin, toJsFloat(args.getOrNull(4), pMin)); null }
+            "setVolume" -> { audioSystem.setVolume(toJsStr(args.getOrNull(1), "master"), toJsFloat(args.getOrNull(2), 1.0f)); null }
+            "getVolume" -> audioSystem.getVolume(toJsStr(args.getOrNull(1), "master")).toDouble()
+            "moveAndSlide" -> {
+                val n = nodeById[toJsInt(args.getOrNull(1), -1)] ?: return null
+                physicsSystem.moveAndSlide(n, toJsFloat(args.getOrNull(2), 0.016f), pendingRemove, { getGlobalTransform(it) }) { nd, fn, other -> callNodeEvent(nd, fn, other) }; null
+            }
+            "distance" -> {
+                val a = nodeById[toJsInt(args.getOrNull(1), -1)]; val b = nodeById[toJsInt(args.getOrNull(2), -1)]
+                if (a != null && b != null) { val ga = getGlobalTransform(a); val gb = getGlobalTransform(b); hypot(ga.gx - gb.gx, ga.gy - gb.gy).toDouble() } else 999999.0
+            }
+            "angleTo" -> {
+                val a = nodeById[toJsInt(args.getOrNull(1), -1)]; val b = nodeById[toJsInt(args.getOrNull(2), -1)]
+                if (a != null && b != null) { val ga = getGlobalTransform(a); val gb = getGlobalTransform(b); Math.toDegrees(atan2((gb.gy - ga.gy).toDouble(), (gb.gx - ga.gx).toDouble())) } else 0.0
+            }
+            "spawn" -> {
+                val cfg = try { JSONObject(toJsStr(args.getOrNull(1), "{}")) } catch (_: Exception) { return -1 }
+                val rawLayer = cfg.optString("layer", "World")
+                val sp = GameNode(
+                    name = cfg.optString("name", "Spawn_${System.nanoTime() % 10000}"), nodeType = cfg.optString("nodeType", "Sprite2D"),
+                    layer = if (rawLayer.startsWith("UI", ignoreCase = true)) "UI" else "World", parent = toJsStr(args.getOrNull(2), ""),
+                    tag = cfg.optString("tag", "default"), persistent = cfg.optBoolean("persistent", false),
+                    x = cfg.optDouble("x", 0.0).toFloat(), y = cfg.optDouble("y", 0.0).toFloat(), z = cfg.optDouble("z", 0.0).toFloat(),
+                    width = cfg.optDouble("width", 64.0).toFloat(), height = cfg.optDouble("height", 64.0).toFloat(),
+                    tiltX = cfg.optDouble("tiltX", 0.0).toFloat(), billboard = cfg.optBoolean("billboard", false), zIndex = cfg.optInt("zIndex", 0),
+                    texture = cfg.optString("texture", ""), atlas = cfg.optString("atlas", ""), atlasFrame = cfg.optString("atlasFrame", ""),
+                    normalMap = cfg.optString("normalMap", ""), normalStrength = cfg.optDouble("normalStrength", 1.0).toFloat(), specular = cfg.optDouble("specular", 0.25).toFloat(),
+                    text = cfg.optString("text", ""), fontSize = cfg.optDouble("fontSize", 44.0).toFloat(),
+                    r = cfg.optDouble("r", 1.0).toFloat(), g = cfg.optDouble("g", 1.0).toFloat(), b = cfg.optDouble("b", 1.0).toFloat(), a = cfg.optDouble("a", 1.0).toFloat(),
+                    sliceLeft = cfg.optDouble("sliceLeft", 0.0).toFloat(), sliceRight = cfg.optDouble("sliceRight", 0.0).toFloat(),
+                    sliceTop = cfg.optDouble("sliceTop", 0.0).toFloat(), sliceBottom = cfg.optDouble("sliceBottom", 0.0).toFloat(),
+                    clipChildren = cfg.optBoolean("clipChildren", false), clipX = cfg.optDouble("clipX", 0.0).toFloat(),
+                    clipY = cfg.optDouble("clipY", 0.0).toFloat(), clipW = cfg.optDouble("clipW", 0.0).toFloat(), clipH = cfg.optDouble("clipH", 0.0).toFloat(),
+                    collider = cfg.optBoolean("collider", false), isTrigger = cfg.optBoolean("isTrigger", false), oneWay = cfg.optBoolean("oneWay", false),
+                    slopeType = cfg.optString("slopeType", "none"), colOffsetX = cfg.optDouble("colOffsetX", 0.0).toFloat(), colOffsetY = cfg.optDouble("colOffsetY", 0.0).toFloat(),
+                    colWidth = cfg.optDouble("colWidth", 0.0).toFloat(), colHeight = cfg.optDouble("colHeight", 0.0).toFloat(),
+                    colLayer = cfg.optInt("colLayer", 1), colMask = cfg.optInt("colMask", 0xFFFF), bodyMode = cfg.optString("bodyMode", "kinematic"),
+                    isHitbox = cfg.optBoolean("isHitbox", false), isHurtbox = cfg.optBoolean("isHurtbox", false), damage = cfg.optDouble("damage", 10.0).toFloat(),
+                    shadowCaster = cfg.optBoolean("shadowCaster", false), lightRadius = cfg.optDouble("lightRadius", 400.0).toFloat(), lightIntensity = cfg.optDouble("lightIntensity", 1.5).toFloat(),
+                    script = dataStore.resolveNodeScriptText(cfg.optString("script", ""), cfg.optString("scriptFile", ""))
+                )
+                pendingAdd.add(sp); nodeById[sp.nodeId] = sp; bindNodeScript(sp); sp.nodeId
+            }
+            "instantiate" -> {
+                val sName = toJsStr(args.getOrNull(1), "")
+                val txt = readSceneText(sName) ?: return -1
+                val loaded = mutableListOf<GameNode>(); parseSceneJson(txt, loaded, normalizeSceneName(sName), false)
+                val sx = toJsFloat(args.getOrNull(2), 0f); val sy = toJsFloat(args.getOrNull(3), 0f); val sz = toJsFloat(args.getOrNull(4), 0f)
+                loaded.forEach { if (it.parent.isEmpty()) { it.x += sx; it.y += sy; it.z += sz }; pendingAdd.add(it); nodeById[it.nodeId] = it; bindNodeScript(it) }
+                loaded.firstOrNull()?.nodeId ?: -1
+            }
+            "destroy" -> { nodeById[toJsInt(args.getOrNull(1), -1)]?.let { pendingRemove.add(it) }; null }
+            "findNode" -> nodes.find { it.name == toJsStr(args.getOrNull(1), "") && !pendingRemove.contains(it) }?.nodeId ?: -1
+            "findNodesByTag" -> {
+                val tg = toJsStr(args.getOrNull(1), "")
+                JSONArray(nodes.filter { it.tag == tg && !pendingRemove.contains(it) }.map { it.nodeId }).toString()
+            }
+            else -> null
+        }
+    }
+
+    private fun initQuickJsVM() {
+        destroyQuickJsVM()
+        if (!qjsLibInited) {
+            try { QuickJSLoader.init(); qjsLibInited = true } catch (e: Throwable) { onConsoleLog("[QuickJS 加载失败] ${e.message}") }
+        }
+        val ctx = QuickJSContext.create()
+        qjs = ctx
+        dataStore.clearRuntimeCaches(); atlasCache.clear()
+
+        val g = ctx.getGlobalObject()
+        g.setProperty("__zLog", JSCallFunction { args -> onConsoleLog(toJsStr(args.getOrNull(0), "")); null })
+        g.setProperty("__zReadScript", JSCallFunction { args -> dataStore.readScriptModuleText(toJsStr(args.getOrNull(0), ""))?.let { JSONArray().put(it.first).put(it.second).toString() } })
+        g.setProperty("__zNodeGet", JSCallFunction { args -> nodeById[toJsInt(args.getOrNull(0), -1)]?.let { getNodeProp(it, toJsStr(args.getOrNull(1), "")) } })
+        g.setProperty("__zNodeSet", JSCallFunction { args -> nodeById[toJsInt(args.getOrNull(0), -1)]?.let { setNodeProp(it, toJsStr(args.getOrNull(1), ""), args.getOrNull(2)) }; null })
+        g.setProperty("__zNodeCall", JSCallFunction { args -> nodeById[toJsInt(args.getOrNull(0), -1)]?.let { invokeNodeMethod(it, toJsStr(args.getOrNull(1), ""), args) } })
+        g.setProperty("__zEngineCall", JSCallFunction { args -> invokeEngineMethod(toJsStr(args.getOrNull(0), ""), args) })
+        g.setProperty("__zInputGet", JSCallFunction { args ->
+            when (toJsStr(args.getOrNull(0), "")) {
+                "isTouching" -> isTouching || inputSystem.getTouchCount() > 0
+                "touchCount" -> inputSystem.getTouchCount()
+                "screenX", "touchX" -> touchScreenX.toDouble()
+                "screenY", "touchY" -> touchScreenY.toDouble()
+                "worldX" -> touchWorldX.toDouble()
+                "worldY" -> touchWorldY.toDouble()
+                else -> null
+            }
+        })
+        g.setProperty("__zInputCall", JSCallFunction { args ->
+            when (toJsStr(args.getOrNull(0), "")) {
+                "isActionPressed" -> inputSystem.isActionPressed(toJsStr(args.getOrNull(1), ""))
+                "isActionJustPressed" -> inputSystem.isActionJustPressed(toJsStr(args.getOrNull(1), ""))
+                "isActionJustReleased" -> inputSystem.isActionJustReleased(toJsStr(args.getOrNull(1), ""))
+                "getAxis" -> inputSystem.getAxis(toJsStr(args.getOrNull(1), "move_left"), toJsStr(args.getOrNull(2), "move_right")).toDouble()
+                "bindAction" -> {
+                    val act = toJsStr(args.getOrNull(1), ""); val list = parseJsonStringList(toJsStr(args.getOrNull(2), "[]"))
+                    if (act.isNotEmpty() && list.isNotEmpty()) inputSystem.bindAction(act, list); null
+                }
+                "setVirtualAction" -> { val act = toJsStr(args.getOrNull(1), ""); if (act.isNotEmpty()) inputSystem.setVirtualAction(act, toJsBool(args.getOrNull(2), false)); null }
+                "bindTouchZone" -> {
+                    val act = toJsStr(args.getOrNull(1), "")
+                    if (act.isNotEmpty()) inputSystem.bindTouchZone(act, toJsFloat(args.getOrNull(2), 0f), toJsFloat(args.getOrNull(3), 0f), toJsFloat(args.getOrNull(4), 160f), toJsFloat(args.getOrNull(5), 160f)); null
+                }
+                "clearTouchZones" -> { inputSystem.clearTouchZones(); null }
+                else -> null
+            }
+        })
+
+        ctx.evaluate(ZERO_QJS_BOOTSTRAP, "zero_bootstrap.js")
+        fnBindNode = g.getJSFunction("__zBindNode")
+        fnDestroyNode = g.getJSFunction("__zDestroyNode")
+        fnCallHook = g.getJSFunction("__zCallHook")
+        fnDispatchTouch = g.getJSFunction("__zDispatchTouch")
+        onConsoleLog("[VM] QuickJS ES6+ 高性能脚本引擎已启动")
     }
 
     private fun bindNodeScript(n: GameNode) {
-        val nodeScope = rhino.newObject(globalScope).apply { prototype = globalScope }
-        val selfObj = GameNodeJsProxy(n).apply { parentScope = nodeScope; prototype = nodeScope }
-        n.jsObj = selfObj
-
-        ScriptableObject.putProperty(selfObj, "createSkinnedMesh", jsFunc { args ->
-            val uv = resolveNodeUvRect(n)
-            meshSystem.createGridMesh(n, (args.getOrNull(0) as? Number)?.toInt() ?: 8, (args.getOrNull(1) as? Number)?.toInt() ?: 12, uv[0], uv[1], uv[2], uv[3]) { getGlobalTransform(it) }
-            true
-        })
-        ScriptableObject.putProperty(selfObj, "bindBones", jsFunc { args ->
-            val boneList = extractStringList(args.getOrNull(0))
-            val smooth = (args.getOrNull(1) as? Number)?.toFloat() ?: 2.2f
-            meshSystem.bindBones(n.name, boneList, nodes, smooth) { getGlobalTransform(it) }
-        })
-        ScriptableObject.putProperty(selfObj, "setMeshWave", jsFunc { args ->
-            meshSystem.setMeshWave(n.name, (args.getOrNull(0) as? Number)?.toFloat() ?: 0f, (args.getOrNull(1) as? Number)?.toFloat() ?: 0f, (args.getOrNull(2) as? Number)?.toFloat() ?: 6f, (args.getOrNull(3) as? Number)?.toFloat() ?: 4f); null
-        })
-        ScriptableObject.putProperty(selfObj, "removeSkinnedMesh", jsFunc { meshSystem.removeMesh(n.name); null })
-
-        ScriptableObject.putProperty(selfObj, "attachCloth", jsFunc { args ->
-            val cfg = (args.getOrNull(0) as? Scriptable) ?: rhino.newObject(globalScope)
-            createClothFromJsConfig(cfg, n.name)
-        })
-        ScriptableObject.putProperty(selfObj, "setNormalMap", jsFunc { args ->
-            n.normalMap = RhinoContext.toString(args.getOrNull(0) ?: "")
-            (args.getOrNull(1) as? Number)?.toFloat()?.let { n.normalStrength = it }
-            (args.getOrNull(2) as? Number)?.toFloat()?.let { n.specular = it }
-            null
-        })
-        ScriptableObject.putProperty(selfObj, "setAnimFloat", jsFunc { args -> n.animator.fsm.setFloat(RhinoContext.toString(args.getOrNull(0) ?: ""), (args.getOrNull(1) as? Number)?.toFloat() ?: 0f); null })
-        ScriptableObject.putProperty(selfObj, "setAnimBool", jsFunc { args -> n.animator.fsm.setBool(RhinoContext.toString(args.getOrNull(0) ?: ""), (args.getOrNull(1) as? Boolean) ?: false); null })
-        ScriptableObject.putProperty(selfObj, "triggerAnim", jsFunc { args -> n.animator.fsm.setTrigger(RhinoContext.toString(args.getOrNull(0) ?: "")); null })
-        ScriptableObject.putProperty(selfObj, "setAnimSpeed", jsFunc { args -> n.animator.speedScale = ((args.getOrNull(0) as? Number)?.toFloat() ?: 1f).coerceIn(0.05f, 8f); null })
-        ScriptableObject.putProperty(selfObj, "getAnimState", jsFunc { n.animator.fsm.currentState.ifEmpty { n.currentClipName } })
-        ScriptableObject.putProperty(selfObj, "isAnimCancelable", jsFunc { n.animator.activeFrame?.cancelable == true })
-        ScriptableObject.putProperty(selfObj, "addAnimTransition", jsFunc { args -> val to = RhinoContext.toString(args.getOrNull(1) ?: ""); val param = RhinoContext.toString(args.getOrNull(2) ?: ""); if (to.isNotEmpty()) n.animator.fsm.addTransition(StateTransition(RhinoContext.toString(args.getOrNull(0) ?: "*"), to, (args.getOrNull(5) as? Number)?.toInt() ?: 0, (args.getOrNull(6) as? Boolean) ?: false, (args.getOrNull(7) as? Boolean) ?: false, if (param.isNotEmpty()) listOf(StateCondition(param, RhinoContext.toString(args.getOrNull(3) ?: "trigger"), args.getOrNull(4))) else emptyList())); null })
-        ScriptableObject.putProperty(selfObj, "registerProClip", jsFunc { args -> val raw = args.getOrNull(0) ?: return@jsFunc false; val s = if (raw is String) raw else RhinoContext.toString(NativeJSON.stringify(rhino, globalScope, raw, null, null)); try { ZeroAnimator.parseInto(n.animator, JSONObject().put("proClips", JSONArray().put(JSONObject(s)))); true } catch (e: Exception) { onConsoleLog("[ANIM 错误 @ ${n.name}] ${e.message}"); false } })
-        ScriptableObject.putProperty(selfObj, "setAtlas", jsFunc { args -> n.atlas = RhinoContext.toString(args.getOrNull(0) ?: n.atlas); n.atlasFrame = RhinoContext.toString(args.getOrNull(1) ?: ""); queryAtlas(n.atlas); null })
-        ScriptableObject.putProperty(selfObj, "setNineSlice", jsFunc { args -> n.sliceLeft = (args.getOrNull(0) as? Number)?.toFloat() ?: 0f; n.sliceRight = (args.getOrNull(1) as? Number)?.toFloat() ?: n.sliceLeft; n.sliceTop = (args.getOrNull(2) as? Number)?.toFloat() ?: n.sliceLeft; n.sliceBottom = (args.getOrNull(3) as? Number)?.toFloat() ?: n.sliceTop; null })
-        ScriptableObject.putProperty(selfObj, "setClipRect", jsFunc { args -> n.clipX = (args.getOrNull(0) as? Number)?.toFloat() ?: 0f; n.clipY = (args.getOrNull(1) as? Number)?.toFloat() ?: 0f; n.clipW = (args.getOrNull(2) as? Number)?.toFloat() ?: 0f; n.clipH = (args.getOrNull(3) as? Number)?.toFloat() ?: 0f; null })
-        ScriptableObject.putProperty(selfObj, "jump", jsFunc { args -> val jf = (args.getOrNull(0) as? Number)?.toFloat() ?: 920f; if (n.isGrounded || n.coyoteTimer > 0f) { n.vy = -abs(jf); n.isGrounded = false; n.coyoteTimer = 0f; n.jumpCount = 1; true } else if (n.jumpCount < n.maxJumps) { n.vy = -abs(jf) * 0.9f; n.jumpCount++; true } else false })
-        ScriptableObject.putProperty(selfObj, "dropThrough", jsFunc { args -> n.dropThroughTimer = (args.getOrNull(0) as? Number)?.toFloat() ?: 0.22f; n.isGrounded = false; null })
-        ScriptableObject.putProperty(selfObj, "bounce", jsFunc { args -> (args.getOrNull(0) as? Number)?.toFloat()?.let { n.vx = it }; n.vy = (args.getOrNull(1) as? Number)?.toFloat() ?: -760f; n.isGrounded = false; n.jumpCount = 1; null })
-        ScriptableObject.putProperty(selfObj, "play", jsFunc { args -> val cn = RhinoContext.toString(args.getOrNull(0) ?: ""); val fr = (args.getOrNull(1) as? Boolean) ?: false; if (n.animator.play(cn, fr)) { n.currentClipName = cn; return@jsFunc null }; n.clips[cn]?.let { c -> if (!fr && n.animPlaying && n.currentClipName == cn) return@jsFunc null; n.currentClipName = cn; n.animStart = c.start; n.animEnd = c.end; n.animFps = c.fps; n.animLoop = c.loop; n.currentFrame = c.start; n.animTimer = 0f; n.animPlaying = true } ?: onConsoleLog("[ANIM 警告 @ ${n.name}] 未找到: $cn"); null })
-        ScriptableObject.putProperty(selfObj, "playAnim", jsFunc { args -> n.animator.stop(); n.currentClipName = ""; n.animStart = (args.getOrNull(0) as? Number)?.toInt() ?: 0; n.animEnd = (args.getOrNull(1) as? Number)?.toInt() ?: 0; n.animFps = (args.getOrNull(2) as? Number)?.toFloat() ?: 12f; n.animLoop = (args.getOrNull(3) as? Boolean) ?: true; n.currentFrame = n.animStart; n.animTimer = 0f; n.animPlaying = true; null })
-        ScriptableObject.putProperty(selfObj, "stopAnim", jsFunc { n.animator.stop(); n.animPlaying = false; n.currentClipName = ""; null })
-        ScriptableObject.putProperty(selfObj, "flash", jsFunc { args -> n.flashTimer = (args.getOrNull(0) as? Number)?.toFloat() ?: 0.12f; null })
-        ScriptableObject.putProperty(selfObj, "emitBurst", jsFunc { args -> val cnt = ((args.getOrNull(0) as? Number)?.toInt() ?: 24).coerceIn(1, 120); val gt = getGlobalTransform(n); repeat(cnt) { spawnSingleParticle(n, gt.gx, gt.gy) }; null })
-        ScriptableObject.putProperty(nodeScope, "self", selfObj)
-        if (n.script.isNotBlank()) try { rhino.evaluateString(nodeScope, n.script, n.name, 1, null) } catch (e: Exception) { onConsoleLog("[JS 编译错误 @ ${n.name}] ${e.message}") }
+        try {
+            fnBindNode?.call(n.nodeId, n.name, n.script)
+        } catch (e: Exception) {
+            onConsoleLog("[JS 编译错误 @ ${n.name}] ${e.message}")
+        }
     }
 
     private fun callLifecycle(n: GameNode, fnName: String, arg: Any? = null) {
-        val sc = n.jsObj?.prototype ?: return
-        (ScriptableObject.getProperty(sc, fnName) as? Function)?.let { try { it.call(rhino, sc, n.jsObj, if (arg != null) arrayOf(arg) else emptyArray()) } catch (e: Exception) { onConsoleLog("[JS 错误 @ ${n.name}.$fnName] ${e.message}") } }
+        try {
+            fnCallHook?.call(n.nodeId, fnName, "val", arg)
+        } catch (e: Exception) {
+            onConsoleLog("[JS 错误 @ ${n.name}.$fnName] ${e.message}")
+        }
+    }
+
+    private fun callNodeEvent(n: GameNode, fnName: String, other: GameNode) {
+        try {
+            fnCallHook?.call(n.nodeId, fnName, "node", other.nodeId)
+        } catch (e: Exception) {
+            onConsoleLog("[JS 错误 @ ${n.name}.$fnName] ${e.message}")
+        }
+    }
+
+    private fun callFrameEvent(n: GameNode, clipName: String, evName: String) {
+        try {
+            fnCallHook?.call(n.nodeId, "onFrameEvent", "two", clipName, evName)
+        } catch (e: Exception) {
+            onConsoleLog("[JS 错误 @ ${n.name}.onFrameEvent] ${e.message}")
+        }
+    }
+
+    private fun callHurtCallback(hurt: GameNode, attacker: GameNode, dmg: Float, kbX: Float, kbY: Float) {
+        try {
+            fnCallHook?.call(hurt.nodeId, "onHurt", "hurt", attacker.nodeId, dmg.toDouble(), kbX.toDouble(), kbY.toDouble())
+        } catch (e: Exception) {
+            onConsoleLog("[JS 运行错误 @ ${hurt.name}.onHurt] ${e.message}")
+        }
     }
 
     private fun getGlobalTransform(n: GameNode, visited: MutableSet<String> = mutableSetOf()): GlobalTransform {
@@ -1192,7 +1399,9 @@ class ZeroEngineView(
 
     private fun flushTouchEvents() {
         val list = synchronized(pendingTouchEvents) { val c = pendingTouchEvents.toList(); pendingTouchEvents.clear(); c }
-        list.forEach { (tp, sx, sy) -> val ev = rhino.newObject(globalScope).apply { ScriptableObject.putProperty(this, "type", tp); ScriptableObject.putProperty(this, "screenX", sx.toDouble()); ScriptableObject.putProperty(this, "screenY", sy.toDouble()); ScriptableObject.putProperty(this, "worldX", touchWorldX.toDouble()); ScriptableObject.putProperty(this, "worldY", touchWorldY.toDouble()) }; nodes.toList().forEach { callLifecycle(it, "onInput", ev) } }
+        list.forEach { (tp, sx, sy) ->
+            try { fnDispatchTouch?.call(tp, sx.toDouble(), sy.toDouble(), touchWorldX.toDouble(), touchWorldY.toDouble()) } catch (_: Exception) {}
+        }
     }
 
     private fun parseSceneJson(raw: String, outList: MutableList<GameNode>, groupName: String = "main", applyCamera: Boolean = true) {
@@ -1231,19 +1440,292 @@ class ZeroEngineView(
         Canvas(bmp).drawText(text, 12f, size, paint); val id = ZeroShaders.uploadBitmapToGL(bmp); bmp.recycle(); textTextureCache[key] = id; return id
     }
 
-    private fun jsFunc(block: (Array<out Any?>) -> Any?): org.mozilla.javascript.BaseFunction = object : org.mozilla.javascript.BaseFunction() {
-        override fun call(cx: RhinoContext?, scope: Scriptable?, thisObj: Scriptable?, args: Array<out Any?>): Any? = block(args)
-    }
     private fun toJsFloat(v: Any?, def: Float): Float = (v as? Number)?.toFloat() ?: def
     private fun toJsInt(v: Any?, def: Int): Int = (v as? Number)?.toInt() ?: def
-    private fun toJsStr(v: Any?, def: String): String = v?.takeIf { it !== Scriptable.NOT_FOUND }?.toString() ?: def
+    private fun toJsStr(v: Any?, def: String): String = v?.toString() ?: def
     private fun toJsBool(v: Any?, def: Boolean): Boolean = (v as? Boolean) ?: def
-    private fun getJsFloat(s: Scriptable, k: String, def: Float): Float = (ScriptableObject.getProperty(s, k) as? Number)?.toFloat() ?: def
-    private fun getJsInt(s: Scriptable, k: String, def: Int): Int = (ScriptableObject.getProperty(s, k) as? Number)?.toInt() ?: def
-    private fun getJsStr(s: Scriptable, k: String, def: String): String = ScriptableObject.getProperty(s, k)?.takeIf { it !== Scriptable.NOT_FOUND }?.toString() ?: def
-    private fun getJsBool(s: Scriptable, k: String, def: Boolean): Boolean = (ScriptableObject.getProperty(s, k) as? Boolean) ?: def
 
     companion object {
-        private val BRIDGED_PROPS = setOf("name", "tag", "sceneGroup", "persistent", "x", "y", "z", "vx", "vy", "vz", "width", "height", "rotation", "tiltX", "scaleX", "scaleY", "parallaxX", "parallaxY", "atlas", "atlasFrame", "normalMap", "normalStrength", "specular", "sliceLeft", "sliceRight", "sliceTop", "sliceBottom", "clipChildren", "clipX", "clipY", "clipW", "clipH", "slopeType", "colOffsetX", "colOffsetY", "colWidth", "colHeight", "colLayer", "colMask", "bodyMode", "gravity", "fallMultiplier", "maxJumps", "isGrounded", "isHitbox", "isHurtbox", "damage", "invulnTimer", "r", "g", "b", "a", "visible", "text", "currentClip", "lightRadius", "lightIntensity")
+        private val nextNodeId = AtomicInteger(0)
+        @Volatile private var qjsLibInited = false
+
+        private val ZERO_QJS_BOOTSTRAP = """
+            (function() {
+              const BRIDGED = new Set([
+                "name","tag","sceneGroup","persistent","x","y","z","vx","vy","vz","width","height","rotation",
+                "tiltX","scaleX","scaleY","parallaxX","parallaxY","atlas","atlasFrame","normalMap","normalStrength",
+                "specular","sliceLeft","sliceRight","sliceTop","sliceBottom","clipChildren","clipX","clipY","clipW",
+                "clipH","slopeType","colOffsetX","colOffsetY","colWidth","colHeight","colLayer","colMask","bodyMode",
+                "gravity","fallMultiplier","maxJumps","isGrounded","isHitbox","isHurtbox","damage","invulnTimer",
+                "r","g","b","a","visible","text","currentClip","lightRadius","lightIntensity"
+              ]);
+              const READONLY = new Set(["name","sceneGroup","isGrounded","currentClip"]);
+              const __zNodes = Object.create(null);
+              const __zHooks = Object.create(null);
+              const __zModules = Object.create(null);
+              const __zTables = Object.create(null);
+              const __zGlobals = Object.create(null);
+              const __zEvents = Object.create(null);
+
+              const nid = (n) => (n && typeof n === "object" && n.__zid) ? n.__zid : -1;
+              const arrJson = (v) => JSON.stringify(Array.isArray(v) ? v.map(String) : (v != null ? [String(v)] : []));
+              const fmtArgs = (a) => Array.from(a).map(x => (typeof x === "object" && x !== null) ? (() => { try { return JSON.stringify(x); } catch(_) { return String(x); } })() : String(x)).join(" ");
+
+              globalThis.console = {
+                log: (...a) => __zLog("[LOG] " + fmtArgs(a)),
+                warn: (...a) => __zLog("[WARN] " + fmtArgs(a)),
+                error: (...a) => __zLog("[ERR] " + fmtArgs(a))
+              };
+
+              const nodeProto = {
+                createSkinnedMesh(c, r) { return __zNodeCall(this.__zid, "createSkinnedMesh", c, r); },
+                bindBones(bones, smooth) { return __zNodeCall(this.__zid, "bindBones", arrJson(bones), smooth); },
+                setMeshWave(ax, ay, freq, spd) { return __zNodeCall(this.__zid, "setMeshWave", ax, ay, freq, spd); },
+                removeSkinnedMesh() { return __zNodeCall(this.__zid, "removeSkinnedMesh"); },
+                attachCloth(cfg) { return __zNodeCall(this.__zid, "attachCloth", JSON.stringify(cfg || {})); },
+                setNormalMap(p, s, sp) { return __zNodeCall(this.__zid, "setNormalMap", p, s, sp); },
+                setAnimFloat(k, v) { return __zNodeCall(this.__zid, "setAnimFloat", k, v); },
+                setAnimBool(k, v) { return __zNodeCall(this.__zid, "setAnimBool", k, v); },
+                triggerAnim(k) { return __zNodeCall(this.__zid, "triggerAnim", k); },
+                setAnimSpeed(s) { return __zNodeCall(this.__zid, "setAnimSpeed", s); },
+                getAnimState() { return __zNodeCall(this.__zid, "getAnimState"); },
+                isAnimCancelable() { return __zNodeCall(this.__zid, "isAnimCancelable"); },
+                addAnimTransition(a,b,c,d,e,f,g,h) { return __zNodeCall(this.__zid, "addAnimTransition", a,b,c,d,e,f,g,h); },
+                registerProClip(clip) { return __zNodeCall(this.__zid, "registerProClip", typeof clip === "string" ? clip : JSON.stringify(clip || {})); },
+                setAtlas(a, f) { return __zNodeCall(this.__zid, "setAtlas", a, f); },
+                setNineSlice(l, r, t, b) { return __zNodeCall(this.__zid, "setNineSlice", l, r, t, b); },
+                setClipRect(x, y, w, h) { return __zNodeCall(this.__zid, "setClipRect", x, y, w, h); },
+                jump(f) { return __zNodeCall(this.__zid, "jump", f); },
+                dropThrough(d) { return __zNodeCall(this.__zid, "dropThrough", d); },
+                bounce(vx, vy) { return __zNodeCall(this.__zid, "bounce", vx, vy); },
+                play(c, f) { return __zNodeCall(this.__zid, "play", c, f); },
+                playAnim(s, e, fps, loop) { return __zNodeCall(this.__zid, "playAnim", s, e, fps, loop); },
+                stopAnim() { return __zNodeCall(this.__zid, "stopAnim"); },
+                flash(d) { return __zNodeCall(this.__zid, "flash", d); },
+                emitBurst(c) { return __zNodeCall(this.__zid, "emitBurst", c); }
+              };
+
+              function createNodeProxy(id) {
+                if (__zNodes[id]) return __zNodes[id];
+                const raw = Object.create(nodeProto);
+                raw.__zid = id;
+                const proxy = new Proxy(raw, {
+                  get(target, prop, receiver) {
+                    if (typeof prop === "string" && BRIDGED.has(prop)) return __zNodeGet(id, prop);
+                    return Reflect.get(target, prop, receiver);
+                  },
+                  set(target, prop, value, receiver) {
+                    if (typeof prop === "string" && BRIDGED.has(prop)) {
+                      if (!READONLY.has(prop)) __zNodeSet(id, prop, value);
+                      return true;
+                    }
+                    return Reflect.set(target, prop, value, receiver);
+                  },
+                  has(target, prop) {
+                    return (typeof prop === "string" && BRIDGED.has(prop)) || Reflect.has(target, prop);
+                  }
+                });
+                __zNodes[id] = proxy;
+                return proxy;
+              }
+
+              globalThis.require = function(rawPath) {
+                const resJson = __zReadScript(String(rawPath || ""));
+                if (!resJson) return null;
+                const pair = JSON.parse(resJson);
+                const normPath = pair[0], code = pair[1];
+                if (Object.prototype.hasOwnProperty.call(__zModules, normPath)) return __zModules[normPath];
+                const mod = { exports: {} };
+                __zModules[normPath] = mod.exports;
+                try {
+                  const fn = new Function("module", "exports", "require", code);
+                  fn(mod, mod.exports, globalThis.require);
+                  __zModules[normPath] = mod.exports;
+                  return mod.exports;
+                } catch (e) {
+                  delete __zModules[normPath];
+                  __zLog("[MODULE 错误 @ " + normPath + "] " + (e && e.message ? e.message : e));
+                  return null;
+                }
+              };
+
+              globalThis.Engine = {
+                log: (...a) => __zLog("[LOG] " + fmtArgs(a)),
+                unloadUnusedTextures: () => __zEngineCall("unloadUnusedTextures"),
+                clearModuleCache: () => { for (const k in __zModules) delete __zModules[k]; },
+                setSdfShadow: (e, s, m) => __zEngineCall("setSdfShadow", e, s, m),
+                setGI: (cfg) => __zEngineCall("setGI", typeof cfg === "boolean" ? String(cfg) : JSON.stringify(cfg || {})),
+                createCloth: (cfg) => __zEngineCall("createCloth", JSON.stringify(cfg || {})),
+                removeCloth: (id) => __zEngineCall("removeCloth", id),
+                setGlobalWind: (wx, wy) => __zEngineCall("setGlobalWind", wx, wy),
+                solveIK: (a,b,c,d,e,f,g) => __zEngineCall("solveIK", a,b,c,d,e,f,g),
+                registerIK: (a,b,c,d,e,f) => __zEngineCall("registerIK", a,b,c,d,e,f),
+                setIKTarget: (a,b,c,d) => __zEngineCall("setIKTarget", a,b,c,d),
+                removeIK: (id) => __zEngineCall("removeIK", id),
+                createSkinnedMesh: (n, c, r) => __zEngineCall("createSkinnedMesh", n, c, r),
+                bindBones: (n, b, s) => __zEngineCall("bindBones", n, arrJson(b), s),
+                setMeshWave: (n, ax, ay, f, s) => __zEngineCall("setMeshWave", n, ax, ay, f, s),
+                removeSkinnedMesh: (n) => __zEngineCall("removeSkinnedMesh", n),
+                loadAtlas: (n) => { const s = __zEngineCall("loadAtlas", n); return s ? JSON.parse(s) : null; },
+                setFlag: (k, v) => __zEngineCall("setFlag", k, arguments.length >= 2 ? v : true),
+                getFlag: (k, def) => __zEngineCall("getFlag", k, def),
+                hasFlag: (k) => __zEngineCall("hasFlag", k),
+                clearFlag: (k) => __zEngineCall("clearFlag", k),
+                clearAllFlags: () => __zEngineCall("clearAllFlags"),
+                getAllFlags: () => JSON.parse(__zEngineCall("getAllFlags") || "{}"),
+                saveWorldFlags: (s) => __zEngineCall("saveWorldFlags", s),
+                loadWorldFlags: (s) => __zEngineCall("loadWorldFlags", s),
+                loadTable: (name) => {
+                  const key = String(name || "");
+                  if (Object.prototype.hasOwnProperty.call(__zTables, key)) return __zTables[key];
+                  const raw = __zEngineCall("readTable", key);
+                  if (!raw) return null;
+                  try { const p = JSON.parse(raw); __zTables[key] = p; return p; }
+                  catch (e) { __zLog("[DATA 解析错误 @ " + key + "] " + e.message); return null; }
+                },
+                reloadTables: () => { for (const k in __zTables) delete __zTables[k]; },
+                setLanguage: (l) => __zEngineCall("setLanguage", l),
+                getLanguage: () => __zEngineCall("getLanguage"),
+                setI18nDict: (l, obj) => __zEngineCall("setI18nDict", l, JSON.stringify(obj || {})),
+                t: (k, fb) => __zEngineCall("t", k, fb != null ? String(fb) : ""),
+                setDebugDraw: (e) => __zEngineCall("setDebugDraw", !!e),
+                isDebugDraw: () => __zEngineCall("isDebugDraw"),
+                setPostFX: (cfg) => __zEngineCall("setPostFX", JSON.stringify(cfg || {})),
+                setFade: (tg, d) => __zEngineCall("setFade", tg, d),
+                fadeToScene: (s, d) => __zEngineCall("fadeToScene", s, d),
+                preloadScene: (s) => __zEngineCall("preloadScene", s),
+                loadSceneAdditive: (s, ox, oy) => __zEngineCall("loadSceneAdditive", s, ox, oy),
+                unloadScene: (s) => __zEngineCall("unloadScene", s),
+                clearSceneCache: () => __zEngineCall("clearSceneCache"),
+                getStats: () => {
+                  const s = JSON.parse(__zEngineCall("getStats") || "{}");
+                  s.modules = Object.keys(__zModules).length;
+                  s.tables = Object.keys(__zTables).length;
+                  return s;
+                },
+                loadScene: (s) => __zEngineCall("loadScene", s),
+                setGlobal: (k, v) => { if (k) __zGlobals[String(k)] = v; },
+                getGlobal: (k, def) => Object.prototype.hasOwnProperty.call(__zGlobals, String(k)) ? __zGlobals[String(k)] : def,
+                saveDisk: (slot, data) => __zEngineCall("saveDisk", slot, typeof data === "string" ? data : JSON.stringify(data == null ? {} : data)),
+                loadDisk: (slot) => { const r = __zEngineCall("loadDisk", slot); return r ? JSON.parse(r) : null; },
+                deleteDisk: (slot) => __zEngineCall("deleteDisk", slot),
+                raycast: (x1, y1, x2, y2, tag, mask) => {
+                  const r = JSON.parse(__zEngineCall("raycast", x1, y1, x2, y2, tag || "", mask == null ? 0xFFFF : mask));
+                  return { hit: r.hit, x: r.x, y: r.y, distance: r.distance, node: r.nodeId > 0 ? (__zNodes[r.nodeId] || null) : null };
+                },
+                hitstop: (d) => __zEngineCall("hitstop", d),
+                setTimeScale: (s) => __zEngineCall("setTimeScale", s),
+                setCameraMode: (m) => __zEngineCall("setCameraMode", m),
+                setCameraTilt: (p, d, f) => __zEngineCall("setCameraTilt", p, d, f),
+                setCameraTarget: (n) => __zEngineCall("setCameraTarget", nid(n)),
+                setCameraDeadzone: (x, y) => __zEngineCall("setCameraDeadzone", x, y),
+                setCameraLookAhead: (x, y) => __zEngineCall("setCameraLookAhead", x, y),
+                setCameraBounds: (a,b,c,d) => __zEngineCall("setCameraBounds", a,b,c,d),
+                clearCameraBounds: () => __zEngineCall("clearCameraBounds"),
+                getCamera: () => JSON.parse(__zEngineCall("getCamera") || "{}"),
+                setAmbientLight: (r, g, b) => __zEngineCall("setAmbientLight", r, g, b),
+                shake: (i, d) => __zEngineCall("shake", i, d),
+                tween: (n, p, tv, d, e) => __zEngineCall("tween", nid(n), p, tv, d, e),
+                playTone: (f, d) => __zEngineCall("playTone", f, d),
+                playBGM: (f, l, v) => __zEngineCall("playBGM", f, l, v),
+                crossfadeBGM: (f, d, l, v) => __zEngineCall("crossfadeBGM", f, d, l, v),
+                stopBGM: (d) => __zEngineCall("stopBGM", d),
+                playSFX: (f, v, p1, p2) => __zEngineCall("playSFX", f, v, p1, p2),
+                setVolume: (c, v) => __zEngineCall("setVolume", c, v),
+                getVolume: (c) => __zEngineCall("getVolume", c),
+                moveAndSlide: (n, dt) => __zEngineCall("moveAndSlide", nid(n), dt),
+                distance: (a, b) => __zEngineCall("distance", nid(a), nid(b)),
+                angleTo: (a, b) => __zEngineCall("angleTo", nid(a), nid(b)),
+                spawn: (cfg, parent) => { const id = __zEngineCall("spawn", JSON.stringify(cfg || {}), parent || ""); return id > 0 ? createNodeProxy(id) : null; },
+                instantiate: (s, x, y, z) => { const id = __zEngineCall("instantiate", s, x, y, z); return id > 0 ? createNodeProxy(id) : null; },
+                destroy: (n) => __zEngineCall("destroy", nid(n)),
+                findNode: (name) => { const id = __zEngineCall("findNode", name); return id > 0 ? (__zNodes[id] || null) : null; },
+                findNodesByTag: (tag) => JSON.parse(__zEngineCall("findNodesByTag", tag) || "[]").map(id => __zNodes[id]).filter(Boolean),
+                on: (ev, fn) => { if (ev && typeof fn === "function") (__zEvents[ev] || (__zEvents[ev] = [])).push(fn); },
+                emit: (ev, data) => { const list = __zEvents[ev]; if (list) list.slice().forEach(fn => { try { fn(data); } catch(_) {} }); }
+              };
+
+              globalThis.Input = {
+                get isTouching() { return __zInputGet("isTouching"); },
+                get touchCount() { return __zInputGet("touchCount"); },
+                get screenX() { return __zInputGet("screenX"); },
+                get touchX() { return __zInputGet("touchX"); },
+                get screenY() { return __zInputGet("screenY"); },
+                get touchY() { return __zInputGet("touchY"); },
+                get worldX() { return __zInputGet("worldX"); },
+                get worldY() { return __zInputGet("worldY"); },
+                isActionPressed: (a) => __zInputCall("isActionPressed", a),
+                isActionJustPressed: (a) => __zInputCall("isActionJustPressed", a),
+                isActionJustReleased: (a) => __zInputCall("isActionJustReleased", a),
+                getAxis: (a, b) => __zInputCall("getAxis", a, b),
+                bindAction: (a, keys) => __zInputCall("bindAction", a, arrJson(keys)),
+                setVirtualAction: (a, v) => __zInputCall("setVirtualAction", a, !!v),
+                bindTouchZone: (a, x, y, w, h) => __zInputCall("bindTouchZone", a, x, y, w, h),
+                clearTouchZones: () => __zInputCall("clearTouchZones")
+              };
+
+              globalThis.__zBindNode = function(id, name, code) {
+                const self = createNodeProxy(id);
+                const hooks = {};
+                if (code && code.trim().length > 0) {
+                  try {
+                    const wrapped = code + "\n;return {" +
+                      "onReady: typeof onReady === 'function' ? onReady : null," +
+                      "onProcess: typeof onProcess === 'function' ? onProcess : null," +
+                      "onCollision: typeof onCollision === 'function' ? onCollision : null," +
+                      "onTriggerEnter: typeof onTriggerEnter === 'function' ? onTriggerEnter : null," +
+                      "onHit: typeof onHit === 'function' ? onHit : null," +
+                      "onHurt: typeof onHurt === 'function' ? onHurt : null," +
+                      "onInput: typeof onInput === 'function' ? onInput : null," +
+                      "onAnimFinished: typeof onAnimFinished === 'function' ? onAnimFinished : null," +
+                      "onFrameEvent: typeof onFrameEvent === 'function' ? onFrameEvent : null" +
+                    "};";
+                    const factory = new Function("self", wrapped);
+                    const res = factory.call(self, self);
+                    if (res) { for (const k in res) if (res[k]) hooks[k] = res[k]; }
+                  } catch (e) {
+                    __zLog("[JS 编译错误 @ " + name + "] " + (e && e.message ? e.message : e));
+                  }
+                }
+                __zHooks[id] = hooks;
+              };
+
+              globalThis.__zDestroyNode = function(id) {
+                delete __zHooks[id];
+                delete __zNodes[id];
+              };
+
+              globalThis.__zCallHook = function(id, fnName, mode, a1, a2, a3, a4) {
+                const h = __zHooks[id];
+                if (!h) return;
+                const fn = h[fnName];
+                if (!fn) return;
+                const self = __zNodes[id];
+                try {
+                  if (mode === "node") fn.call(self, __zNodes[a1] || null);
+                  else if (mode === "hurt") fn.call(self, __zNodes[a1] || null, a2, a3, a4);
+                  else if (mode === "two") fn.call(self, a1, a2);
+                  else if (a1 !== undefined && a1 !== null) fn.call(self, a1);
+                  else fn.call(self);
+                } catch (e) {
+                  __zLog("[JS 错误 @ " + (self ? self.name : id) + "." + fnName + "] " + (e && e.message ? e.message : e));
+                }
+              };
+
+              globalThis.__zDispatchTouch = function(type, sx, sy, wx, wy) {
+                const ev = { type, screenX: sx, screenY: sy, worldX: wx, worldY: wy };
+                const ids = Object.keys(__zHooks);
+                for (let i = 0; i < ids.length; i++) {
+                  const id = ids[i], h = __zHooks[id];
+                  if (h && h.onInput) {
+                    const self = __zNodes[id];
+                    try { h.onInput.call(self, ev); } catch (e) {
+                      __zLog("[JS 错误 @ " + (self ? self.name : id) + ".onInput] " + (e && e.message ? e.message : e));
+                    }
+                  }
+                }
+              };
+            })();
+        """.trimIndent()
     }
 }

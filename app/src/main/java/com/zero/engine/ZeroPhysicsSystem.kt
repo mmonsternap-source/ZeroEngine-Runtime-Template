@@ -1,10 +1,6 @@
 package com.zero.engine
 
 import android.view.MotionEvent
-import org.mozilla.javascript.Context as RhinoContext
-import org.mozilla.javascript.Function
-import org.mozilla.javascript.Scriptable
-import org.mozilla.javascript.ScriptableObject
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -27,6 +23,14 @@ class ZeroPhysicsSystem(
         val y2: Float,
         val hit: Boolean,
         var ttl: Float = 0.16f
+    )
+
+    data class RaycastResult(
+        val hit: Boolean,
+        val x: Float,
+        val y: Float,
+        val distance: Float,
+        val node: ZeroEngineView.GameNode?
     )
 
     private val spatialCellSize = 256f
@@ -172,7 +176,7 @@ class ZeroPhysicsSystem(
         dt: Float,
         pendingRemove: Set<ZeroEngineView.GameNode>,
         getGlobalTransform: (ZeroEngineView.GameNode) -> ZeroEngineView.GlobalTransform,
-        callLifecycle: (ZeroEngineView.GameNode, String, Any?) -> Unit
+        onNodeEvent: (ZeroEngineView.GameNode, String, ZeroEngineView.GameNode) -> Unit
     ) {
         val collidedSolids = mutableSetOf<ZeroEngineView.GameNode>()
         if (n.bodyMode == "platformer" || n.bodyMode == "rigid") {
@@ -260,8 +264,8 @@ class ZeroPhysicsSystem(
 
         for (other in collidedSolids) {
             if (!pendingRemove.contains(n) && !pendingRemove.contains(other)) {
-                callLifecycle(n, "onCollision", other.jsObj)
-                callLifecycle(other, "onCollision", n.jsObj)
+                onNodeEvent(n, "onCollision", other)
+                onNodeEvent(other, "onCollision", n)
             }
         }
         if (n.collider) {
@@ -269,8 +273,8 @@ class ZeroPhysicsSystem(
                 if (other !== n && other.visible && other.collider && other.layer == n.layer && canCollideLayer(n, other)) {
                     if ((n.isTrigger || other.isTrigger) && checkOverlap(n, other, getGlobalTransform)) {
                         if (!pendingRemove.contains(n) && !pendingRemove.contains(other)) {
-                            callLifecycle(n, "onTriggerEnter", other.jsObj)
-                            callLifecycle(other, "onTriggerEnter", n.jsObj)
+                            onNodeEvent(n, "onTriggerEnter", other)
+                            onNodeEvent(other, "onTriggerEnter", n)
                         }
                     }
                 }
@@ -281,9 +285,9 @@ class ZeroPhysicsSystem(
     fun processCombatOverlaps(
         nodes: List<ZeroEngineView.GameNode>,
         pendingRemove: Set<ZeroEngineView.GameNode>,
-        rhino: RhinoContext,
         getGlobalTransform: (ZeroEngineView.GameNode) -> ZeroEngineView.GlobalTransform,
-        callLifecycle: (ZeroEngineView.GameNode, String, Any?) -> Unit,
+        onHit: (attacker: ZeroEngineView.GameNode, hurt: ZeroEngineView.GameNode) -> Unit,
+        onHurt: (hurt: ZeroEngineView.GameNode, attacker: ZeroEngineView.GameNode, dmg: Float, kbX: Float, kbY: Float) -> Unit,
         addHitstop: (Float) -> Unit
     ) {
         val hitboxes = nodes.filter { it.visible && it.isHitbox && !pendingRemove.contains(it) }
@@ -297,8 +301,8 @@ class ZeroPhysicsSystem(
                 if (hb.hitCooldownMap.containsKey(hurt.name)) continue
                 if (checkOverlap(hb, hurt, getGlobalTransform)) {
                     hb.hitCooldownMap[hurt.name] = 0.25f
-                    callLifecycle(hb, "onHit", hurt.jsObj)
-                    triggerHurtCallback(rhino, hb, hurt, hb.damage, 0f, 0f)
+                    onHit(hb, hurt)
+                    onHurt(hurt, hb, hb.damage, 0f, 0f)
                 }
             }
         }
@@ -336,38 +340,19 @@ class ZeroPhysicsSystem(
                         if (hurt.bodyMode != "kinematic" && (kbX != 0f || kbY != 0f)) {
                             hurt.vx = kbX; hurt.vy = kbY; hurt.isGrounded = false
                         }
-                        callLifecycle(attacker, "onHit", hurt.jsObj)
-                        triggerHurtCallback(rhino, attacker, hurt, box.damage, kbX, kbY)
+                        onHit(attacker, hurt)
+                        onHurt(hurt, attacker, box.damage, kbX, kbY)
                     }
                 }
             }
         }
     }
 
-    private fun triggerHurtCallback(
-        rhino: RhinoContext,
-        attacker: ZeroEngineView.GameNode,
-        hurt: ZeroEngineView.GameNode,
-        dmg: Float,
-        kbX: Float,
-        kbY: Float
-    ) {
-        val scope = hurt.jsObj?.prototype ?: return
-        val fn = ScriptableObject.getProperty(scope, "onHurt") as? Function ?: return
-        try {
-            fn.call(rhino, scope, hurt.jsObj, arrayOf(attacker.jsObj, dmg.toDouble(), kbX.toDouble(), kbY.toDouble()))
-        } catch (e: Exception) {
-            onConsoleLog("[JS 运行错误 @ ${hurt.name}.onHurt] ${e.message}")
-        }
-    }
-
     fun raycast(
-        rhino: RhinoContext,
-        globalScope: ScriptableObject,
         x1: Float, y1: Float, x2: Float, y2: Float,
         ignoreTag: String, mask: Int,
         getGlobalTransform: (ZeroEngineView.GameNode) -> ZeroEngineView.GlobalTransform
-    ): Scriptable {
+    ): RaycastResult {
         var closestT = 1.0f
         var hitNode: ZeroEngineView.GameNode? = null
         val dx = x2 - x1; val dy = y2 - y1
@@ -398,24 +383,14 @@ class ZeroPhysicsSystem(
             }
         }
 
-        val res = rhino.newObject(globalScope)
-        if (hitNode != null) {
+        return if (hitNode != null) {
             val hx = x1 + dx * closestT; val hy = y1 + dy * closestT
             if (debugDrawEnabled) debugRays.add(DebugRay(x1, y1, hx, hy, hit = true))
-            ScriptableObject.putProperty(res, "hit", true)
-            ScriptableObject.putProperty(res, "x", hx.toDouble())
-            ScriptableObject.putProperty(res, "y", hy.toDouble())
-            ScriptableObject.putProperty(res, "distance", hypot(hx - x1, hy - y1).toDouble())
-            ScriptableObject.putProperty(res, "node", hitNode.jsObj)
+            RaycastResult(true, hx, hy, hypot(hx - x1, hy - y1), hitNode)
         } else {
             if (debugDrawEnabled) debugRays.add(DebugRay(x1, y1, x2, y2, hit = false))
-            ScriptableObject.putProperty(res, "hit", false)
-            ScriptableObject.putProperty(res, "x", x2.toDouble())
-            ScriptableObject.putProperty(res, "y", y2.toDouble())
-            ScriptableObject.putProperty(res, "distance", hypot(dx, dy).toDouble())
-            ScriptableObject.putProperty(res, "node", null)
+            RaycastResult(false, x2, y2, hypot(dx, dy), null)
         }
-        return res
     }
 
     private fun intersectSegmentAABB(x1: Float, y1: Float, dx: Float, dy: Float, minX: Float, minY: Float, maxX: Float, maxY: Float): Float? {
