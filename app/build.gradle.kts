@@ -8,32 +8,16 @@ android {
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.zero.engine"
+        applicationId = "com.developer.myzerogame"
         minSdk = 21
         targetSdk = 34
         versionCode = 1
-        versionName = "0.1.0"
-    }
-
-    signingConfigs {
-        create("release") {
-            val keystoreFile = file("release.keystore")
-            if (keystoreFile.exists()) {
-                storeFile = keystoreFile
-                storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "zeroengine123"
-                keyAlias = System.getenv("KEY_ALIAS") ?: "zero"
-                keyPassword = System.getenv("KEY_PASSWORD") ?: "zeroengine123"
-            }
-        }
+        versionName = "1.0.0"
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
-            val keystoreFile = file("release.keystore")
-            if (keystoreFile.exists()) {
-                signingConfig = signingConfigs.getByName("release")
-            }
         }
     }
 
@@ -48,5 +32,6 @@ android {
 }
 
 dependencies {
-    implementation("org.mozilla:rhino:1.7.15")
+    // 高性能 QuickJS 引擎（ES6+ / 16KB 页大小对齐）
+    implementation("wang.harlon.quickjs:wrapper-android:3.2.3")
 }
