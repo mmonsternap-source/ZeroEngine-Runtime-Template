@@ -31,6 +31,22 @@ on:
         description: 'Screen Orientation (sensor / landscape / portrait)'
         required: true
         default: 'sensor'
+      admob_enabled:
+        description: 'Enable Google AdMob (true / false)'
+        required: false
+        default: 'false'
+      admob_app_id:
+        description: 'AdMob App ID'
+        required: false
+        default: ''
+      admob_interstitial_id:
+        description: 'AdMob Interstitial Ad Unit ID'
+        required: false
+        default: ''
+      admob_reward_id:
+        description: 'AdMob Rewarded Ad Unit ID'
+        required: false
+        default: ''
 
 jobs:
   build:
@@ -58,13 +74,17 @@ jobs:
             unzip -o game_bundle.zip -d app/src/main/assets/game
           fi
 
-      - name: Patch App Name, Package, Version, Icon & Orientation
+      - name: Patch App Name, Package, Version, Icon, Orientation & AdMob
         env:
           APP_NAME: ${{ github.event.inputs.app_name }}
           PKG_NAME: ${{ github.event.inputs.package_name }}
           VER_NAME: ${{ github.event.inputs.version_name }}
           VER_CODE: ${{ github.event.inputs.version_code }}
           SCREEN_ORI: ${{ github.event.inputs.screen_orientation }}
+          ADMOB_ON: ${{ github.event.inputs.admob_enabled }}
+          ADMOB_APP_ID: ${{ github.event.inputs.admob_app_id }}
+          ADMOB_INTER_ID: ${{ github.event.inputs.admob_interstitial_id }}
+          ADMOB_REWARD_ID: ${{ github.event.inputs.admob_reward_id }}
         run: |
           mkdir -p app/src/main/res/values
           cat > app/src/main/res/values/strings.xml <<EOF
@@ -79,7 +99,6 @@ jobs:
           sed -i -E "s/(versionCode[[:space:]]*=?[[:space:]]*)[0-9]+/\1${VER_CODE}/" "$GRADLE_FILE"
           sed -i -E "s/(versionName[[:space:]]*=?[[:space:]]*\")[^\"]+\"/\1${VER_NAME}\"/" "$GRADLE_FILE"
 
-          # 1. 替换自定义桌面图标（若工程包含 app_icon.png）
           HAS_CUSTOM_ICON="0"
           if [ -f "app/src/main/assets/game/app_icon.png" ]; then
             HAS_CUSTOM_ICON="1"
@@ -92,18 +111,121 @@ jobs:
             rm -f app/src/main/assets/game/app_icon.png
           fi
 
-          # 2. 写入横屏/竖屏锁定配置与图标属性到 AndroidManifest.xml
-          HAS_CUSTOM_ICON="$HAS_CUSTOM_ICON" python3 - <<'PY'
+          # 注入 AdMob 依赖与真机广告桥接（仅在启用时生效）
+          if [ "$ADMOB_ON" = "true" ]; then
+            APP_ID="${ADMOB_APP_ID:-ca-app-pub-3940256099942544~3347511713}"
+            INTER_ID="${ADMOB_INTER_ID:-ca-app-pub-3940256099942544/1033173712}"
+            REWARD_ID="${ADMOB_REWARD_ID:-ca-app-pub-3940256099942544/5224354917}"
+
+            if ! grep -q "play-services-ads" "$GRADLE_FILE"; then
+              sed -i 's/dependencies {/dependencies {\n    implementation("com.google.android.gms:play-services-ads:23.6.0")/' "$GRADLE_FILE"
+            fi
+
+            cat > app/src/main/java/com/zero/engine/ZeroAdBridge.kt <<KOTLIN
+          package com.zero.engine
+
+          import android.app.Activity
+          import android.content.Context
+          import com.google.android.gms.ads.AdError
+          import com.google.android.gms.ads.AdRequest
+          import com.google.android.gms.ads.FullScreenContentCallback
+          import com.google.android.gms.ads.LoadAdError
+          import com.google.android.gms.ads.MobileAds
+          import com.google.android.gms.ads.interstitial.InterstitialAd
+          import com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback
+          import com.google.android.gms.ads.rewarded.RewardedAd
+          import com.google.android.gms.ads.rewarded.RewardedAdLoadCallback
+
+          object ZeroAdBridge {
+              private const val INTER_ID = "${INTER_ID}"
+              private const val REWARD_ID = "${REWARD_ID}"
+              @Volatile private var interstitialAd: InterstitialAd? = null
+              @Volatile private var rewardedAd: RewardedAd? = null
+              private var logger: ((String) -> Unit)? = null
+              private var inited = false
+
+              fun init(context: Context, onLog: (String) -> Unit) {
+                  logger = onLog
+                  val act = context as? Activity ?: return
+                  if (inited) return
+                  inited = true
+                  act.runOnUiThread {
+                      MobileAds.initialize(act) {
+                          loadInterstitial(act)
+                          loadRewarded(act)
+                      }
+                  }
+              }
+
+              private fun loadInterstitial(act: Activity) {
+                  if (INTER_ID.isBlank()) return
+                  InterstitialAd.load(act, INTER_ID, AdRequest.Builder().build(), object : InterstitialAdLoadCallback() {
+                      override fun onAdLoaded(ad: InterstitialAd) { interstitialAd = ad }
+                      override fun onAdFailedToLoad(err: LoadAdError) { interstitialAd = null }
+                  })
+              }
+
+              private fun loadRewarded(act: Activity) {
+                  if (REWARD_ID.isBlank()) return
+                  RewardedAd.load(act, REWARD_ID, AdRequest.Builder().build(), object : RewardedAdLoadCallback() {
+                      override fun onAdLoaded(ad: RewardedAd) { rewardedAd = ad }
+                      override fun onAdFailedToLoad(err: LoadAdError) { rewardedAd = null }
+                  })
+              }
+
+              fun isReady(type: String): Boolean = when (type.lowercase()) {
+                  "interstitial", "inter" -> interstitialAd != null
+                  "rewarded", "reward" -> rewardedAd != null
+                  else -> false
+              }
+
+              fun showInterstitial(context: Context, onDone: (Boolean) -> Unit) {
+                  val act = context as? Activity ?: run { onDone(false); return }
+                  act.runOnUiThread {
+                      val ad = interstitialAd
+                      if (ad == null) {
+                          loadInterstitial(act)
+                          onDone(false)
+                          return@runOnUiThread
+                      }
+                      interstitialAd = null
+                      ad.fullScreenContentCallback = object : FullScreenContentCallback() {
+                          override fun onAdDismissedFullScreenContent() { loadInterstitial(act); onDone(true) }
+                          override fun onAdFailedToShowFullScreenContent(err: AdError) { loadInterstitial(act); onDone(false) }
+                      }
+                      ad.show(act)
+                  }
+              }
+
+              fun showRewarded(context: Context, onResult: (Boolean) -> Unit) {
+                  val act = context as? Activity ?: run { onResult(false); return }
+                  act.runOnUiThread {
+                      val ad = rewardedAd
+                      if (ad == null) {
+                          loadRewarded(act)
+                          onResult(false)
+                          return@runOnUiThread
+                      }
+                      rewardedAd = null
+                      var earned = false
+                      ad.fullScreenContentCallback = object : FullScreenContentCallback() {
+                          override fun onAdDismissedFullScreenContent() { loadRewarded(act); onResult(earned) }
+                          override fun onAdFailedToShowFullScreenContent(err: AdError) { loadRewarded(act); onResult(false) }
+                      }
+                      ad.show(act) { earned = true }
+                  }
+              }
+          }
+          KOTLIN
+          fi
+
+          HAS_CUSTOM_ICON="$HAS_CUSTOM_ICON" ADMOB_ON="$ADMOB_ON" ADMOB_APP_ID="${ADMOB_APP_ID:-ca-app-pub-3940256099942544~3347511713}" python3 - <<'PY'
           import os, re
           p = "app/src/main/AndroidManifest.xml"
           if os.path.exists(p):
               txt = open(p, encoding="utf-8").read()
               ori = os.environ.get("SCREEN_ORI", "sensor")
-              ori_map = {
-                  "portrait": "portrait",
-                  "landscape": "sensorLandscape",
-                  "sensor": "unspecified"
-              }
+              ori_map = {"portrait": "portrait", "landscape": "sensorLandscape", "sensor": "unspecified"}
               val = ori_map.get(ori, "unspecified")
 
               def patch_activity(m):
@@ -127,6 +249,16 @@ jobs:
                           tag = re.sub(r'android:roundIcon="[^"]*"', 'android:roundIcon="@mipmap/ic_launcher_round"', tag)
                       return tag
                   txt = re.sub(r'<application\b[^>]*>', patch_app, txt, count=1)
+
+              if os.environ.get("ADMOB_ON") == "true":
+                  app_id = os.environ.get("ADMOB_APP_ID")
+                  if "android.permission.INTERNET" not in txt:
+                      txt = txt.replace("<application", '<uses-permission android:name="android.permission.INTERNET" />\n    <application', 1)
+                  meta = f'        <meta-data android:name="com.google.android.gms.ads.APPLICATION_ID" android:value="{app_id}" />\n'
+                  if "com.google.android.gms.ads.APPLICATION_ID" in txt:
+                      txt = re.sub(r'<meta-data[^>]*com\.google\.android\.gms\.ads\.APPLICATION_ID[^>]*/>', meta.strip(), txt)
+                  else:
+                      txt = txt.replace("</application>", meta + "    </application>", 1)
 
               open(p, "w", encoding="utf-8").write(txt)
           PY
@@ -159,7 +291,7 @@ jobs:
             fi
             if [ "$FMT" = "aab" ] || [ "$FMT" = "both" ]; then
               $GRADLE_CMD bundleDebug
-              cp app/build/outputs/bundle/debug/*.aab dist_out/
+              cp app/build/outputs/bundle/release/*.aab dist_out/ 2>/dev/null || cp app/build/outputs/bundle/debug/*.aab dist_out/
             fi
           fi
 
