@@ -98,7 +98,6 @@ class ZeroEngineView(
     private val textureSizes = ConcurrentHashMap<String, Pair<Int, Int>>()
     private val identityMatrix = FloatArray(16).apply { Matrix.setIdentityM(this, 0) }
 
-    // 渲染期 O(1) 全局变换缓存（仅在 renderSceneFrame 期间启用，杜绝脏数据）
     private var useTransformCache = false
     private val renderTransformCache = HashMap<Int, GlobalTransform>(256)
 
@@ -175,12 +174,17 @@ class ZeroEngineView(
         val rt = Runtime.getRuntime()
         val usedMb = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024)
         val maxMb = rt.maxMemory() / (1024 * 1024)
+        val giLabel = when {
+            giSystem.isJfaReady -> "RC+JFA"
+            giSystem.isReady -> "ON"
+            else -> "OFF"
+        }
         return String.format(
             Locale.US,
             "FPS: %.1f | DC: %d | Inst: %d | 剔除: %d\n节点: %d | 光源: %d | 纹理: %d | 内存: %d/%dMB\nGL: ES3.0 | VM: QuickJS | GI: %s | 阴影: %s",
             smoothedFps, lastFrameDrawCalls, lastFrameInstances, lastFrameCulled,
             lastFrameNodes, lastFrameLights, lastFrameTextures, usedMb, maxMb,
-            if (giSystem.isReady) "ON" else "OFF",
+            giLabel,
             if (lightingSystem.sdfShadowEnabled) "ON" else "OFF"
         )
     }
@@ -272,7 +276,7 @@ class ZeroEngineView(
         ZeroAdBridge.init(context, onConsoleLog)
         scriptBridge.initVM(); dataStore.loadI18nFromDiskIfNeeded(dataStore.currentLang)
         loadSceneContent(sceneJson, groupName = "main", additive = false); lastFrameNs = System.nanoTime()
-        onConsoleLog("[GPU] OpenGL ES 3.0 + GPU Instancing 管线已就绪")
+        onConsoleLog("[GPU] OpenGL ES 3.0 + GPU Instancing + JFA Radiance GI 已就绪")
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -489,6 +493,24 @@ class ZeroEngineView(
         instancedBatch.end()
     }
 
+    private fun renderJfaOccludersPass(worldNodes: List<GameNode>, emptyArr: FloatArray) {
+        if (!giSystem.isJfaReady) return
+        val casters = worldNodes.filter { it.shadowCaster && it.nodeType != "ParticleEmitter" }
+        if (casters.isEmpty()) return
+        if (!giSystem.beginOccluderPass()) return
+
+        spriteBatch.begin(vpMatrix, false, 1f, 1f, 1f, 0, null, null) { frameDrawCalls++ }
+        casters.forEach { n ->
+            when {
+                n.nodeType == "TileMap" -> { spriteBatch.flush(); renderTileMap(n, vpMatrix, true, false, 0, emptyArr, emptyArr) }
+                canBatchNode(n) -> submitNodeToBatch(n, true)
+                else -> { spriteBatch.flush(); renderNodeSingle(n, vpMatrix, true, false, 0, emptyArr, emptyArr) }
+            }
+        }
+        spriteBatch.end()
+        giSystem.buildJfaDistanceField { frameDrawCalls++ }
+    }
+
     private fun renderSceneFrame() {
         frameDrawCalls = 0; frameCulled = 0
         instancedBatch.resetFrameCounter()
@@ -520,7 +542,10 @@ class ZeroEngineView(
                         else -> { spriteBatch.flush(); renderNodeSingle(n, vpMatrix, true, false, 0, emptyArr, emptyArr) }
                     }
                 }
-                spriteBatch.end(); renderLightsToFbo(allLights)
+                spriteBatch.end()
+                renderLightsToFbo(allLights)
+                renderJfaOccludersPass(worldNodes, emptyArr)
+
                 GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0); GLES20.glViewport(0, 0, surfaceW, surfaceH)
                 GLES20.glClearColor(0f, 0f, 0f, 1f); GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT); renderPostComposite()
 
