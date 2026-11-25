@@ -35,6 +35,11 @@ class ZeroEngineView(
     data class TweenTask(val node: GameNode, val prop: String, val startVal: Float, val targetVal: Float, val duration: Float, val ease: String, var elapsed: Float = 0f)
     data class AdditiveLoadReq(val sceneFile: String, val offsetX: Float, val offsetY: Float)
     data class GlobalTransform(val gx: Float, val gy: Float, val gz: Float, val gRot: Float, val gSx: Float, val gSy: Float)
+    data class ScriptInstanceCmd(
+        val texture: String, val x: Float, val y: Float, val z: Float,
+        val w: Float, val h: Float, val rotDeg: Float,
+        val r: Float, val g: Float, val b: Float, val a: Float, val additive: Boolean
+    )
 
     data class GameNode(
         var name: String, var nodeType: String = "Sprite2D", var layer: String = "World", var parent: String = "",
@@ -72,6 +77,7 @@ class ZeroEngineView(
     internal val audioSystem = ZeroAudioSystem(projectDir, onConsoleLog)
     internal val inputSystem = ZeroInputSystem()
     private val spriteBatch = ZeroSpriteBatch(1024)
+    private val instancedBatch = ZeroInstancedBatch(4096)
     internal val dataStore = ZeroDataStore(projectDir, onConsoleLog)
     internal val physicsSystem = ZeroPhysicsSystem(onConsoleLog)
     internal val lightingSystem = ZeroLightingSystem(projectDir, onConsoleLog)
@@ -83,12 +89,18 @@ class ZeroEngineView(
     internal val atlasCache = ConcurrentHashMap<String, TextureAtlasData>()
     internal val nodes = mutableListOf<GameNode>()
     internal val nodeById = HashMap<Int, GameNode>(256)
+    internal val nodeByName = HashMap<String, GameNode>(256)
     internal val pendingAdd = mutableListOf<GameNode>()
     internal val pendingRemove = mutableSetOf<GameNode>()
     internal val activeTweens = mutableListOf<TweenTask>()
+    internal val scriptInstances = mutableListOf<ScriptInstanceCmd>()
     internal val textureCache = ConcurrentHashMap<String, Int>()
     private val textureSizes = ConcurrentHashMap<String, Pair<Int, Int>>()
     private val identityMatrix = FloatArray(16).apply { Matrix.setIdentityM(this, 0) }
+
+    // 渲染期 O(1) 全局变换缓存（仅在 renderSceneFrame 期间启用，杜绝脏数据）
+    private var useTransformCache = false
+    private val renderTransformCache = HashMap<Int, GlobalTransform>(256)
 
     internal val preloadedSceneCache = ConcurrentHashMap<String, String>()
     private val sceneIoExecutor = Executors.newSingleThreadExecutor()
@@ -128,6 +140,7 @@ class ZeroEngineView(
     private var frameCulled = 0
     @Volatile internal var lastFrameCulled = 0
     @Volatile internal var lastFrameLights = 0
+    @Volatile internal var lastFrameInstances = 0
     @Volatile private var lastFrameNodes = 0
     @Volatile private var lastFrameTextures = 0
 
@@ -155,7 +168,7 @@ class ZeroEngineView(
 
     init {
         isFocusable = true; isFocusableInTouchMode = true; requestFocus()
-        setEGLContextClientVersion(2); setRenderer(this); renderMode = RENDERMODE_CONTINUOUSLY
+        setEGLContextClientVersion(3); setRenderer(this); renderMode = RENDERMODE_CONTINUOUSLY
     }
 
     fun getPerfSummaryText(): String {
@@ -164,12 +177,29 @@ class ZeroEngineView(
         val maxMb = rt.maxMemory() / (1024 * 1024)
         return String.format(
             Locale.US,
-            "FPS: %.1f | DC: %d | 剔除: %d\n节点: %d | 光源: %d | 纹理: %d | 内存: %d/%dMB\nVM: QuickJS | GI: %s | 阴影: %s",
-            smoothedFps, lastFrameDrawCalls, lastFrameCulled,
+            "FPS: %.1f | DC: %d | Inst: %d | 剔除: %d\n节点: %d | 光源: %d | 纹理: %d | 内存: %d/%dMB\nGL: ES3.0 | VM: QuickJS | GI: %s | 阴影: %s",
+            smoothedFps, lastFrameDrawCalls, lastFrameInstances, lastFrameCulled,
             lastFrameNodes, lastFrameLights, lastFrameTextures, usedMb, maxMb,
             if (giSystem.isReady) "ON" else "OFF",
             if (lightingSystem.sdfShadowEnabled) "ON" else "OFF"
         )
+    }
+
+    internal fun findNodeByName(name: String): GameNode? {
+        if (name.isEmpty()) return null
+        val cached = nodeByName[name]
+        if (cached != null && !pendingRemove.contains(cached)) return cached
+        return nodes.find { it.name == name && !pendingRemove.contains(it) }
+    }
+
+    internal fun indexNode(n: GameNode) {
+        nodeById[n.nodeId] = n
+        nodeByName[n.name] = n
+    }
+
+    private fun unindexNode(n: GameNode) {
+        nodeById.remove(n.nodeId)
+        if (nodeByName[n.name] === n) nodeByName.remove(n.name)
     }
 
     internal fun normalizeSceneName(name: String): String = if (name.endsWith(".scene")) name else "$name.scene"
@@ -182,6 +212,7 @@ class ZeroEngineView(
         queueEvent {
             scriptBridge.destroyVM()
             releaseFbos(); releaseSceneGpuResources(includePersistent = true)
+            instancedBatch.releaseGL()
             lightingSystem.releaseGL(); rigSystem.releaseGL(); meshSystem.releaseGL(); giSystem.releaseGL()
             val texIds = (textureCache.values + textTextureCache.values).filter { it != 0 && it != whiteTexId }.toIntArray()
             if (texIds.isNotEmpty()) GLES20.glDeleteTextures(texIds.size, texIds, 0)
@@ -236,10 +267,12 @@ class ZeroEngineView(
         postProgram = ZeroShaders.buildShaderProgram(ZeroShaders.POST_VERTEX_SHADER, ZeroShaders.POST_FRAGMENT_SHADER, onConsoleLog)
         batchProgram = ZeroShaders.buildShaderProgram(ZeroShaders.BATCH_VERTEX_SHADER, ZeroShaders.BATCH_FRAGMENT_SHADER, onConsoleLog)
         spriteBatch.init(batchProgram)
+        instancedBatch.initGL(onConsoleLog)
         lightingSystem.initGL(); rigSystem.initGL(); meshSystem.initGL(); giSystem.initGL()
         ZeroAdBridge.init(context, onConsoleLog)
         scriptBridge.initVM(); dataStore.loadI18nFromDiskIfNeeded(dataStore.currentLang)
         loadSceneContent(sceneJson, groupName = "main", additive = false); lastFrameNs = System.nanoTime()
+        onConsoleLog("[GPU] OpenGL ES 3.0 + GPU Instancing 管线已就绪")
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -266,9 +299,11 @@ class ZeroEngineView(
     private fun loadSceneContent(rawJson: String, groupName: String, additive: Boolean, offsetX: Float = 0f, offsetY: Float = 0f) {
         if (!additive) {
             releaseSceneGpuResources(includePersistent = false)
-            nodes.filter { !it.persistent }.forEach { nodeById.remove(it.nodeId); scriptBridge.destroyNode(it.nodeId) }
+            nodes.filter { !it.persistent }.forEach { unindexNode(it); scriptBridge.destroyNode(it.nodeId) }
             val kept = nodes.filter { it.persistent }
-            nodes.clear(); nodes.addAll(kept); pendingAdd.removeAll { !it.persistent }; pendingRemove.clear()
+            nodes.clear(); nodes.addAll(kept)
+            nodeById.clear(); nodeByName.clear(); kept.forEach { indexNode(it) }
+            pendingAdd.removeAll { !it.persistent }; pendingRemove.clear(); scriptInstances.clear()
             activeTweens.removeAll { !it.node.persistent }; physicsSystem.clearRays(); rigSystem.clearAll(); meshSystem.clearAll()
             if (camTarget?.persistent != true) camTarget = null; camBoundsEnabled = false
         }
@@ -286,7 +321,7 @@ class ZeroEngineView(
             newNodes.forEach { if (it.parent.isEmpty() && it.layer == "World") { it.x += offsetX; it.y += offsetY } }
         }
         nodes.addAll(newNodes)
-        newNodes.forEach { nodeById[it.nodeId] = it }
+        newNodes.forEach { indexNode(it) }
         if (!additive) unloadUnusedTextures()
         newNodes.forEach { scriptBridge.bindNodeScript(it) }
         physicsSystem.rebuildSpatialIndex(nodes, pendingRemove) { getGlobalTransform(it) }
@@ -322,12 +357,13 @@ class ZeroEngineView(
         }
         if (hitstopTimer > 0f) { hitstopTimer = max(0f, hitstopTimer - rawDt); updateCameraMatrices(rawDt); renderSceneFrame(); return }
 
+        scriptInstances.clear()
         val dt = rawDt * timeScale; engineTime += dt; physicsSystem.updateRays(rawDt)
         updateCameraMatrices(dt); updateWorldTouchFromScreen(); updateTweens(dt); flushTouchEvents()
 
         if (pendingAdd.isNotEmpty()) {
             val added = pendingAdd.toList(); pendingAdd.clear(); nodes.addAll(added)
-            added.forEach { nodeById[it.nodeId] = it }
+            added.forEach { indexNode(it) }
             added.forEach { scriptBridge.bindNodeScript(it); scriptBridge.callLifecycle(it, "onReady") }
         }
         physicsSystem.rebuildSpatialIndex(nodes, pendingRemove) { getGlobalTransform(it) }
@@ -361,7 +397,7 @@ class ZeroEngineView(
         if (pendingRemove.isNotEmpty()) {
             pendingRemove.forEach {
                 releaseNodeGpuResources(it); meshSystem.removeMesh(it.name)
-                nodeById.remove(it.nodeId); scriptBridge.destroyNode(it.nodeId)
+                unindexNode(it); scriptBridge.destroyNode(it.nodeId)
             }
             nodes.removeAll(pendingRemove); pendingRemove.clear()
         }
@@ -372,7 +408,7 @@ class ZeroEngineView(
         n.animator.update(dt, { clip, ev -> scriptBridge.callFrameEvent(n, clip, ev) }, { clip -> scriptBridge.callLifecycle(n, "onAnimFinished", clip) })
         n.animator.activeFrame?.let { af -> n.currentFrame = af.frameIndex; if (af.atlasFrame.isNotEmpty()) n.atlasFrame = af.atlasFrame }
         n.animator.activeBonePoses.forEach { pose ->
-            val target = nodes.find { it.name == pose.targetNodeName && (it.parent == n.name || it === n) } ?: nodes.find { it.name == pose.targetNodeName }
+            val target = findNodeByName(pose.targetNodeName)
             target?.let { t -> pose.x?.let { t.x = it }; pose.y?.let { t.y = it }; pose.rotation?.let { t.rotation = it }; pose.scaleX?.let { t.scaleX = it }; pose.scaleY?.let { t.scaleY = it } }
         }
     }
@@ -384,7 +420,7 @@ class ZeroEngineView(
         if (n.clipW > 0f && n.clipH > 0f) { left = max(left, n.clipX); top = max(top, n.clipY); right = min(right, n.clipX + n.clipW); bottom = min(bottom, n.clipY + n.clipH); hasClip = true }
         var pName = n.parent; var guard = 0
         while (pName.isNotEmpty() && guard++ < 16) {
-            val p = nodes.find { it.name == pName } ?: break
+            val p = findNodeByName(pName) ?: break
             if (p.clipChildren && p.layer == "UI") {
                 val pgt = getGlobalTransform(p); val pw = abs(p.width * pgt.gSx); val ph = abs(p.height * pgt.gSy)
                 left = max(left, pgt.gx - pw * 0.5f); top = max(top, pgt.gy - ph * 0.5f); right = min(right, pgt.gx + pw * 0.5f); bottom = min(bottom, pgt.gy + ph * 0.5f); hasClip = true
@@ -410,82 +446,131 @@ class ZeroEngineView(
         return pos to col
     }
 
+    private fun renderInstancedWorldPass(particleNodes: List<GameNode>, fadeAlpha: Float) {
+        if (fadeAlpha <= 0.001f || (particleNodes.isEmpty() && scriptInstances.isEmpty())) return
+        if (!instancedBatch.isReady) {
+            spriteBatch.begin(vpMatrix, false, ambientR, ambientG, ambientB, 0, null, null) { frameDrawCalls++ }
+            particleNodes.forEach { submitParticlesToBatch(it, true, fadeAlpha) }
+            spriteBatch.end()
+            return
+        }
+        val tilt = if (camMode == "2.5D") (-90f + camPitch * 0.65f) else 0f
+        instancedBatch.begin(vpMatrix, tilt) { frameDrawCalls++ }
+
+        particleNodes.forEach { n ->
+            val gt = getGlobalTransform(n)
+            val texId = if (n.texture.isNotEmpty()) getImageTexture(n.texture) else whiteTexId
+            n.particles.forEach { p ->
+                if (!p.active) return@forEach
+                if (!isBoxInView(p.x - p.size, p.x + p.size, p.y - p.size, p.y + p.size)) { frameCulled++; return@forEach }
+                val ratio = (p.life / p.maxLife).coerceIn(0f, 1f)
+                val sz = p.size * (0.25f + 0.75f * ratio)
+                instancedBatch.pushInstance(
+                    texId = texId, x = p.x, y = p.y, z = gt.gz + 4f,
+                    w = sz, h = sz, rotDeg = 0f,
+                    r = n.r, g = n.g, b = n.b, a = p.alpha * ratio * fadeAlpha,
+                    additive = true
+                )
+            }
+        }
+
+        scriptInstances.forEach { cmd ->
+            val b = max(abs(cmd.w), abs(cmd.h)) * 0.75f
+            if (!isBoxInView(cmd.x - b, cmd.x + b, cmd.y - b, cmd.y + b)) { frameCulled++; return@forEach }
+            val texId = if (cmd.texture.isNotEmpty()) getImageTexture(cmd.texture) else whiteTexId
+            instancedBatch.pushInstance(
+                texId = texId, x = cmd.x, y = cmd.y, z = cmd.z,
+                w = cmd.w, h = cmd.h, rotDeg = cmd.rotDeg,
+                r = cmd.r, g = cmd.g, b = cmd.b, a = cmd.a * fadeAlpha,
+                additive = cmd.additive
+            )
+        }
+
+        instancedBatch.end()
+    }
+
     private fun renderSceneFrame() {
         frameDrawCalls = 0; frameCulled = 0
-        val allLights = nodes.filter { it.visible && it.nodeType == "PointLight" }; lastFrameLights = allLights.size
-        val worldNodes = nodes.filter { it.visible && it.layer != "UI" && it.nodeType != "PointLight" }
-            .sortedWith(compareBy({ it.zIndex }, { it.nodeType != "TileMap" }, { it.tiltX >= -45f }, { getGlobalTransform(it).gy }))
-        val particleNodes = worldNodes.filter { it.nodeType == "ParticleEmitter" }
-        val nonSkinnedWorld = worldNodes.filter { it.nodeType != "ParticleEmitter" && !meshSystem.hasMesh(it.name) }
-        val normalNodes = nonSkinnedWorld.filter { it.nodeType != "TileMap" && it.normalMap.isNotEmpty() }
-        val solidWorldNodes = nonSkinnedWorld.filter { it.nodeType == "TileMap" || it.normalMap.isEmpty() }
-        val emptyArr = FloatArray(4)
+        instancedBatch.resetFrameCounter()
+        renderTransformCache.clear()
+        useTransformCache = true
 
-        lightingSystem.collectOccluders(nodes, { x0, x1, y0, y1 -> isBoxInView(x0, x1, y0, y1) }, { getGlobalTransform(it) })
-        val (lightPosArr, lightColArr) = packLightsArrays(allLights)
-        val clampedLightCount = min(allLights.size, ZeroLightingSystem.MAX_LIGHTS)
+        try {
+            val allLights = nodes.filter { it.visible && it.nodeType == "PointLight" }; lastFrameLights = allLights.size
+            val worldNodes = nodes.filter { it.visible && it.layer != "UI" && it.nodeType != "PointLight" }
+                .sortedWith(compareBy({ it.zIndex }, { it.nodeType != "TileMap" }, { it.tiltX >= -45f }, { getGlobalTransform(it).gy }))
+            val particleNodes = worldNodes.filter { it.nodeType == "ParticleEmitter" }
+            val nonSkinnedWorld = worldNodes.filter { it.nodeType != "ParticleEmitter" && !meshSystem.hasMesh(it.name) }
+            val normalNodes = nonSkinnedWorld.filter { it.nodeType != "TileMap" && it.normalMap.isNotEmpty() }
+            val solidWorldNodes = nonSkinnedWorld.filter { it.nodeType == "TileMap" || it.normalMap.isEmpty() }
+            val emptyArr = FloatArray(4)
 
-        if (postFxEnabled && fboReady) {
-            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, sceneFbo); GLES20.glViewport(0, 0, surfaceW, surfaceH)
-            GLES20.glClearColor(0.04f, 0.05f, 0.08f, 1f); GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-            spriteBatch.begin(vpMatrix, false, ambientR, ambientG, ambientB, 0, null, null) { frameDrawCalls++ }
-            solidWorldNodes.forEach { n ->
-                when {
-                    n.nodeType == "TileMap" -> { spriteBatch.flush(); renderTileMap(n, vpMatrix, true, false, 0, emptyArr, emptyArr) }
-                    canBatchNode(n) -> submitNodeToBatch(n, true)
-                    else -> { spriteBatch.flush(); renderNodeSingle(n, vpMatrix, true, false, 0, emptyArr, emptyArr) }
-                }
-            }
-            spriteBatch.end(); renderLightsToFbo(allLights)
-            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0); GLES20.glViewport(0, 0, surfaceW, surfaceH)
-            GLES20.glClearColor(0f, 0f, 0f, 1f); GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT); renderPostComposite()
+            lightingSystem.collectOccluders(nodes, { x0, x1, y0, y1 -> isBoxInView(x0, x1, y0, y1) }, { getGlobalTransform(it) })
+            val (lightPosArr, lightColArr) = packLightsArrays(allLights)
+            val clampedLightCount = min(allLights.size, ZeroLightingSystem.MAX_LIGHTS)
 
-            giSystem.renderAndComposite(sceneColorTex, lightMapTex, surfaceW, surfaceH, 1f - postFade, engineTime) { frameDrawCalls++ }
-
-            if (normalNodes.isNotEmpty() && postFade < 0.99f) {
-                normalNodes.forEach { renderNodeSingle(it, vpMatrix, true, true, clampedLightCount, lightPosArr, lightColArr) }
-            }
-            meshSystem.renderSkinnedMeshes(vpMatrix, nodes, 1f - postFade, ambientR, ambientG, ambientB, clampedLightCount, lightPosArr, lightColArr, whiteTexId, { getImageTexture(it) }, { getGlobalTransform(it) }) { frameDrawCalls++ }
-            rigSystem.renderCloths(vpMatrix, nodes, 1f - postFade, whiteTexId, { getImageTexture(it) }, { getGlobalTransform(it) }) { frameDrawCalls++ }
-            if (particleNodes.isNotEmpty()) {
+            if (postFxEnabled && fboReady) {
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, sceneFbo); GLES20.glViewport(0, 0, surfaceW, surfaceH)
+                GLES20.glClearColor(0.04f, 0.05f, 0.08f, 1f); GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
                 spriteBatch.begin(vpMatrix, false, ambientR, ambientG, ambientB, 0, null, null) { frameDrawCalls++ }
-                particleNodes.forEach { submitParticlesToBatch(it, true, 1f - postFade) }; spriteBatch.end()
-            }
-        } else {
-            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0); GLES20.glViewport(0, 0, surfaceW, surfaceH)
-            GLES20.glClearColor(0.04f, 0.05f, 0.08f, 1f); GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
-            spriteBatch.begin(vpMatrix, false, ambientR, ambientG, ambientB, clampedLightCount, lightPosArr, lightColArr) { frameDrawCalls++ }
-            worldNodes.forEach { n ->
-                if (meshSystem.hasMesh(n.name)) return@forEach
-                when {
-                    n.nodeType == "ParticleEmitter" -> { spriteBatch.setInlineLight(false); submitParticlesToBatch(n, true, 1f) }
-                    n.nodeType == "TileMap" -> { spriteBatch.flush(); renderTileMap(n, vpMatrix, true, true, clampedLightCount, lightPosArr, lightColArr) }
-                    canBatchNode(n) -> { spriteBatch.setInlineLight(true); submitNodeToBatch(n, true) }
-                    else -> { spriteBatch.flush(); renderNodeSingle(n, vpMatrix, true, true, clampedLightCount, lightPosArr, lightColArr) }
+                solidWorldNodes.forEach { n ->
+                    when {
+                        n.nodeType == "TileMap" -> { spriteBatch.flush(); renderTileMap(n, vpMatrix, true, false, 0, emptyArr, emptyArr) }
+                        canBatchNode(n) -> submitNodeToBatch(n, true)
+                        else -> { spriteBatch.flush(); renderNodeSingle(n, vpMatrix, true, false, 0, emptyArr, emptyArr) }
+                    }
                 }
-            }
-            spriteBatch.end()
-            meshSystem.renderSkinnedMeshes(vpMatrix, nodes, 1f, ambientR, ambientG, ambientB, clampedLightCount, lightPosArr, lightColArr, whiteTexId, { getImageTexture(it) }, { getGlobalTransform(it) }) { frameDrawCalls++ }
-            rigSystem.renderCloths(vpMatrix, nodes, 1f, whiteTexId, { getImageTexture(it) }, { getGlobalTransform(it) }) { frameDrawCalls++ }
-        }
+                spriteBatch.end(); renderLightsToFbo(allLights)
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0); GLES20.glViewport(0, 0, surfaceW, surfaceH)
+                GLES20.glClearColor(0f, 0f, 0f, 1f); GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT); renderPostComposite()
 
-        if (physicsSystem.debugDrawEnabled) renderDebugOverlay(vpMatrix)
-        val uiNodes = nodes.filter { it.visible && it.layer == "UI" }.sortedBy { it.zIndex }
-        if (uiNodes.isNotEmpty()) {
-            spriteBatch.begin(uiVpMatrix, false, 1f, 1f, 1f, 0, null, null) { frameDrawCalls++ }
-            uiNodes.forEach { n ->
-                val clipRect = resolveUiClipRect(n); if (clipRect != null) { spriteBatch.flush(); applyUiScissor(clipRect) }
-                when {
-                    n.nodeType == "ParticleEmitter" -> submitParticlesToBatch(n, false, 1f)
-                    canBatchNode(n) -> submitNodeToBatch(n, false)
-                    else -> { spriteBatch.flush(); renderNodeSingle(n, uiVpMatrix, false, false, 0, emptyArr, emptyArr) }
+                giSystem.renderAndComposite(sceneColorTex, lightMapTex, surfaceW, surfaceH, 1f - postFade, engineTime) { frameDrawCalls++ }
+
+                if (normalNodes.isNotEmpty() && postFade < 0.99f) {
+                    normalNodes.forEach { renderNodeSingle(it, vpMatrix, true, true, clampedLightCount, lightPosArr, lightColArr) }
                 }
-                if (clipRect != null) { spriteBatch.flush(); GLES20.glDisable(GLES20.GL_SCISSOR_TEST) }
+                meshSystem.renderSkinnedMeshes(vpMatrix, nodes, 1f - postFade, ambientR, ambientG, ambientB, clampedLightCount, lightPosArr, lightColArr, whiteTexId, { getImageTexture(it) }, { getGlobalTransform(it) }) { frameDrawCalls++ }
+                rigSystem.renderCloths(vpMatrix, nodes, 1f - postFade, whiteTexId, { getImageTexture(it) }, { getGlobalTransform(it) }) { frameDrawCalls++ }
+                renderInstancedWorldPass(particleNodes, 1f - postFade)
+            } else {
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0); GLES20.glViewport(0, 0, surfaceW, surfaceH)
+                GLES20.glClearColor(0.04f, 0.05f, 0.08f, 1f); GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
+                spriteBatch.begin(vpMatrix, false, ambientR, ambientG, ambientB, clampedLightCount, lightPosArr, lightColArr) { frameDrawCalls++ }
+                worldNodes.forEach { n ->
+                    if (meshSystem.hasMesh(n.name) || n.nodeType == "ParticleEmitter") return@forEach
+                    when {
+                        n.nodeType == "TileMap" -> { spriteBatch.flush(); renderTileMap(n, vpMatrix, true, true, clampedLightCount, lightPosArr, lightColArr) }
+                        canBatchNode(n) -> { spriteBatch.setInlineLight(true); submitNodeToBatch(n, true) }
+                        else -> { spriteBatch.flush(); renderNodeSingle(n, vpMatrix, true, true, clampedLightCount, lightPosArr, lightColArr) }
+                    }
+                }
+                spriteBatch.end()
+                meshSystem.renderSkinnedMeshes(vpMatrix, nodes, 1f, ambientR, ambientG, ambientB, clampedLightCount, lightPosArr, lightColArr, whiteTexId, { getImageTexture(it) }, { getGlobalTransform(it) }) { frameDrawCalls++ }
+                rigSystem.renderCloths(vpMatrix, nodes, 1f, whiteTexId, { getImageTexture(it) }, { getGlobalTransform(it) }) { frameDrawCalls++ }
+                renderInstancedWorldPass(particleNodes, 1f)
             }
-            spriteBatch.end()
+
+            if (physicsSystem.debugDrawEnabled) renderDebugOverlay(vpMatrix)
+            val uiNodes = nodes.filter { it.visible && it.layer == "UI" }.sortedBy { it.zIndex }
+            if (uiNodes.isNotEmpty()) {
+                spriteBatch.begin(uiVpMatrix, false, 1f, 1f, 1f, 0, null, null) { frameDrawCalls++ }
+                uiNodes.forEach { n ->
+                    val clipRect = resolveUiClipRect(n); if (clipRect != null) { spriteBatch.flush(); applyUiScissor(clipRect) }
+                    when {
+                        n.nodeType == "ParticleEmitter" -> submitParticlesToBatch(n, false, 1f)
+                        canBatchNode(n) -> submitNodeToBatch(n, false)
+                        else -> { spriteBatch.flush(); renderNodeSingle(n, uiVpMatrix, false, false, 0, emptyArr, emptyArr) }
+                    }
+                    if (clipRect != null) { spriteBatch.flush(); GLES20.glDisable(GLES20.GL_SCISSOR_TEST) }
+                }
+                spriteBatch.end()
+            }
+            if (physicsSystem.debugDrawEnabled) renderTouchZonesDebugOverlay(uiVpMatrix)
+        } finally {
+            useTransformCache = false
         }
-        if (physicsSystem.debugDrawEnabled) renderTouchZonesDebugOverlay(uiVpMatrix)
         lastFrameDrawCalls = frameDrawCalls; lastFrameCulled = frameCulled
+        lastFrameInstances = instancedBatch.frameInstanceCount
         lastFrameNodes = nodes.size; lastFrameTextures = textureCache.size
     }
 
@@ -868,12 +953,29 @@ class ZeroEngineView(
     }
 
     internal fun getGlobalTransform(n: GameNode, visited: MutableSet<String> = mutableSetOf()): GlobalTransform {
+        if (useTransformCache) renderTransformCache[n.nodeId]?.let { return it }
         val px = if (n.layer == "World" && n.parallaxX != 1f) (camX - 540f) * (1f - n.parallaxX) else 0f
         val py = if (n.layer == "World" && n.parallaxY != 1f) (camY - 960f) * (1f - n.parallaxY) else 0f
-        if (n.parent.isEmpty() || visited.contains(n.name)) return GlobalTransform(n.x + px, n.y + py, n.z, n.rotation, n.scaleX, n.scaleY)
-        visited.add(n.name); val p = nodes.find { it.name == n.parent } ?: return GlobalTransform(n.x + px, n.y + py, n.z, n.rotation, n.scaleX, n.scaleY)
-        val pt = getGlobalTransform(p, visited); val rad = Math.toRadians(pt.gRot.toDouble()); val sx = n.x * pt.gSx; val sy = n.y * pt.gSy
-        return GlobalTransform(pt.gx + (sx * cos(rad) - sy * sin(rad)).toFloat(), pt.gy + (sx * sin(rad) + sy * cos(rad)).toFloat(), pt.gz + n.z, pt.gRot + n.rotation, pt.gSx * n.scaleX, pt.gSy * n.scaleY)
+        val res = if (n.parent.isEmpty() || visited.contains(n.name)) {
+            GlobalTransform(n.x + px, n.y + py, n.z, n.rotation, n.scaleX, n.scaleY)
+        } else {
+            visited.add(n.name)
+            val p = findNodeByName(n.parent)
+            if (p == null) {
+                GlobalTransform(n.x + px, n.y + py, n.z, n.rotation, n.scaleX, n.scaleY)
+            } else {
+                val pt = getGlobalTransform(p, visited)
+                val rad = Math.toRadians(pt.gRot.toDouble())
+                val sx = n.x * pt.gSx; val sy = n.y * pt.gSy
+                GlobalTransform(
+                    pt.gx + (sx * cos(rad) - sy * sin(rad)).toFloat(),
+                    pt.gy + (sx * sin(rad) + sy * cos(rad)).toFloat(),
+                    pt.gz + n.z, pt.gRot + n.rotation, pt.gSx * n.scaleX, pt.gSy * n.scaleY
+                )
+            }
+        }
+        if (useTransformCache) renderTransformCache[n.nodeId] = res
+        return res
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {

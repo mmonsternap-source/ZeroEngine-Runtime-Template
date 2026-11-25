@@ -300,6 +300,25 @@ class ZeroScriptBridge(
 
     private fun invokeEngineMethod(method: String, args: Array<out Any?>): Any? {
         return when (method) {
+            "drawInstanced" -> {
+                engine.scriptInstances.add(
+                    ZeroEngineView.ScriptInstanceCmd(
+                        texture = toJsStr(args.getOrNull(1), ""),
+                        x = toJsFloat(args.getOrNull(2), 0f),
+                        y = toJsFloat(args.getOrNull(3), 0f),
+                        w = toJsFloat(args.getOrNull(4), 32f),
+                        h = toJsFloat(args.getOrNull(5), 32f),
+                        rotDeg = toJsFloat(args.getOrNull(6), 0f),
+                        r = toJsFloat(args.getOrNull(7), 1f),
+                        g = toJsFloat(args.getOrNull(8), 1f),
+                        b = toJsFloat(args.getOrNull(9), 1f),
+                        a = toJsFloat(args.getOrNull(10), 1f),
+                        additive = toJsBool(args.getOrNull(11), false),
+                        z = toJsFloat(args.getOrNull(12), 2f)
+                    )
+                )
+                null
+            }
             "unloadUnusedTextures" -> engine.unloadUnusedTextures()
             "setSdfShadow" -> {
                 engine.lightingSystem.sdfShadowEnabled = toJsBool(args.getOrNull(1), true)
@@ -330,8 +349,8 @@ class ZeroScriptBridge(
             "removeCloth" -> { engine.rigSystem.removeCloth(toJsStr(args.getOrNull(1), "")); null }
             "setGlobalWind" -> { engine.rigSystem.setGlobalWind(toJsFloat(args.getOrNull(1), 0f), toJsFloat(args.getOrNull(2), 0f)); null }
             "solveIK" -> {
-                val root = engine.nodes.find { it.name == toJsStr(args.getOrNull(1), "") } ?: return false
-                val mid = engine.nodes.find { it.name == toJsStr(args.getOrNull(2), "") } ?: return false
+                val root = engine.findNodeByName(toJsStr(args.getOrNull(1), "")) ?: return false
+                val mid = engine.findNodeByName(toJsStr(args.getOrNull(2), "")) ?: return false
                 engine.rigSystem.solveTwoBoneIK(root, mid, toJsFloat(args.getOrNull(3), 0f), toJsFloat(args.getOrNull(4), 0f), toJsFloat(args.getOrNull(5), 80f), toJsFloat(args.getOrNull(6), 80f), toJsBool(args.getOrNull(7), false)) { engine.getGlobalTransform(it) }
             }
             "registerIK" -> {
@@ -340,7 +359,7 @@ class ZeroScriptBridge(
             "setIKTarget" -> { engine.rigSystem.setIkTarget(toJsStr(args.getOrNull(1), ""), toJsFloat(args.getOrNull(2), 0f), toJsFloat(args.getOrNull(3), 0f), toJsBool(args.getOrNull(4), true)); null }
             "removeIK" -> { engine.rigSystem.removeIk(toJsStr(args.getOrNull(1), "")); null }
             "createSkinnedMesh" -> {
-                val target = engine.nodes.find { it.name == toJsStr(args.getOrNull(1), "") } ?: return false
+                val target = engine.findNodeByName(toJsStr(args.getOrNull(1), "")) ?: return false
                 val uv = engine.resolveNodeUvRect(target)
                 engine.meshSystem.createGridMesh(target, toJsInt(args.getOrNull(2), 8), toJsInt(args.getOrNull(3), 12), uv[0], uv[1], uv[2], uv[3]) { engine.getGlobalTransform(it) }
                 true
@@ -419,8 +438,8 @@ class ZeroScriptBridge(
             "unloadScene" -> { val s = toJsStr(args.getOrNull(1), ""); if (s.isNotEmpty()) engine.pendingUnloadScenes.add(engine.normalizeSceneName(s)); null }
             "clearSceneCache" -> { engine.preloadedSceneCache.clear(); null }
             "getStats" -> JSONObject().apply {
-                put("vm", "QuickJS")
-                put("fps", engine.smoothedFps.toDouble()); put("drawCalls", engine.lastFrameDrawCalls); put("culled", engine.lastFrameCulled)
+                put("vm", "QuickJS"); put("gl", "ES3.0")
+                put("fps", engine.smoothedFps.toDouble()); put("drawCalls", engine.lastFrameDrawCalls); put("instances", engine.lastFrameInstances); put("culled", engine.lastFrameCulled)
                 put("nodes", engine.nodes.size); put("lights", engine.lastFrameLights); put("occluders", engine.lightingSystem.activeOccluderCount)
                 put("cloths", engine.rigSystem.activeClothCount); put("iks", engine.rigSystem.activeIkCount); put("skinnedMeshes", engine.meshSystem.activeMeshCount)
                 put("gi", engine.giSystem.isReady); put("sdfShadow", engine.lightingSystem.sdfShadowEnabled); put("spatialCells", engine.physicsSystem.spatialCellsCount)
@@ -511,7 +530,7 @@ class ZeroScriptBridge(
                     defaultLightIntensity = 1.5,
                     overrideParent = toJsStr(args.getOrNull(2), "")
                 )
-                engine.pendingAdd.add(sp); engine.nodeById[sp.nodeId] = sp; bindNodeScript(sp); sp.nodeId
+                engine.pendingAdd.add(sp); engine.indexNode(sp); bindNodeScript(sp); sp.nodeId
             }
             "instantiate" -> {
                 val sName = toJsStr(args.getOrNull(1), "")
@@ -521,12 +540,12 @@ class ZeroScriptBridge(
                 val sx = toJsFloat(args.getOrNull(2), 0f); val sy = toJsFloat(args.getOrNull(3), 0f); val sz = toJsFloat(args.getOrNull(4), 0f)
                 loaded.forEach {
                     if (it.parent.isEmpty()) { it.x += sx; it.y += sy; it.z += sz }
-                    engine.pendingAdd.add(it); engine.nodeById[it.nodeId] = it; bindNodeScript(it)
+                    engine.pendingAdd.add(it); engine.indexNode(it); bindNodeScript(it)
                 }
                 loaded.firstOrNull()?.nodeId ?: -1
             }
             "destroy" -> { engine.nodeById[toJsInt(args.getOrNull(1), -1)]?.let { engine.pendingRemove.add(it) }; null }
-            "findNode" -> engine.nodes.find { it.name == toJsStr(args.getOrNull(1), "") && !engine.pendingRemove.contains(it) }?.nodeId ?: -1
+            "findNode" -> engine.findNodeByName(toJsStr(args.getOrNull(1), ""))?.nodeId ?: -1
             "findNodesByTag" -> {
                 val tg = toJsStr(args.getOrNull(1), "")
                 JSONArray(engine.nodes.filter { it.tag == tg && !engine.pendingRemove.contains(it) }.map { it.nodeId }).toString()
@@ -539,7 +558,7 @@ class ZeroScriptBridge(
         val cfg = try { JSONObject(cfgJson) } catch (_: Exception) { JSONObject() }
         val anchorName = cfg.optString("anchor", defaultAnchor)
         val id = cfg.optString("id", "${anchorName}_cloth_${System.nanoTime() % 1000}")
-        val anchorNode = engine.nodes.find { it.name == anchorName }
+        val anchorNode = engine.findNodeByName(anchorName)
         val gt = anchorNode?.let { engine.getGlobalTransform(it) }
         engine.rigSystem.createCloth(
             id = id,
