@@ -16,7 +16,7 @@ import java.io.File
 
 /**
  * ZeroEngine-Runtime-Template 纯运行态入口（独立商业游戏发布壳）
- * 启动时自动释放 assets/game/ 至本地运行目录并全屏加载 scenes/main.scene
+ * 启动时自动释放 assets/game/ 至本地运行目录，播放开屏 Logo 动画并全屏加载 scenes/main.scene
  */
 class MainActivity : Activity() {
 
@@ -56,6 +56,9 @@ class MainActivity : Activity() {
                     ViewGroup.LayoutParams.MATCH_PARENT
                 )
             )
+
+            // 播放开屏 Logo 动画（默认 Zero Engine 动效，支持读取项目自定义 splash.json / splash_logo.png）
+            ZeroSplashOverlay.show(this, container, runtimeDir, isEditorLaunch = false)
         } catch (e: Exception) {
             Log.e("ZeroRuntime", "Boot failed", e)
             showStartupError("游戏启动异常：${e.message}")
