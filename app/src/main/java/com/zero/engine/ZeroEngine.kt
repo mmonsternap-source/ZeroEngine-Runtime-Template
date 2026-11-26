@@ -24,7 +24,7 @@ import kotlin.math.*
 
 class ZeroEngineView(
     context: Context,
-    private val projectDir: File,
+    internal val projectDir: File,
     private val sceneJson: String,
     internal val onConsoleLog: (String) -> Unit
 ) : GLSurfaceView(context), GLSurfaceView.Renderer {
@@ -85,6 +85,9 @@ class ZeroEngineView(
     internal val meshSystem = ZeroMeshSkinningSystem(onConsoleLog)
     internal val giSystem = ZeroGlobalIlluminationSystem(onConsoleLog)
     internal val aiNavSystem = ZeroAiNavSystem(onConsoleLog)
+    internal val cutsceneSystem = ZeroCutsceneSystem(this)
+    @Volatile internal var isPaused = false
+    @Volatile internal var pendingStepFrames = 0
     private val scriptBridge = ZeroScriptBridge(this)
 
     internal val atlasCache = ConcurrentHashMap<String, TextureAtlasData>()
@@ -192,6 +195,8 @@ class ZeroEngineView(
 
     fun hotReloadScene() {
         queueEvent {
+            isPaused = false
+            pendingStepFrames = 0
             nodes.forEach { it.persistent = false }
             preloadedSceneCache.clear()
             dataStore.clearRuntimeCaches()
@@ -232,6 +237,7 @@ class ZeroEngineView(
             instancedBatch.releaseGL()
             lightingSystem.releaseGL(); rigSystem.releaseGL(); meshSystem.releaseGL(); giSystem.releaseGL()
             aiNavSystem.clear()
+            cutsceneSystem.clear()
             val texIds = (textureCache.values + textTextureCache.values).filter { it != 0 && it != whiteTexId }.toIntArray()
             if (texIds.isNotEmpty()) GLES20.glDeleteTextures(texIds.size, texIds, 0)
             textureCache.clear(); textureSizes.clear(); textTextureCache.clear()
@@ -324,6 +330,7 @@ class ZeroEngineView(
             pendingAdd.removeAll { !it.persistent }; pendingRemove.clear(); scriptInstances.clear()
             activeTweens.removeAll { !it.node.persistent }; physicsSystem.clearRays(); rigSystem.clearAll(); meshSystem.clearAll()
             aiNavSystem.clear()
+            cutsceneSystem.clear()
             if (camTarget?.persistent != true) camTarget = null; camBoundsEnabled = false
         }
         val newNodes = mutableListOf<GameNode>()
@@ -375,6 +382,13 @@ class ZeroEngineView(
             nodes.forEach { if (!it.persistent && it.sceneGroup in groups) pendingRemove.add(it) }
         }
         if (hitstopTimer > 0f) { hitstopTimer = max(0f, hitstopTimer - rawDt); updateCameraMatrices(rawDt); renderSceneFrame(); return }
+        if (isPaused) {
+            if (pendingStepFrames > 0) {
+                pendingStepFrames--
+            } else {
+                updateCameraMatrices(0f); renderSceneFrame(); return
+            }
+        }
 
         scriptInstances.clear()
         val dt = rawDt * timeScale; engineTime += dt; physicsSystem.updateRays(rawDt)
@@ -404,6 +418,7 @@ class ZeroEngineView(
         rigSystem.update(dt, nodes) { getGlobalTransform(it) }
         meshSystem.update(dt, nodes) { getGlobalTransform(it) }
         aiNavSystem.update(dt)
+        cutsceneSystem.update(dt)
 
         physicsSystem.rebuildSpatialIndex(nodes, pendingRemove) { getGlobalTransform(it) }
         physicsSystem.processCombatOverlaps(

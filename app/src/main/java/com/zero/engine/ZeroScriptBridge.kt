@@ -301,6 +301,9 @@ class ZeroScriptBridge(
 
     private fun invokeEngineMethod(method: String, args: Array<out Any?>): Any? {
         return when (method) {
+            "playCutscene" -> engine.cutsceneSystem.play(toJsStr(args.getOrNull(1), ""))
+            "stopCutscene" -> { engine.cutsceneSystem.clear(); null }
+            "isCutscenePlaying" -> engine.cutsceneSystem.isPlaying
             "createGrass" -> {
                 val cfg = try { JSONObject(toJsStr(args.getOrNull(1), "{}")) } catch (_: Exception) { JSONObject() }
                 engine.rigSystem.foliageSystem.createGrassPatch(
@@ -588,7 +591,7 @@ class ZeroScriptBridge(
                 put("nodes", engine.nodes.size); put("lights", engine.lastFrameLights); put("occluders", engine.lightingSystem.activeOccluderCount)
                 put("cloths", engine.rigSystem.activeClothCount); put("iks", engine.rigSystem.activeIkCount); put("skinnedMeshes", engine.meshSystem.activeMeshCount)
                 put("gi", engine.giSystem.isReady); put("jfa", engine.giSystem.isJfaReady); put("sdfShadow", engine.lightingSystem.sdfShadowEnabled); put("spatialCells", engine.physicsSystem.spatialCellsCount)
-                put("navReady", engine.aiNavSystem.isBaked); put("sounds", engine.aiNavSystem.activeSoundCount)
+                put("navReady", engine.aiNavSystem.isBaked); put("sounds", engine.aiNavSystem.activeSoundCount); put("cutscene", engine.cutsceneSystem.isPlaying)
                 put("atlases", engine.atlasCache.size); put("flags", engine.dataStore.worldFlags.size); put("lang", engine.dataStore.currentLang)
                 put("fbo", engine.postFxEnabled && engine.fboReady); put("touches", engine.inputSystem.getTouchCount()); put("textures", engine.textureCache.size)
             }.toString()
@@ -827,6 +830,16 @@ class ZeroScriptBridge(
               };
               Engine.clearGrass = function() {
                 __zEngineCall("clearGrass");
+              };
+              Engine.playCutscene = function(source) {
+                var payload = (typeof source === "string") ? source : JSON.stringify(source || []);
+                return !!__zEngineCall("playCutscene", payload);
+              };
+              Engine.stopCutscene = function() {
+                __zEngineCall("stopCutscene");
+              };
+              Engine.isCutscenePlaying = function() {
+                return !!__zEngineCall("isCutscenePlaying");
               };
             })();
         """.trimIndent()
