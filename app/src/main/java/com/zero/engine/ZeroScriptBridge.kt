@@ -301,6 +301,38 @@ class ZeroScriptBridge(
 
     private fun invokeEngineMethod(method: String, args: Array<out Any?>): Any? {
         return when (method) {
+            "createWater" -> {
+                val cfg = try { JSONObject(toJsStr(args.getOrNull(1), "{}")) } catch (_: Exception) { JSONObject() }
+                engine.rigSystem.waterSystem.createWater(
+                    id = cfg.optString("id", ""),
+                    x = cfg.optDouble("x", 540.0).toFloat(),
+                    y = cfg.optDouble("y", 1100.0).toFloat(),
+                    z = cfg.optDouble("z", 1.0).toFloat(),
+                    width = cfg.optDouble("width", 760.0).toFloat(),
+                    height = cfg.optDouble("height", 360.0).toFloat(),
+                    r = cfg.optDouble("r", 0.08).toFloat(),
+                    g = cfg.optDouble("g", 0.32).toFloat(),
+                    b = cfg.optDouble("b", 0.48).toFloat(),
+                    a = cfg.optDouble("a", 0.82).toFloat(),
+                    reflectStrength = cfg.optDouble("reflect", 0.95).toFloat(),
+                    waveScale = cfg.optDouble("waveScale", 1.1).toFloat(),
+                    waveSpeed = cfg.optDouble("waveSpeed", 1.0).toFloat(),
+                    causticStrength = cfg.optDouble("caustics", 0.75).toFloat(),
+                    autoSplash = cfg.optBoolean("autoSplash", true)
+                )
+            }
+            "removeWater" -> { engine.rigSystem.waterSystem.removeWater(toJsStr(args.getOrNull(1), "")); null }
+            "addRipple" -> {
+                engine.rigSystem.waterSystem.addRipple(
+                    x = toJsFloat(args.getOrNull(1), 540f),
+                    y = toJsFloat(args.getOrNull(2), 960f),
+                    maxRadius = toJsFloat(args.getOrNull(3), 160f),
+                    strength = toJsFloat(args.getOrNull(4), 1.1f),
+                    duration = toJsFloat(args.getOrNull(5), 1.3f)
+                )
+                null
+            }
+            "clearWater" -> { engine.rigSystem.waterSystem.clear(); null }
             "bakeNavGrid" -> engine.aiNavSystem.bakeNavGrid(
                 nodes = engine.nodes,
                 pendingRemove = engine.pendingRemove,
@@ -728,6 +760,21 @@ class ZeroScriptBridge(
               };
               Engine.clearSounds = function() {
                 __zEngineCall("clearSounds");
+              };
+              Engine.createWater = function(cfg) {
+                return __zEngineCall("createWater", JSON.stringify(cfg || {}));
+              };
+              Engine.removeWater = function(id) {
+                __zEngineCall("removeWater", id || "");
+              };
+              Engine.addRipple = function(x, y, radius, strength, duration) {
+                __zEngineCall("addRipple", x, y,
+                  radius !== undefined ? radius : 160,
+                  strength !== undefined ? strength : 1.1,
+                  duration !== undefined ? duration : 1.3);
+              };
+              Engine.clearWater = function() {
+                __zEngineCall("clearWater");
               };
             })();
         """.trimIndent()

@@ -7,9 +7,10 @@ import java.nio.FloatBuffer
 import kotlin.math.max
 
 /**
- * P15 + P18-B 次世代 2D 光影系统（OpenGL ES 3.0）：
+ * P15 + P18-B + P18-C 次世代 2D 光影系统（OpenGL ES 3.0）：
  * 1. 全像素级 JFA 距离场 + 2-Cascade 辐射级联 GI + 2D SDF 墙角 AO
- * 2. P18-B：JFA 体积光（上帝光 / 丁达尔光束）+ 受光源染色的 FBM 动态流动迷雾（零额外 DrawCall）
+ * 2. P18-B：JFA 体积光（上帝光）+ 动态 FBM 流动迷雾
+ * 3. P18-C：共享场景与光图 FBO 纹理句柄给水面反射系统
  */
 class ZeroGlobalIlluminationSystem(
     private val onConsoleLog: (String) -> Unit
@@ -25,7 +26,6 @@ class ZeroGlobalIlluminationSystem(
     var skyG: Float = 0.06f
     var skyB: Float = 0.10f
 
-    // P18-B 体积光与动态迷雾参数
     var volumetricIntensity: Float = 0.65f
     var fogDensity: Float = 0.26f
     var fogSpeed: Float = 0.18f
@@ -146,6 +146,8 @@ class ZeroGlobalIlluminationSystem(
 
     fun releaseGL() {
         releaseFbos()
+        lastSceneTex = 0
+        lastLightTex = 0
         val progs = listOf(seedProgram, jfaProgram, sdfProgram, rcGiProgram, blurProgram, compositeProgram).filter { it != 0 }
         progs.forEach { GLES20.glDeleteProgram(it) }
         seedProgram = 0; jfaProgram = 0; sdfProgram = 0
@@ -232,13 +234,17 @@ class ZeroGlobalIlluminationSystem(
         time: Float,
         onDrawCall: () -> Unit
     ) {
+        lastSceneTex = sceneColorTex
+        lastLightTex = lightMapTex
+        lastSurfaceW = surfaceW
+        lastSurfaceH = surfaceH
+
         if (!enabled || !fboReady || fadeAlpha <= 0.001f) return
         if (intensity <= 0.001f && volumetricIntensity <= 0.001f && fogDensity <= 0.001f) return
         if (sceneColorTex == 0 || lightMapTex == 0) return
 
         GLES20.glDisable(GLES20.GL_BLEND)
 
-        // Pass 1：双级联辐射 GI + JFA 体积光 + 动态 FBM 迷雾
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, giFboA)
         GLES20.glViewport(0, 0, giW, giH)
         GLES20.glUseProgram(rcGiProgram)
@@ -275,11 +281,9 @@ class ZeroGlobalIlluminationSystem(
         onDrawCall()
         unbindQuadAttribs()
 
-        // Pass 2 & 3：分离高斯降噪
         runBlurPass(giTexA, giFboB, 1.6f / giW, 0f, onDrawCall)
         runBlurPass(giTexB, giFboA, 0f, 1.6f / giH, onDrawCall)
 
-        // Pass 4：全分辨率 Screen 滤色叠加至屏幕 FBO 0
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
         GLES20.glViewport(0, 0, surfaceW, surfaceH)
         GLES20.glEnable(GLES20.GL_BLEND)
@@ -330,6 +334,11 @@ class ZeroGlobalIlluminationSystem(
     }
 
     companion object {
+        @Volatile var lastSceneTex: Int = 0
+        @Volatile var lastLightTex: Int = 0
+        @Volatile var lastSurfaceW: Int = 1080
+        @Volatile var lastSurfaceH: Int = 1920
+
         private val FULLSCREEN_VS = """#version 300 es
             layout(location = 0) in vec2 aPosition;
             layout(location = 1) in vec2 aTexCoord;
@@ -556,11 +565,9 @@ class ZeroGlobalIlluminationSystem(
                     }
                 }
 
-                // 1. 双级联辐射 GI
                 vec3 combined = (nearAccum * 0.62 + farAccum * 0.48) / 16.0;
                 vec3 gi = (boostSat(combined, uSaturation) + uSkyColor * ao) * uIntensity;
 
-                // 2. 动态 FBM 流动迷雾（双层错向飘动 + 受局部光照染色）
                 float fogNoise = 0.5;
                 vec3 fogLayer = vec3(0.0);
                 if (uFogDensity > 0.001 || uVolumetric > 0.001) {
@@ -576,7 +583,6 @@ class ZeroGlobalIlluminationSystem(
                     fogLayer = uFogColor * (0.28 + localLight * 1.15) * mist;
                 }
 
-                // 3. JFA 体积光（丁达尔光束在流动雾气中产生明暗纹理）
                 vec3 godRays = (volAccum / 16.0) * uVolumetric * (0.58 + 0.52 * fogNoise) * wallClear;
 
                 fragColor = vec4(gi + godRays + fogLayer, 1.0);

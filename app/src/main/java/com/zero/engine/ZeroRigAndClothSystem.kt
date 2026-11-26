@@ -7,9 +7,7 @@ import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.*
 
 /**
- * P17 GLES 3.0 GPU 布料飘带管线 + 2-Bone IK 反向运动学系统：
- * - CPU 仅解算轻量的 Verlet 脊柱节点（最多 32 节）
- * - 飘带几何网格一次性写入静态 GPU VBO，法线展开、丝绸高频风浪抖动与褶皱明暗全部在 GPU 顶点着色器完成
+ * P17 + P18-C GLES 3.0 GPU 布料飘带管线 + 2-Bone IK + 交互式水面托管
  */
 class ZeroRigAndClothSystem(
     private val onConsoleLog: (String) -> Unit
@@ -57,6 +55,8 @@ class ZeroRigAndClothSystem(
 
     private val cloths = ConcurrentHashMap<String, ClothStrip>()
     private val ikChains = ConcurrentHashMap<String, IkChain>()
+    val waterSystem = ZeroWaterSystem(onConsoleLog)
+
     private var clothProgram = 0
     private var globalWindX = 0f
     private var globalWindY = 0f
@@ -67,12 +67,14 @@ class ZeroRigAndClothSystem(
 
     fun initGL() {
         clothProgram = ZeroShaders.buildShaderProgram(CLOTH_VS, CLOTH_FS, onConsoleLog)
+        waterSystem.initGL()
     }
 
     fun releaseGL() {
         cloths.values.forEach { releaseClothVbo(it) }
         cloths.clear()
         ikChains.clear()
+        waterSystem.releaseGL()
         if (clothProgram != 0) {
             GLES20.glDeleteProgram(clothProgram)
             clothProgram = 0
@@ -83,6 +85,7 @@ class ZeroRigAndClothSystem(
         cloths.values.forEach { releaseClothVbo(it) }
         cloths.clear()
         ikChains.clear()
+        waterSystem.clear()
     }
 
     private fun releaseClothVbo(c: ClothStrip) {
@@ -206,13 +209,13 @@ class ZeroRigAndClothSystem(
         nodes: List<ZeroEngineView.GameNode>,
         getGlobalTransform: (ZeroEngineView.GameNode) -> ZeroEngineView.GlobalTransform
     ) {
+        waterSystem.update(dt, nodes, getGlobalTransform)
         elapsedTime += dt
         if (cloths.isEmpty() && ikChains.isEmpty()) return
 
         val nodeMap = HashMap<String, ZeroEngineView.GameNode>(nodes.size)
         nodes.forEach { nodeMap[it.name] = it }
 
-        // 1. 持续性 2-Bone IK 解算
         ikChains.values.forEach { ik ->
             if (!ik.active) return@forEach
             val root = nodeMap[ik.rootName] ?: return@forEach
@@ -220,7 +223,6 @@ class ZeroRigAndClothSystem(
             solveTwoBoneIK(root, mid, ik.targetX, ik.targetY, ik.len1, ik.len2, ik.flipBend, getGlobalTransform)
         }
 
-        // 2. 轻量 Verlet 脊柱物理积分
         val stepDt = dt.coerceIn(0.001f, 0.033f)
         val dtSq = stepDt * stepDt
 
@@ -251,7 +253,6 @@ class ZeroRigAndClothSystem(
                 p.y += vy + totalGravY * dtSq
             }
 
-            // 距离约束迭代（4 次足够稳定且极快）
             repeat(4) {
                 for (i in 0 until c.nodes.size - 1) {
                     val p0 = c.nodes[i]
@@ -272,7 +273,6 @@ class ZeroRigAndClothSystem(
                 }
             }
 
-            // 打包为 GPU Uniform 数组（xy = 脊柱位置, z = 半宽, w = 归一化节比例）
             val maxIdx = max(1, c.nodes.size - 1).toFloat()
             for (i in c.nodes.indices) {
                 val t = i / maxIdx
@@ -289,17 +289,13 @@ class ZeroRigAndClothSystem(
     private fun ensureClothVbo(c: ClothStrip) {
         if (c.vboId != 0) return
         val count = c.nodes.size
-        // TRIANGLE_STRIP：每节左右 2 个顶点，共 count * 2 个顶点
-        // 属性 vec4(segIndex, side(-1/+1), u, v)
         val vCount = count * 2
         val data = FloatArray(vCount * 4)
         val maxIdx = max(1, count - 1).toFloat()
         var off = 0
         for (i in 0 until count) {
             val v = i / maxIdx
-            // 左侧顶点
             data[off++] = i.toFloat(); data[off++] = -1f; data[off++] = 0f; data[off++] = v
-            // 右侧顶点
             data[off++] = i.toFloat(); data[off++] = 1f; data[off++] = 1f; data[off++] = v
         }
 
@@ -324,6 +320,13 @@ class ZeroRigAndClothSystem(
         getGlobalTransform: (ZeroEngineView.GameNode) -> ZeroEngineView.GlobalTransform,
         onDrawCall: () -> Unit
     ) {
+        waterSystem.render(
+            vpMatrix, fadeAlpha,
+            ZeroGlobalIlluminationSystem.lastSceneTex,
+            ZeroGlobalIlluminationSystem.lastLightTex,
+            onDrawCall
+        )
+
         if (cloths.isEmpty() || clothProgram == 0 || fadeAlpha <= 0.001f) return
 
         val nodeMap = HashMap<String, ZeroEngineView.GameNode>(nodes.size)
@@ -379,12 +382,12 @@ class ZeroRigAndClothSystem(
         private val CLOTH_VS = """#version 300 es
             precision highp float;
 
-            layout(location = 0) in vec4 aRibbonData; // x=segIdx, y=side(-1/+1), z=u, w=v
+            layout(location = 0) in vec4 aRibbonData;
 
             uniform mat4 uVP;
             uniform float uZ;
             uniform int uNodeCount;
-            uniform vec4 uNodes[32]; // xy=pos, z=halfWidth, w=ratio(0..1)
+            uniform vec4 uNodes[32];
             uniform float uTime;
             uniform float uFlutterAmp;
 
@@ -402,7 +405,6 @@ class ZeroRigAndClothSystem(
                 vec2 dir = tLen > 0.0001 ? tangent / tLen : vec2(0.0, 1.0);
                 vec2 normal = vec2(-dir.y, dir.x);
 
-                // GPU 高频丝绸飘动与边缘微褶皱
                 float wave = sin(uTime * 11.5 - curr.w * 10.0 + aRibbonData.y * 0.85);
                 float flutter = wave * uFlutterAmp * curr.w;
                 vec2 worldPos = curr.xy + normal * (aRibbonData.y * curr.z + flutter);
