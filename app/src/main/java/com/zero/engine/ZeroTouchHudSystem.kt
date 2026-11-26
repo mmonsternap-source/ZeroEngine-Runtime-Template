@@ -16,6 +16,7 @@ import kotlin.math.*
 
 /**
  * P20-A/B/C 原生多指虚拟摇杆 + 技能按键 + 血条 + 世界空间伤害飘字与守卫警戒标覆层
+ * 已自动适配 2.5D / 2D 相机左右方向
  */
 class ZeroTouchHudSystem(
     private val engine: ZeroEngineView
@@ -404,11 +405,12 @@ class ZeroTouchHudSystem(
             joyThumbPxX = joyAnchorPxX + nx * clamped
             joyThumbPxY = joyAnchorPxY + ny * clamped
             val mag = (clamped / max(1f, radPx)).coerceIn(0f, 1f)
+            val xSign = if (engine.camMode.equals("2.5D", ignoreCase = true)) -1f else 1f
             joyMag = mag
-            joyDx = nx * mag
+            joyDx = nx * mag * xSign
             joyDy = ny * mag
             if (mag > 0.05f) {
-                joyAngleDeg = Math.toDegrees(atan2(ny.toDouble(), nx.toDouble())).toFloat()
+                joyAngleDeg = Math.toDegrees(atan2(joyDy.toDouble(), joyDx.toDouble())).toFloat()
             }
         }
 
