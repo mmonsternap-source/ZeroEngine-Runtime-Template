@@ -7,7 +7,7 @@ import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.*
 
 /**
- * P17 + P18-C + P19-A + P19-B GLES 3.0 GPU 布料飘带 + 2-Bone IK + 水面/天气/交互草海联动托管
+ * P17 ~ P20 GLES 3.0 GPU 布料飘带 + 2-Bone IK + 水面/草海/天气/战斗VFX/潜行视野锥统一托管
  */
 class ZeroRigAndClothSystem(
     private val onConsoleLog: (String) -> Unit
@@ -58,6 +58,8 @@ class ZeroRigAndClothSystem(
     val waterSystem = ZeroWaterSystem(onConsoleLog)
     val weatherSystem = ZeroWeatherSystem(onConsoleLog)
     val foliageSystem = ZeroFoliageSystem(onConsoleLog)
+    val combatVfxSystem = ZeroCombatVfxSystem(onConsoleLog)
+    val stealthGuardSystem = ZeroStealthGuardSystem(onConsoleLog)
 
     private var clothProgram = 0
     private var globalWindX = 0f
@@ -72,6 +74,8 @@ class ZeroRigAndClothSystem(
         waterSystem.initGL()
         weatherSystem.initGL()
         foliageSystem.initGL()
+        combatVfxSystem.initGL()
+        stealthGuardSystem.initGL()
     }
 
     fun releaseGL() {
@@ -81,6 +85,8 @@ class ZeroRigAndClothSystem(
         waterSystem.releaseGL()
         weatherSystem.releaseGL()
         foliageSystem.releaseGL()
+        combatVfxSystem.releaseGL()
+        stealthGuardSystem.releaseGL()
         if (clothProgram != 0) {
             GLES20.glDeleteProgram(clothProgram)
             clothProgram = 0
@@ -94,6 +100,8 @@ class ZeroRigAndClothSystem(
         waterSystem.clear()
         weatherSystem.clear()
         foliageSystem.clear()
+        combatVfxSystem.clear()
+        stealthGuardSystem.clear()
     }
 
     private fun releaseClothVbo(c: ClothStrip) {
@@ -220,6 +228,7 @@ class ZeroRigAndClothSystem(
         waterSystem.update(dt, nodes, getGlobalTransform)
         weatherSystem.update(dt, waterSystem)
         foliageSystem.update(dt, nodes, globalWindX + weatherSystem.currentWindX, getGlobalTransform)
+        combatVfxSystem.update(dt, nodes, getGlobalTransform)
         elapsedTime += dt
         if (cloths.isEmpty() && ikChains.isEmpty()) return
 
@@ -336,11 +345,13 @@ class ZeroRigAndClothSystem(
             ZeroGlobalIlluminationSystem.lastLightTex,
             onDrawCall
         )
+        stealthGuardSystem.renderCones(vpMatrix, fadeAlpha, onDrawCall)
         foliageSystem.render(
             vpMatrix, fadeAlpha,
             ZeroGlobalIlluminationSystem.lastLightTex,
             onDrawCall
         )
+        combatVfxSystem.render(vpMatrix, fadeAlpha, whiteTexId, getImageTexture, onDrawCall)
 
         if (cloths.isNotEmpty() && clothProgram != 0 && fadeAlpha > 0.001f) {
             val nodeMap = HashMap<String, ZeroEngineView.GameNode>(nodes.size)

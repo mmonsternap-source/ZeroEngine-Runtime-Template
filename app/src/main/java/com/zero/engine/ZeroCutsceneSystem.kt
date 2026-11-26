@@ -19,7 +19,7 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * P19-C + P20-A JSON 驱动剧情对话与过场导演系统（同时托管原生虚拟摇杆与 HUD 覆层）：
+ * P19-C + P20-A/C JSON 驱动剧情对话与过场导演系统（同时托管原生虚拟摇杆、HUD 覆层与守卫 AI 更新）：
  * 支持指令：say / choice / wait / camera / move / shake / fade / flag / sfx / bgm / jump
  */
 class ZeroCutsceneSystem(
@@ -134,6 +134,7 @@ class ZeroCutsceneSystem(
     }
 
     fun update(dt: Float) {
+        engine.rigSystem.stealthGuardSystem.update(dt, engine)
         touchHud.update(dt, isPlaying)
         if (!isPlaying) return
         when (stepType) {

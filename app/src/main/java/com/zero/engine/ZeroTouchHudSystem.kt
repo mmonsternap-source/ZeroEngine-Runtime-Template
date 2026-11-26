@@ -6,6 +6,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.opengl.Matrix
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
@@ -14,10 +15,7 @@ import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.*
 
 /**
- * P20-A 原生多指虚拟摇杆 + 技能按键 + 状态条 HUD 系统：
- * - 单层轻量原生 Canvas 覆层，零布局重排，支持左手摇杆 + 右手多键并发触控
- * - 未命中摇杆/按键的触控自动穿透给 ZeroEngineView
- * - 剧情过场播放期间自动隐藏避让，结束自动恢复
+ * P20-A/B/C 原生多指虚拟摇杆 + 技能按键 + 血条 + 世界空间伤害飘字与守卫警戒标覆层
  */
 class ZeroTouchHudSystem(
     private val engine: ZeroEngineView
@@ -52,7 +50,6 @@ class ZeroTouchHudSystem(
         @Volatile var trailValue: Float
     )
 
-    // 摇杆状态（跨 UI/GL 线程安全读取）
     @Volatile var joyEnabled: Boolean = false
     @Volatile var joyBaseX: Float = 0.18f
     @Volatile var joyBaseY: Float = 0.84f
@@ -75,6 +72,7 @@ class ZeroTouchHudSystem(
 
     private var hudView: TouchHudCanvasView? = null
     private var hiddenByCutscene: Boolean = false
+    private var lastHasWorldFx: Boolean = false
 
     fun setupJoystick(enabled: Boolean, x: Float, y: Float, radius: Float, floating: Boolean) {
         joyEnabled = enabled
@@ -119,7 +117,6 @@ class ZeroTouchHudSystem(
     }
 
     fun isButtonDown(id: String): Boolean = buttons[id]?.isDown == true
-
     fun isButtonJustPressed(id: String): Boolean = buttons[id]?.frameJustPressed == true
 
     fun startButtonCooldown(id: String, seconds: Float) {
@@ -174,8 +171,15 @@ class ZeroTouchHudSystem(
         }
         buttons.clear()
         bars.clear()
+        lastHasWorldFx = false
         syncOverlayVisibility()
     }
+
+    private fun hasTouchControls(): Boolean = joyEnabled || buttons.isNotEmpty() || bars.isNotEmpty()
+
+    private fun hasWorldOverlays(): Boolean =
+        engine.rigSystem.combatVfxSystem.floatingTexts.isNotEmpty() ||
+            engine.rigSystem.stealthGuardSystem.hudMarkers.isNotEmpty()
 
     fun update(dt: Float, cutscenePlaying: Boolean) {
         if (cutscenePlaying != hiddenByCutscene) {
@@ -193,9 +197,14 @@ class ZeroTouchHudSystem(
             syncOverlayVisibility()
         }
 
-        var needRedraw = false
+        val worldFxNow = hasWorldOverlays()
+        if (worldFxNow != lastHasWorldFx) {
+            lastHasWorldFx = worldFxNow
+            syncOverlayVisibility()
+        }
+
+        var needRedraw = worldFxNow
         buttons.values.forEach { b ->
-            // 将本帧期间发生的点击锁存到下一帧，确保所有节点 onProcess 都能稳定读到 1 帧
             b.frameJustPressed = b.queuedPress
             b.queuedPress = false
             if (b.cooldownLeft > 0f) {
@@ -221,10 +230,8 @@ class ZeroTouchHudSystem(
         joyMag = 0f
     }
 
-    private fun hasAnyWidget(): Boolean = joyEnabled || buttons.isNotEmpty() || bars.isNotEmpty()
-
     private fun syncOverlayVisibility() {
-        val shouldShow = hasAnyWidget() && !hiddenByCutscene
+        val shouldShow = (!hiddenByCutscene && hasTouchControls()) || hasWorldOverlays()
         engine.post {
             if (shouldShow) {
                 ensureViewOnUi()
@@ -240,7 +247,6 @@ class ZeroTouchHudSystem(
         if (hudView != null) return
         val parent = engine.parent as? ViewGroup ?: return
         val v = TouchHudCanvasView(engine.context)
-        // 插在引擎画面之上、过场对话覆层之下
         val insertIdx = min(1, parent.childCount)
         parent.addView(
             v,
@@ -263,19 +269,41 @@ class ZeroTouchHudSystem(
             textAlign = Paint.Align.CENTER
             typeface = Typeface.DEFAULT_BOLD
         }
+        private val textStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#CC020617")
+            style = Paint.Style.STROKE
+            strokeJoin = Paint.Join.ROUND
+            textAlign = Paint.Align.CENTER
+            typeface = Typeface.DEFAULT_BOLD
+        }
         private val barTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.WHITE
             textAlign = Paint.Align.LEFT
             typeface = Typeface.MONOSPACE
         }
         private val rectTmp = RectF()
+        private val projIn = FloatArray(4)
+        private val projOut = FloatArray(4)
+        private val screenPt = FloatArray(2)
 
         private fun resolveX(v: Float): Float = if (v in 0f..1f) v * width else (v / 1080f) * width
         private fun resolveY(v: Float): Float = if (v in 0f..1f) v * height else (v / 1920f) * height
         private fun uiScale(): Float = max(0.4f, width / 1080f)
 
+        private fun projectWorld(wx: Float, wy: Float, wz: Float, vp: FloatArray, out: FloatArray): Boolean {
+            projIn[0] = wx; projIn[1] = wy; projIn[2] = wz; projIn[3] = 1f
+            Matrix.multiplyMV(projOut, 0, vp, 0, projIn, 0)
+            if (projOut[3] <= 0.0001f) return false
+            val ndcX = projOut[0] / projOut[3]
+            val ndcY = projOut[1] / projOut[3]
+            if (ndcX < -1.2f || ndcX > 1.2f || ndcY < -1.2f || ndcY > 1.2f) return false
+            out[0] = (ndcX * 0.5f + 0.5f) * width
+            out[1] = (0.5f - ndcY * 0.5f) * height
+            return true
+        }
+
         override fun onTouchEvent(event: MotionEvent): Boolean {
-            if (!hasAnyWidget() || hiddenByCutscene) return false
+            if (!hasTouchControls() || hiddenByCutscene) return false
             val scale = uiScale()
             val action = event.actionMasked
             val idx = event.actionIndex
@@ -286,7 +314,6 @@ class ZeroTouchHudSystem(
                     val tx = event.getX(idx)
                     val ty = event.getY(idx)
 
-                    // 1. 优先命中技能按键
                     for (b in buttons.values) {
                         val bx = resolveX(b.x)
                         val by = resolveY(b.y)
@@ -307,7 +334,6 @@ class ZeroTouchHudSystem(
                         }
                     }
 
-                    // 2. 命中虚拟摇杆区
                     if (joyEnabled && joyPointerId == -1) {
                         val radPx = joyRadius * scale
                         val bx = resolveX(joyBaseX)
@@ -328,7 +354,6 @@ class ZeroTouchHudSystem(
                         }
                     }
 
-                    // 首个触点未命中任何 HUD 控件，穿透给游戏世界
                     return action != MotionEvent.ACTION_DOWN
                 }
 
@@ -391,7 +416,73 @@ class ZeroTouchHudSystem(
             super.onDraw(canvas)
             val scale = uiScale()
 
-            // 1. 绘制状态条（HP / MP / 体力等）
+            // ==================== 0. 世界空间覆层（守卫警戒标 + 伤害飘字） ====================
+            val vfx = engine.rigSystem.combatVfxSystem
+            if (vfx.hasVpMatrix) {
+                val vp = vfx.latestVpMatrix
+
+                // P20-C 守卫头顶 ? / ! 警戒标
+                for (m in engine.rigSystem.stealthGuardSystem.hudMarkers) {
+                    if (!projectWorld(m.x, m.y, 12f, vp, screenPt)) continue
+                    val sx = screenPt[0]
+                    val sy = screenPt[1]
+                    val isAlert = m.state == "alert"
+                    val symbol = if (isAlert) "!" else "?"
+                    val sz = (if (isAlert) 56f else 46f) * scale
+                    val col = when (m.state) {
+                        "alert" -> Color.parseColor("#EF4444")
+                        "suspect" -> Color.parseColor("#FACC15")
+                        else -> Color.parseColor("#FB923C")
+                    }
+                    textStrokePaint.textSize = sz
+                    textStrokePaint.strokeWidth = 7f * scale
+                    textStrokePaint.color = Color.argb(220, 2, 6, 23)
+                    canvas.drawText(symbol, sx, sy, textStrokePaint)
+
+                    textPaint.textSize = sz
+                    textPaint.color = col
+                    canvas.drawText(symbol, sx, sy, textPaint)
+
+                    if (!isAlert && m.suspicion > 0.02f) {
+                        val bw = 54f * scale
+                        val bh = 7f * scale
+                        rectTmp.set(sx - bw * 0.5f, sy + 6f * scale, sx + bw * 0.5f, sy + 6f * scale + bh)
+                        fillPaint.color = Color.argb(180, 15, 23, 42)
+                        canvas.drawRoundRect(rectTmp, 4f, 4f, fillPaint)
+                        rectTmp.set(sx - bw * 0.5f, sy + 6f * scale, sx - bw * 0.5f + bw * m.suspicion.coerceIn(0f, 1f), sy + 6f * scale + bh)
+                        fillPaint.color = col
+                        canvas.drawRoundRect(rectTmp, 4f, 4f, fillPaint)
+                    }
+                }
+
+                // P20-B 世界空间伤害飘字
+                for (f in vfx.floatingTexts) {
+                    if (!projectWorld(f.x, f.y, f.z, vp, screenPt)) continue
+                    val p = (f.age / f.maxAge).coerceIn(0f, 1f)
+                    val pop = if (p < 0.18f) {
+                        val k = p / 0.18f
+                        (0.6f + 0.75f * sin(k * Math.PI * 0.5).toFloat()) * (if (f.crit) 1.25f else 1.0f)
+                    } else {
+                        if (f.crit) 1.15f else 1.0f
+                    }
+                    val alpha = if (p > 0.65f) ((1f - p) / 0.35f).coerceIn(0f, 1f) else 1f
+                    val aInt = (alpha * 255f).toInt().coerceIn(0, 255)
+                    val sz = (if (f.crit) 48f else 36f) * f.scale * pop * scale
+
+                    textStrokePaint.textSize = sz
+                    textStrokePaint.strokeWidth = 6f * scale
+                    textStrokePaint.color = Color.argb((aInt * 0.85f).toInt(), 2, 6, 23)
+                    canvas.drawText(f.text, screenPt[0], screenPt[1], textStrokePaint)
+
+                    textPaint.textSize = sz
+                    textPaint.color = Color.argb(aInt, Color.red(f.colorInt), Color.green(f.colorInt), Color.blue(f.colorInt))
+                    canvas.drawText(f.text, screenPt[0], screenPt[1], textPaint)
+                }
+            }
+
+            if (hiddenByCutscene) return
+
+            // ==================== 1. 绘制状态条 ====================
             bars.values.forEach { bar ->
                 val bx = resolveX(bar.x)
                 val by = resolveY(bar.y)
@@ -399,12 +490,10 @@ class ZeroTouchHudSystem(
                 val bh = max(14f, bar.h * scale)
                 val corner = bh * 0.42f
 
-                // 底层背板
                 rectTmp.set(bx, by, bx + bw, by + bh)
                 fillPaint.color = Color.argb(185, 11, 17, 32)
                 canvas.drawRoundRect(rectTmp, corner, corner, fillPaint)
 
-                // 白色缓降残血条
                 val trailRatio = (bar.trailValue / bar.maxValue).coerceIn(0f, 1f)
                 if (trailRatio > 0.001f) {
                     rectTmp.set(bx + 2f, by + 2f, bx + 2f + (bw - 4f) * trailRatio, by + bh - 2f)
@@ -412,7 +501,6 @@ class ZeroTouchHudSystem(
                     canvas.drawRoundRect(rectTmp, corner, corner, fillPaint)
                 }
 
-                // 主血条
                 val ratio = (bar.value / bar.maxValue).coerceIn(0f, 1f)
                 if (ratio > 0.001f) {
                     rectTmp.set(bx + 2f, by + 2f, bx + 2f + (bw - 4f) * ratio, by + bh - 2f)
@@ -420,7 +508,6 @@ class ZeroTouchHudSystem(
                     canvas.drawRoundRect(rectTmp, corner, corner, fillPaint)
                 }
 
-                // 外描边与数值文字
                 rectTmp.set(bx, by, bx + bw, by + bh)
                 strokePaint.color = Color.argb(180, 148, 163, 184)
                 strokePaint.strokeWidth = 2.2f * scale
@@ -435,7 +522,7 @@ class ZeroTouchHudSystem(
                 canvas.drawText(txt, bx + 10f * scale, by + bh * 0.76f, barTextPaint)
             }
 
-            // 2. 绘制虚拟摇杆
+            // ==================== 2. 绘制虚拟摇杆 ====================
             if (joyEnabled) {
                 val radPx = joyRadius * scale
                 val cx = if (joyActive) joyAnchorPxX else resolveX(joyBaseX)
@@ -454,7 +541,7 @@ class ZeroTouchHudSystem(
                 canvas.drawCircle(tx, ty, radPx * 0.42f, fillPaint)
             }
 
-            // 3. 绘制技能按键 + 冷却扇形转圈
+            // ==================== 3. 绘制技能按键 ====================
             buttons.values.forEach { b ->
                 val bx = resolveX(b.x)
                 val by = resolveY(b.y)

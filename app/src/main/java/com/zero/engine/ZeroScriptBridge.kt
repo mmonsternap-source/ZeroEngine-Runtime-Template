@@ -301,6 +301,146 @@ class ZeroScriptBridge(
 
     private fun invokeEngineMethod(method: String, args: Array<out Any?>): Any? {
         return when (method) {
+            // ==================== P20-B: 刀光拖尾 / 冲刺残影 / 伤害飘字 ====================
+            "attachTrail" -> {
+                val cfg = try { JSONObject(toJsStr(args.getOrNull(1), "{}")) } catch (_: Exception) { JSONObject() }
+                engine.rigSystem.combatVfxSystem.attachTrail(
+                    id = cfg.optString("id", ""),
+                    nodeName = cfg.optString("node", ""),
+                    offsetX = cfg.optDouble("offsetX", 0.0).toFloat(),
+                    offsetY = cfg.optDouble("offsetY", 0.0).toFloat(),
+                    width = cfg.optDouble("width", 28.0).toFloat(),
+                    life = cfg.optDouble("life", 0.28).toFloat(),
+                    r = cfg.optDouble("r", 0.35).toFloat(),
+                    g = cfg.optDouble("g", 0.85).toFloat(),
+                    b = cfg.optDouble("b", 1.0).toFloat(),
+                    a = cfg.optDouble("a", 0.85).toFloat(),
+                    additive = cfg.optBoolean("additive", true),
+                    enabled = cfg.optBoolean("enabled", true)
+                )
+            }
+            "setTrailEnabled" -> {
+                engine.rigSystem.combatVfxSystem.setTrailEnabled(toJsStr(args.getOrNull(1), ""), toJsBool(args.getOrNull(2), true)); null
+            }
+            "removeTrail" -> {
+                engine.rigSystem.combatVfxSystem.removeTrail(toJsStr(args.getOrNull(1), "")); null
+            }
+            "spawnAfterimage" -> {
+                val target = engine.findNodeByName(toJsStr(args.getOrNull(1), "")) ?: return null
+                val cfg = try { JSONObject(toJsStr(args.getOrNull(2), "{}")) } catch (_: Exception) { JSONObject() }
+                engine.rigSystem.combatVfxSystem.spawnAfterimage(
+                    n = target,
+                    gt = engine.getGlobalTransform(target),
+                    duration = cfg.optDouble("duration", 0.32).toFloat(),
+                    r = cfg.optDouble("r", 0.35).toFloat(),
+                    g = cfg.optDouble("g", 0.82).toFloat(),
+                    b = cfg.optDouble("b", 1.0).toFloat(),
+                    a = cfg.optDouble("a", 0.65).toFloat()
+                )
+                null
+            }
+            "setAutoAfterimage" -> {
+                val nodeName = toJsStr(args.getOrNull(1), "")
+                val cfg = try { JSONObject(toJsStr(args.getOrNull(2), "{}")) } catch (_: Exception) { JSONObject() }
+                engine.rigSystem.combatVfxSystem.setAutoAfterimage(
+                    nodeName = nodeName,
+                    enabled = cfg.optBoolean("enabled", true),
+                    interval = cfg.optDouble("interval", 0.045).toFloat(),
+                    duration = cfg.optDouble("duration", 0.28).toFloat(),
+                    r = cfg.optDouble("r", 0.35).toFloat(),
+                    g = cfg.optDouble("g", 0.82).toFloat(),
+                    b = cfg.optDouble("b", 1.0).toFloat(),
+                    a = cfg.optDouble("a", 0.62).toFloat()
+                )
+                null
+            }
+            "spawnFloatingText" -> {
+                val x = toJsFloat(args.getOrNull(1), 540f)
+                val y = toJsFloat(args.getOrNull(2), 960f)
+                val text = toJsStr(args.getOrNull(3), "")
+                val cfg = try { JSONObject(toJsStr(args.getOrNull(4), "{}")) } catch (_: Exception) { JSONObject() }
+                val crit = cfg.optBoolean("crit", false)
+                engine.rigSystem.combatVfxSystem.spawnFloatingText(
+                    x = x,
+                    y = y,
+                    text = text,
+                    colorHex = cfg.optString("color", if (crit) "#FACC15" else "#FFFFFF"),
+                    scale = cfg.optDouble("scale", 1.0).toFloat(),
+                    crit = crit,
+                    duration = cfg.optDouble("duration", 0.85).toFloat()
+                )
+                null
+            }
+            // ==================== P20-C: 守卫 AI 状态机与视野锥 ====================
+            "createGuard" -> {
+                val cfg = try { JSONObject(toJsStr(args.getOrNull(1), "{}")) } catch (_: Exception) { JSONObject() }
+                val wpList = mutableListOf<Pair<Float, Float>>()
+                cfg.optJSONArray("waypoints")?.let { arr ->
+                    for (i in 0 until arr.length()) {
+                        val obj = arr.optJSONObject(i)
+                        if (obj != null) {
+                            wpList.add(obj.optDouble("x", 0.0).toFloat() to obj.optDouble("y", 0.0).toFloat())
+                        } else {
+                            val sub = arr.optJSONArray(i)
+                            if (sub != null && sub.length() >= 2) {
+                                wpList.add(sub.optDouble(0, 0.0).toFloat() to sub.optDouble(1, 0.0).toFloat())
+                            }
+                        }
+                    }
+                }
+                engine.rigSystem.stealthGuardSystem.createGuard(
+                    id = cfg.optString("id", ""),
+                    nodeName = cfg.optString("node", ""),
+                    targetName = cfg.optString("target", "Hero"),
+                    waypoints = wpList,
+                    patrolSpeed = cfg.optDouble("patrolSpeed", 130.0).toFloat(),
+                    chaseSpeed = cfg.optDouble("chaseSpeed", 250.0).toFloat(),
+                    viewRange = cfg.optDouble("viewRange", 340.0).toFloat(),
+                    fovDeg = cfg.optDouble("fov", 75.0).toFloat(),
+                    hearMul = cfg.optDouble("hearMul", 1.0).toFloat(),
+                    suspectTime = cfg.optDouble("suspectTime", 0.9).toFloat(),
+                    loseTime = cfg.optDouble("loseTime", 2.4).toFloat(),
+                    wallMask = cfg.optInt("wallMask", 0xFFFF),
+                    showCone = cfg.optBoolean("showCone", true)
+                )
+            }
+            "removeGuard" -> { engine.rigSystem.stealthGuardSystem.removeGuard(toJsStr(args.getOrNull(1), "")); null }
+            "clearGuards" -> { engine.rigSystem.stealthGuardSystem.clear(); null }
+            "getGuardState" -> {
+                val g = engine.rigSystem.stealthGuardSystem.getGuard(toJsStr(args.getOrNull(1), "")) ?: return null
+                JSONObject()
+                    .put("state", g.state)
+                    .put("suspicion", g.suspicion.toDouble())
+                    .put("facingDeg", g.facingDeg.toDouble())
+                    .put("lastKnownX", g.lastKnownX.toDouble())
+                    .put("lastKnownY", g.lastKnownY.toDouble())
+                    .put("hasLastKnown", g.hasLastKnown)
+                    .toString()
+            }
+            // ==================== P20-D: 2D 空间音效 & 马达震动 ====================
+            "playSpatialSFX" -> {
+                engine.rigSystem.combatVfxSystem.playSpatialSfx(
+                    projectDir = engine.projectDir,
+                    fileName = toJsStr(args.getOrNull(1), ""),
+                    wx = toJsFloat(args.getOrNull(2), engine.camX),
+                    wy = toJsFloat(args.getOrNull(3), engine.camY),
+                    camX = engine.camX,
+                    camY = engine.camY,
+                    maxDist = toJsFloat(args.getOrNull(4), 900f),
+                    baseVol = toJsFloat(args.getOrNull(5), 1.0f),
+                    pitch = toJsFloat(args.getOrNull(6), 1.0f)
+                )
+                null
+            }
+            "vibrate" -> {
+                engine.rigSystem.combatVfxSystem.vibrate(
+                    engine = engine,
+                    style = toJsStr(args.getOrNull(1), "light"),
+                    durationMs = toJsInt(args.getOrNull(2), 30).toLong()
+                )
+                null
+            }
+            // ==================== P20-A: 虚拟摇杆 & 技能键 & 血条 ====================
             "setupJoystick" -> {
                 val cfg = try { JSONObject(toJsStr(args.getOrNull(1), "{}")) } catch (_: Exception) { JSONObject() }
                 engine.cutsceneSystem.touchHud.setupJoystick(
@@ -815,6 +955,9 @@ class ZeroScriptBridge(
         private val P18_AI_JS_SHIM = """
             (function() {
               if (typeof Engine === "undefined") return;
+              function _nodeName(n) {
+                return (typeof n === "string") ? n : (n && n.name ? n.name : "");
+              }
               Engine.bakeNavGrid = function(cellSize, pad, mask) {
                 return __zEngineCall("bakeNavGrid",
                   cellSize !== undefined ? cellSize : 48,
@@ -829,11 +972,9 @@ class ZeroScriptBridge(
                 return !!__zEngineCall("isWalkable", x, y);
               };
               Engine.canSee = function(viewer, target, range, fovDeg, facingDeg, wallMask) {
-                var vName = (typeof viewer === "string") ? viewer : (viewer && viewer.name ? viewer.name : "");
-                var tName = (typeof target === "string") ? target : (target && target.name ? target.name : "");
                 var fDeg = (facingDeg !== undefined && facingDeg !== null) ? facingDeg : 999999;
                 return !!__zEngineCall("canSee",
-                  vName, tName,
+                  _nodeName(viewer), _nodeName(target),
                   range !== undefined ? range : 500,
                   fovDeg !== undefined ? fovDeg : 90,
                   fDeg,
@@ -933,6 +1074,57 @@ class ZeroScriptBridge(
               };
               Engine.clearTouchHud = function() {
                 __zEngineCall("clearTouchHud");
+              };
+              // P20-B: 拖尾 / 残影 / 伤害飘字
+              Engine.attachTrail = function(cfg) {
+                var o = cfg || {};
+                if (o.node && typeof o.node !== "string") o = Object.assign({}, o, { node: _nodeName(o.node) });
+                return __zEngineCall("attachTrail", JSON.stringify(o));
+              };
+              Engine.setTrailEnabled = function(id, enabled) {
+                __zEngineCall("setTrailEnabled", id || "", enabled !== false);
+              };
+              Engine.removeTrail = function(id) {
+                __zEngineCall("removeTrail", id || "");
+              };
+              Engine.spawnAfterimage = function(node, cfg) {
+                __zEngineCall("spawnAfterimage", _nodeName(node), JSON.stringify(cfg || {}));
+              };
+              Engine.setAutoAfterimage = function(node, cfg) {
+                __zEngineCall("setAutoAfterimage", _nodeName(node), JSON.stringify(cfg || {}));
+              };
+              Engine.spawnFloatingText = function(x, y, text, cfg) {
+                __zEngineCall("spawnFloatingText", x, y, String(text || ""), JSON.stringify(cfg || {}));
+              };
+              // P20-C: 潜行守卫大脑 & 视野锥
+              Engine.createGuard = function(cfg) {
+                var o = cfg || {};
+                if (o.node && typeof o.node !== "string") o = Object.assign({}, o, { node: _nodeName(o.node) });
+                if (o.target && typeof o.target !== "string") o = Object.assign({}, o, { target: _nodeName(o.target) });
+                return __zEngineCall("createGuard", JSON.stringify(o));
+              };
+              Engine.removeGuard = function(id) {
+                __zEngineCall("removeGuard", id || "");
+              };
+              Engine.clearGuards = function() {
+                __zEngineCall("clearGuards");
+              };
+              Engine.getGuardState = function(id) {
+                var raw = __zEngineCall("getGuardState", id || "");
+                return raw ? JSON.parse(raw) : null;
+              };
+              // P20-D: 2D 空间音效 & 马达震动
+              Engine.playSpatialSFX = function(file, x, y, maxDist, vol, pitch) {
+                __zEngineCall("playSpatialSFX",
+                  file || "",
+                  x !== undefined ? x : 0,
+                  y !== undefined ? y : 0,
+                  maxDist !== undefined ? maxDist : 900,
+                  vol !== undefined ? vol : 1.0,
+                  pitch !== undefined ? pitch : 1.0);
+              };
+              Engine.vibrate = function(style, durationMs) {
+                __zEngineCall("vibrate", style || "light", durationMs !== undefined ? durationMs : 30);
               };
             })();
         """.trimIndent()
