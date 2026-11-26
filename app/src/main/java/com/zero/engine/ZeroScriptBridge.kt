@@ -301,6 +301,19 @@ class ZeroScriptBridge(
 
     private fun invokeEngineMethod(method: String, args: Array<out Any?>): Any? {
         return when (method) {
+            "setWeather" -> {
+                val cfg = try { JSONObject(toJsStr(args.getOrNull(1), "{}")) } catch (_: Exception) { JSONObject() }
+                engine.rigSystem.weatherSystem.setWeather(
+                    typeName = cfg.optString("type", "rain"),
+                    intensityVal = cfg.optDouble("intensity", 0.85).toFloat(),
+                    windX = cfg.optDouble("wind", -220.0).toFloat(),
+                    lightning = cfg.optBoolean("lightning", true),
+                    splash = cfg.optBoolean("splash", true)
+                )
+                null
+            }
+            "triggerLightning" -> { engine.rigSystem.weatherSystem.triggerLightning(); null }
+            "clearWeather" -> { engine.rigSystem.weatherSystem.clear(); null }
             "createWater" -> {
                 val cfg = try { JSONObject(toJsStr(args.getOrNull(1), "{}")) } catch (_: Exception) { JSONObject() }
                 engine.rigSystem.waterSystem.createWater(
@@ -775,6 +788,15 @@ class ZeroScriptBridge(
               };
               Engine.clearWater = function() {
                 __zEngineCall("clearWater");
+              };
+              Engine.setWeather = function(cfg) {
+                __zEngineCall("setWeather", JSON.stringify(cfg || {}));
+              };
+              Engine.triggerLightning = function() {
+                __zEngineCall("triggerLightning");
+              };
+              Engine.clearWeather = function() {
+                __zEngineCall("clearWeather");
               };
             })();
         """.trimIndent()

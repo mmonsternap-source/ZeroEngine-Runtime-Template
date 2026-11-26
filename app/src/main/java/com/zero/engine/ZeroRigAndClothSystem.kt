@@ -7,7 +7,7 @@ import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.*
 
 /**
- * P17 + P18-C GLES 3.0 GPU 布料飘带管线 + 2-Bone IK + 交互式水面托管
+ * P17 + P18-C + P19-A GLES 3.0 GPU 布料飘带 + 2-Bone IK + 交互水面与全局天气联动托管
  */
 class ZeroRigAndClothSystem(
     private val onConsoleLog: (String) -> Unit
@@ -56,6 +56,7 @@ class ZeroRigAndClothSystem(
     private val cloths = ConcurrentHashMap<String, ClothStrip>()
     private val ikChains = ConcurrentHashMap<String, IkChain>()
     val waterSystem = ZeroWaterSystem(onConsoleLog)
+    val weatherSystem = ZeroWeatherSystem(onConsoleLog)
 
     private var clothProgram = 0
     private var globalWindX = 0f
@@ -68,6 +69,7 @@ class ZeroRigAndClothSystem(
     fun initGL() {
         clothProgram = ZeroShaders.buildShaderProgram(CLOTH_VS, CLOTH_FS, onConsoleLog)
         waterSystem.initGL()
+        weatherSystem.initGL()
     }
 
     fun releaseGL() {
@@ -75,6 +77,7 @@ class ZeroRigAndClothSystem(
         cloths.clear()
         ikChains.clear()
         waterSystem.releaseGL()
+        weatherSystem.releaseGL()
         if (clothProgram != 0) {
             GLES20.glDeleteProgram(clothProgram)
             clothProgram = 0
@@ -86,6 +89,7 @@ class ZeroRigAndClothSystem(
         cloths.clear()
         ikChains.clear()
         waterSystem.clear()
+        weatherSystem.clear()
     }
 
     private fun releaseClothVbo(c: ClothStrip) {
@@ -210,6 +214,7 @@ class ZeroRigAndClothSystem(
         getGlobalTransform: (ZeroEngineView.GameNode) -> ZeroEngineView.GlobalTransform
     ) {
         waterSystem.update(dt, nodes, getGlobalTransform)
+        weatherSystem.update(dt, waterSystem)
         elapsedTime += dt
         if (cloths.isEmpty() && ikChains.isEmpty()) return
 
@@ -237,8 +242,8 @@ class ZeroRigAndClothSystem(
                 c.nodes[0].oldY = c.nodes[0].y
             }
 
-            val totalWindX = c.windX + globalWindX
-            val totalGravY = c.gravityY + globalWindY
+            val totalWindX = c.windX + globalWindX + weatherSystem.currentWindX
+            val totalGravY = c.gravityY + globalWindY + weatherSystem.currentWindY
             val damping = 0.965f
 
             for (i in 1 until c.nodes.size) {
@@ -327,53 +332,55 @@ class ZeroRigAndClothSystem(
             onDrawCall
         )
 
-        if (cloths.isEmpty() || clothProgram == 0 || fadeAlpha <= 0.001f) return
+        if (cloths.isNotEmpty() && clothProgram != 0 && fadeAlpha > 0.001f) {
+            val nodeMap = HashMap<String, ZeroEngineView.GameNode>(nodes.size)
+            nodes.forEach { nodeMap[it.name] = it }
 
-        val nodeMap = HashMap<String, ZeroEngineView.GameNode>(nodes.size)
-        nodes.forEach { nodeMap[it.name] = it }
+            GLES20.glUseProgram(clothProgram)
+            val uVpLoc = GLES20.glGetUniformLocation(clothProgram, "uVP")
+            val uZLoc = GLES20.glGetUniformLocation(clothProgram, "uZ")
+            val uCountLoc = GLES20.glGetUniformLocation(clothProgram, "uNodeCount")
+            val uNodesLoc = GLES20.glGetUniformLocation(clothProgram, "uNodes")
+            val uTimeLoc = GLES20.glGetUniformLocation(clothProgram, "uTime")
+            val uFlutterLoc = GLES20.glGetUniformLocation(clothProgram, "uFlutterAmp")
+            val uColorLoc = GLES20.glGetUniformLocation(clothProgram, "uColor")
+            val uTexLoc = GLES20.glGetUniformLocation(clothProgram, "uTexture")
 
-        GLES20.glUseProgram(clothProgram)
-        val uVpLoc = GLES20.glGetUniformLocation(clothProgram, "uVP")
-        val uZLoc = GLES20.glGetUniformLocation(clothProgram, "uZ")
-        val uCountLoc = GLES20.glGetUniformLocation(clothProgram, "uNodeCount")
-        val uNodesLoc = GLES20.glGetUniformLocation(clothProgram, "uNodes")
-        val uTimeLoc = GLES20.glGetUniformLocation(clothProgram, "uTime")
-        val uFlutterLoc = GLES20.glGetUniformLocation(clothProgram, "uFlutterAmp")
-        val uColorLoc = GLES20.glGetUniformLocation(clothProgram, "uColor")
-        val uTexLoc = GLES20.glGetUniformLocation(clothProgram, "uTexture")
+            GLES20.glUniformMatrix4fv(uVpLoc, 1, false, vpMatrix, 0)
+            GLES20.glUniform1f(uTimeLoc, elapsedTime)
+            GLES20.glEnableVertexAttribArray(0)
 
-        GLES20.glUniformMatrix4fv(uVpLoc, 1, false, vpMatrix, 0)
-        GLES20.glUniform1f(uTimeLoc, elapsedTime)
-        GLES20.glEnableVertexAttribArray(0)
+            cloths.values.forEach { c ->
+                val anchor = if (c.anchorNodeName.isNotEmpty()) nodeMap[c.anchorNodeName] else null
+                if (anchor != null && !anchor.visible) return@forEach
+                ensureClothVbo(c)
+                if (c.vboId == 0 || c.vertexCount < 4) return@forEach
 
-        cloths.values.forEach { c ->
-            val anchor = if (c.anchorNodeName.isNotEmpty()) nodeMap[c.anchorNodeName] else null
-            if (anchor != null && !anchor.visible) return@forEach
-            ensureClothVbo(c)
-            if (c.vboId == 0 || c.vertexCount < 4) return@forEach
+                val z = (anchor?.let { getGlobalTransform(it).gz } ?: 0f) + 2f
+                val flutterAmp = (c.turbulence * 0.035f).coerceIn(0f, 14f)
 
-            val z = (anchor?.let { getGlobalTransform(it).gz } ?: 0f) + 2f
-            val flutterAmp = (c.turbulence * 0.035f).coerceIn(0f, 14f)
+                GLES20.glUniform1f(uZLoc, z)
+                GLES20.glUniform1i(uCountLoc, c.nodes.size)
+                GLES20.glUniform4fv(uNodesLoc, c.nodes.size, c.uniformNodes, 0)
+                GLES20.glUniform1f(uFlutterLoc, flutterAmp)
+                GLES20.glUniform4f(uColorLoc, c.r * fadeAlpha, c.g * fadeAlpha, c.b * fadeAlpha, c.a)
 
-            GLES20.glUniform1f(uZLoc, z)
-            GLES20.glUniform1i(uCountLoc, c.nodes.size)
-            GLES20.glUniform4fv(uNodesLoc, c.nodes.size, c.uniformNodes, 0)
-            GLES20.glUniform1f(uFlutterLoc, flutterAmp)
-            GLES20.glUniform4f(uColorLoc, c.r * fadeAlpha, c.g * fadeAlpha, c.b * fadeAlpha, c.a)
+                val texId = if (c.texture.isNotEmpty()) getImageTexture(c.texture) else whiteTexId
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId)
+                GLES20.glUniform1i(uTexLoc, 0)
 
-            val texId = if (c.texture.isNotEmpty()) getImageTexture(c.texture) else whiteTexId
-            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId)
-            GLES20.glUniform1i(uTexLoc, 0)
+                GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, c.vboId)
+                GLES20.glVertexAttribPointer(0, 4, GLES20.GL_FLOAT, false, 16, 0)
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, c.vertexCount)
+                onDrawCall()
+            }
 
-            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, c.vboId)
-            GLES20.glVertexAttribPointer(0, 4, GLES20.GL_FLOAT, false, 16, 0)
-            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, c.vertexCount)
-            onDrawCall()
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+            GLES20.glDisableVertexAttribArray(0)
         }
 
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
-        GLES20.glDisableVertexAttribArray(0)
+        weatherSystem.render(fadeAlpha, onDrawCall)
     }
 
     companion object {

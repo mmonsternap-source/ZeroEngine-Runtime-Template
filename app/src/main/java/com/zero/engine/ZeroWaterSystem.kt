@@ -8,10 +8,10 @@ import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.*
 
 /**
- * P18-C GLES 3.0 2D/2.5D 交互式水面系统：
+ * P18-C + P19-A GLES 3.0 2D/2.5D 交互式水面系统：
  * - 实时屏幕空间倒影（沿水面岸线镜像翻转 + 法线波纹折射）
  * - 程序化水底焦散 + 动态光源着色
- * - 最多 16 道并发物理扩散涟漪 + 节点踩水自动触发波纹
+ * - 最多 16 道并发物理扩散涟漪 + 节点踩水/雨滴自动触发波纹
  */
 class ZeroWaterSystem(
     private val onConsoleLog: (String) -> Unit
@@ -44,6 +44,8 @@ class ZeroWaterSystem(
     )
 
     private val zones = ConcurrentHashMap<String, WaterZone>()
+    val activeZones: Collection<WaterZone> get() = zones.values
+
     private val ripples = mutableListOf<Ripple>()
     private val rippleUniforms = FloatArray(MAX_RIPPLES * 4)
     private val nodeLastPos = HashMap<Int, Pair<Float, Float>>()
@@ -53,7 +55,6 @@ class ZeroWaterSystem(
 
     private val quadBuf: FloatBuffer = ByteBuffer.allocateDirect(4 * 4 * 4)
         .order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
-            // [lx, ly, u, v]
             put(floatArrayOf(
                 -0.5f, -0.5f, 0f, 0f,
                  0.5f, -0.5f, 1f, 0f,
@@ -140,7 +141,6 @@ class ZeroWaterSystem(
         elapsedTime += dt
         if (zones.isEmpty() && ripples.isEmpty()) return
 
-        // 1. 推进并清理过期涟漪
         val it = ripples.iterator()
         while (it.hasNext()) {
             val rp = it.next()
@@ -148,7 +148,6 @@ class ZeroWaterSystem(
             if (rp.age >= rp.maxAge) it.remove()
         }
 
-        // 2. 自动检测涉水移动节点并触发踩水涟漪
         if (zones.values.any { it.autoSplash }) {
             for (n in nodes) {
                 if (!n.visible || n.layer != "World") continue
@@ -187,7 +186,6 @@ class ZeroWaterSystem(
     ) {
         if (zones.isEmpty() || waterProgram == 0 || fadeAlpha <= 0.001f) return
 
-        // 打包当前活跃涟漪到 Uniform 数组
         val activeCount = min(ripples.size, MAX_RIPPLES)
         for (i in 0 until activeCount) {
             val rp = ripples[i]
@@ -269,7 +267,7 @@ class ZeroWaterSystem(
             layout(location = 1) in vec2 aUv;
 
             uniform mat4 uVP;
-            uniform vec4 uWaterRect; // xy=center, zw=size
+            uniform vec4 uWaterRect;
             uniform float uZ;
 
             out vec2 vUv;
@@ -281,7 +279,6 @@ class ZeroWaterSystem(
                 vec2 worldPos = uWaterRect.xy + aLocalPos * uWaterRect.zw;
                 vec4 clip = uVP * vec4(worldPos, uZ, 1.0);
 
-                // 计算该列水面上边缘的屏幕空间 Y，用于 2D/2.5D 岸线镜像倒影
                 vec2 topWorld = vec2(worldPos.x, uWaterRect.y - uWaterRect.w * 0.5);
                 vec4 topClip = uVP * vec4(topWorld, uZ, 1.0);
                 vTopScreenY = (topClip.y / max(0.0001, topClip.w)) * 0.5 + 0.5;
@@ -301,10 +298,10 @@ class ZeroWaterSystem(
             uniform int uHasScene;
             uniform int uHasLight;
             uniform vec4 uColor;
-            uniform vec4 uParams; // x=reflect, y=waveScale, z=waveSpeed, w=caustics
+            uniform vec4 uParams;
             uniform float uTime;
             uniform int uRippleCount;
-            uniform vec4 uRipples[16]; // xy=pos, z=radius, w=amp
+            uniform vec4 uRipples[16];
 
             in vec2 vUv;
             in vec2 vWorldPos;
@@ -318,12 +315,10 @@ class ZeroWaterSystem(
                 float t = uTime * uParams.z;
                 float ws = uParams.y;
 
-                // 1. 双层程序化水面波纹偏移
                 float w1 = sin(vWorldPos.x * 0.045 * ws + t * 2.4 + cos(vWorldPos.y * 0.03 * ws - t * 1.5));
                 float w2 = cos(vWorldPos.y * 0.065 * ws - t * 2.9 + sin(vWorldPos.x * 0.025 * ws + t));
                 vec2 distort = vec2(w1, w2) * 0.0045;
 
-                // 2. 物理扩散涟漪叠加（产生折射偏移 + 波峰高光）
                 float rippleSpec = 0.0;
                 for (int i = 0; i < 16; i++) {
                     if (i >= uRippleCount) break;
@@ -340,7 +335,6 @@ class ZeroWaterSystem(
                     }
                 }
 
-                // 3. 实时屏幕空间倒影采样
                 vec3 reflColor = uColor.rgb * 0.65;
                 float reflFactor = 0.0;
                 if (uHasScene != 0 && uParams.x > 0.001) {
@@ -354,7 +348,6 @@ class ZeroWaterSystem(
                     }
                 }
 
-                // 4. 水底焦散光斑与动态光图染色
                 float c1 = sin(vWorldPos.x * 0.055 * ws + t * 1.9 + sin(vWorldPos.y * 0.04 * ws - t * 1.3));
                 float c2 = cos(vWorldPos.y * 0.055 * ws - t * 1.6 + cos(vWorldPos.x * 0.045 * ws + t * 1.1));
                 float caustic = pow(clamp((c1 * c2) * 0.5 + 0.5, 0.0, 1.0), 4.0) * uParams.w;
@@ -364,7 +357,6 @@ class ZeroWaterSystem(
                     lightMul = max(vec3(0.22), texture(uLightTex, clamp(screenUv + distort * 0.5, 0.0, 1.0)).rgb);
                 }
 
-                // 5. 岸线微弱白沫 + 深度渐变融合
                 float shoreEdge = (1.0 - smoothstep(0.0, 0.06, vUv.y)) * 0.28;
                 vec3 baseWater = mix(uColor.rgb * 1.15, uColor.rgb * 0.55, vUv.y);
                 vec3 finalRgb = mix(baseWater, reflColor, clamp(reflFactor, 0.0, 0.82));
