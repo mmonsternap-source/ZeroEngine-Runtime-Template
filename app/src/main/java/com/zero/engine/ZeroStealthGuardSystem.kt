@@ -263,7 +263,7 @@ class ZeroStealthGuardSystem(
                     val hit = engine.physicsSystem.raycast(
                         nGt.gx, nGt.gy, ex, ey,
                         ignoreTag = node.tag,
-                        colMask = g.wallMask
+                        mask = g.wallMask
                     ) { engine.getGlobalTransform(it) }
                     if (hit.hit) {
                         g.coneVerts[off++] = hit.x
