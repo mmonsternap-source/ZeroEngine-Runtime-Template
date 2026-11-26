@@ -301,6 +301,27 @@ class ZeroScriptBridge(
 
     private fun invokeEngineMethod(method: String, args: Array<out Any?>): Any? {
         return when (method) {
+            "createGrass" -> {
+                val cfg = try { JSONObject(toJsStr(args.getOrNull(1), "{}")) } catch (_: Exception) { JSONObject() }
+                engine.rigSystem.foliageSystem.createGrassPatch(
+                    id = cfg.optString("id", ""),
+                    x = cfg.optDouble("x", 540.0).toFloat(),
+                    y = cfg.optDouble("y", 960.0).toFloat(),
+                    z = cfg.optDouble("z", 1.5).toFloat(),
+                    width = cfg.optDouble("width", 780.0).toFloat(),
+                    height = cfg.optDouble("height", 360.0).toFloat(),
+                    count = cfg.optInt("count", 1400),
+                    bladeW = cfg.optDouble("bladeW", 12.0).toFloat(),
+                    bladeH = cfg.optDouble("bladeH", 54.0).toFloat(),
+                    r = cfg.optDouble("r", 0.16).toFloat(),
+                    g = cfg.optDouble("g", 0.62).toFloat(),
+                    b = cfg.optDouble("b", 0.24).toFloat(),
+                    windStrength = cfg.optDouble("wind", 1.0).toFloat(),
+                    bendStrength = cfg.optDouble("bend", 1.25).toFloat()
+                )
+            }
+            "removeGrass" -> { engine.rigSystem.foliageSystem.removeGrassPatch(toJsStr(args.getOrNull(1), "")); null }
+            "clearGrass" -> { engine.rigSystem.foliageSystem.clear(); null }
             "setWeather" -> {
                 val cfg = try { JSONObject(toJsStr(args.getOrNull(1), "{}")) } catch (_: Exception) { JSONObject() }
                 engine.rigSystem.weatherSystem.setWeather(
@@ -797,6 +818,15 @@ class ZeroScriptBridge(
               };
               Engine.clearWeather = function() {
                 __zEngineCall("clearWeather");
+              };
+              Engine.createGrass = function(cfg) {
+                return __zEngineCall("createGrass", JSON.stringify(cfg || {}));
+              };
+              Engine.removeGrass = function(id) {
+                __zEngineCall("removeGrass", id || "");
+              };
+              Engine.clearGrass = function() {
+                __zEngineCall("clearGrass");
               };
             })();
         """.trimIndent()
