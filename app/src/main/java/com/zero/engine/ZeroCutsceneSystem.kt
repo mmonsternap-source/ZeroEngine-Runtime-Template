@@ -19,13 +19,14 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * P19-C JSON 驱动剧情对话与过场导演系统：
+ * P19-C + P20-A JSON 驱动剧情对话与过场导演系统（同时托管原生虚拟摇杆与 HUD 覆层）：
  * 支持指令：say / choice / wait / camera / move / shake / fade / flag / sfx / bgm / jump
- * 原生 Android 覆层渲染文字与分支按钮，自动适配中英文换行与编辑器/打包双环境。
  */
 class ZeroCutsceneSystem(
     private val engine: ZeroEngineView
 ) {
+    val touchHud = ZeroTouchHudSystem(engine)
+
     @Volatile var isPlaying: Boolean = false
         private set
 
@@ -115,7 +116,8 @@ class ZeroCutsceneSystem(
         return true
     }
 
-    fun clear() {
+    /** 仅结束当前剧情对话，保留虚拟摇杆与 HUD */
+    fun stop() {
         isPlaying = false
         steps = emptyList()
         labelIndex.clear()
@@ -125,7 +127,14 @@ class ZeroCutsceneSystem(
         hideOverlayUi()
     }
 
+    /** 切换场景或销毁引擎时调用：清空剧情并一并清理虚拟摇杆与 HUD */
+    fun clear() {
+        stop()
+        touchHud.clear()
+    }
+
     fun update(dt: Float) {
+        touchHud.update(dt, isPlaying)
         if (!isPlaying) return
         when (stepType) {
             "say", "choice" -> {
@@ -314,8 +323,8 @@ class ZeroCutsceneSystem(
             }
         }
 
-        // 所有步骤执行完毕
-        clear()
+        // 所有步骤执行完毕，仅结束剧情，保留摇杆与 HUD
+        stop()
     }
 
     private fun onDialogTapGl() {
@@ -447,7 +456,6 @@ class ZeroCutsceneSystem(
             bodyView?.text = text
             hintView?.visibility = if (done && optsSnapshot == null) View.VISIBLE else View.GONE
 
-            // 更新立绘/头像
             portraitView?.let { pv ->
                 if (portraitFile.isEmpty()) {
                     pv.visibility = View.GONE
@@ -467,7 +475,6 @@ class ZeroCutsceneSystem(
                 }
             }
 
-            // 更新分支选项按钮
             choicesBox?.let { cb ->
                 cb.removeAllViews()
                 if (optsSnapshot != null) {

@@ -301,8 +301,67 @@ class ZeroScriptBridge(
 
     private fun invokeEngineMethod(method: String, args: Array<out Any?>): Any? {
         return when (method) {
+            "setupJoystick" -> {
+                val cfg = try { JSONObject(toJsStr(args.getOrNull(1), "{}")) } catch (_: Exception) { JSONObject() }
+                engine.cutsceneSystem.touchHud.setupJoystick(
+                    enabled = cfg.optBoolean("enabled", true),
+                    x = cfg.optDouble("x", 0.18).toFloat(),
+                    y = cfg.optDouble("y", 0.84).toFloat(),
+                    radius = cfg.optDouble("radius", 115.0).toFloat(),
+                    floating = cfg.optBoolean("floating", true)
+                )
+                null
+            }
+            "getJoystick" -> {
+                val h = engine.cutsceneSystem.touchHud
+                JSONObject()
+                    .put("x", h.joyDx.toDouble())
+                    .put("y", h.joyDy.toDouble())
+                    .put("active", h.joyActive)
+                    .put("mag", h.joyMag.toDouble())
+                    .put("angle", h.joyAngleDeg.toDouble())
+                    .toString()
+            }
+            "addHudButton" -> {
+                val cfg = try { JSONObject(toJsStr(args.getOrNull(1), "{}")) } catch (_: Exception) { JSONObject() }
+                engine.cutsceneSystem.touchHud.addButton(
+                    id = cfg.optString("id", "btn"),
+                    label = cfg.optString("label", "A"),
+                    x = cfg.optDouble("x", 0.85).toFloat(),
+                    y = cfg.optDouble("y", 0.84).toFloat(),
+                    radius = cfg.optDouble("radius", 72.0).toFloat(),
+                    colorHex = cfg.optString("color", "#EF4444"),
+                    action = cfg.optString("action", ""),
+                    cooldown = cfg.optDouble("cooldown", 0.0).toFloat()
+                )
+                null
+            }
+            "removeHudButton" -> { engine.cutsceneSystem.touchHud.removeButton(toJsStr(args.getOrNull(1), "")); null }
+            "isHudButtonDown" -> engine.cutsceneSystem.touchHud.isButtonDown(toJsStr(args.getOrNull(1), ""))
+            "isHudButtonJustPressed" -> engine.cutsceneSystem.touchHud.isButtonJustPressed(toJsStr(args.getOrNull(1), ""))
+            "startButtonCooldown" -> {
+                engine.cutsceneSystem.touchHud.startButtonCooldown(toJsStr(args.getOrNull(1), ""), toJsFloat(args.getOrNull(2), 1f)); null
+            }
+            "getButtonCooldown" -> engine.cutsceneSystem.touchHud.getButtonCooldown(toJsStr(args.getOrNull(1), "")).toDouble()
+            "setHudBar" -> {
+                val cfg = try { JSONObject(toJsStr(args.getOrNull(1), "{}")) } catch (_: Exception) { JSONObject() }
+                engine.cutsceneSystem.touchHud.setBar(
+                    id = cfg.optString("id", "hp"),
+                    label = cfg.optString("label", "HP"),
+                    value = cfg.optDouble("value", 100.0).toFloat(),
+                    maxValue = cfg.optDouble("max", 100.0).toFloat(),
+                    x = cfg.optDouble("x", 0.04).toFloat(),
+                    y = cfg.optDouble("y", 0.24).toFloat(),
+                    w = cfg.optDouble("w", 0.40).toFloat(),
+                    h = cfg.optDouble("h", 28.0).toFloat(),
+                    colorHex = cfg.optString("color", "#22C55E")
+                )
+                null
+            }
+            "removeHudBar" -> { engine.cutsceneSystem.touchHud.removeBar(toJsStr(args.getOrNull(1), "")); null }
+            "clearTouchHud" -> { engine.cutsceneSystem.touchHud.clear(); null }
             "playCutscene" -> engine.cutsceneSystem.play(toJsStr(args.getOrNull(1), ""))
-            "stopCutscene" -> { engine.cutsceneSystem.clear(); null }
+            "stopCutscene" -> { engine.cutsceneSystem.stop(); null }
             "isCutscenePlaying" -> engine.cutsceneSystem.isPlaying
             "createGrass" -> {
                 val cfg = try { JSONObject(toJsStr(args.getOrNull(1), "{}")) } catch (_: Exception) { JSONObject() }
@@ -840,6 +899,40 @@ class ZeroScriptBridge(
               };
               Engine.isCutscenePlaying = function() {
                 return !!__zEngineCall("isCutscenePlaying");
+              };
+              Engine.setupJoystick = function(cfg) {
+                __zEngineCall("setupJoystick", JSON.stringify(cfg || {}));
+              };
+              Engine.getJoystick = function() {
+                var raw = __zEngineCall("getJoystick");
+                return raw ? JSON.parse(raw) : { x: 0, y: 0, active: false, mag: 0, angle: 0 };
+              };
+              Engine.addHudButton = function(cfg) {
+                __zEngineCall("addHudButton", JSON.stringify(cfg || {}));
+              };
+              Engine.removeHudButton = function(id) {
+                __zEngineCall("removeHudButton", id || "");
+              };
+              Engine.isHudButtonDown = function(id) {
+                return !!__zEngineCall("isHudButtonDown", id || "");
+              };
+              Engine.isHudButtonJustPressed = function(id) {
+                return !!__zEngineCall("isHudButtonJustPressed", id || "");
+              };
+              Engine.startButtonCooldown = function(id, sec) {
+                __zEngineCall("startButtonCooldown", id || "", sec !== undefined ? sec : 1.0);
+              };
+              Engine.getButtonCooldown = function(id) {
+                return __zEngineCall("getButtonCooldown", id || "") || 0;
+              };
+              Engine.setHudBar = function(cfg) {
+                __zEngineCall("setHudBar", JSON.stringify(cfg || {}));
+              };
+              Engine.removeHudBar = function(id) {
+                __zEngineCall("removeHudBar", id || "");
+              };
+              Engine.clearTouchHud = function() {
+                __zEngineCall("clearTouchHud");
               };
             })();
         """.trimIndent()
