@@ -7,10 +7,9 @@ import java.nio.FloatBuffer
 import kotlin.math.max
 
 /**
- * P15 次世代 2D 光影系统（OpenGL ES 3.0）：
- * 1. 全像素级 JFA (Jump Flood Algorithm) 距离场：支持任意透明轮廓 PNG、斜坡与整张 TileMap，无遮挡数量上限
- * 2. 2-Cascade Radiance Gathering（双级联辐射采集）+ SDF 球体步进：光线遇墙自动反弹并截断，彻底杜绝穿墙漏光
- * 3. 内置 2D SDF 环境光遮蔽（AO）与分离高斯降噪
+ * P15 + P18-B 次世代 2D 光影系统（OpenGL ES 3.0）：
+ * 1. 全像素级 JFA 距离场 + 2-Cascade 辐射级联 GI + 2D SDF 墙角 AO
+ * 2. P18-B：JFA 体积光（上帝光 / 丁达尔光束）+ 受光源染色的 FBM 动态流动迷雾（零额外 DrawCall）
  */
 class ZeroGlobalIlluminationSystem(
     private val onConsoleLog: (String) -> Unit
@@ -18,13 +17,21 @@ class ZeroGlobalIlluminationSystem(
     var enabled: Boolean = true
     var jfaEnabled: Boolean = true
     var intensity: Float = 0.72f
-    var radius: Float = 0.22f       // 屏幕空间最大光线反弹扩散半径 (0.04 ~ 0.45)
-    var threshold: Float = 0.18f    // 触发光线反弹的亮度阈值
-    var saturation: Float = 1.40f   // 间接光溢色饱和度增强
-    var aoStrength: Float = 0.65f   // 2D SDF 墙角接触暗部强度 (0 ~ 1)
+    var radius: Float = 0.22f
+    var threshold: Float = 0.18f
+    var saturation: Float = 1.40f
+    var aoStrength: Float = 0.65f
     var skyR: Float = 0.04f
     var skyG: Float = 0.06f
     var skyB: Float = 0.10f
+
+    // P18-B 体积光与动态迷雾参数
+    var volumetricIntensity: Float = 0.65f
+    var fogDensity: Float = 0.26f
+    var fogSpeed: Float = 0.18f
+    var fogR: Float = 0.24f
+    var fogG: Float = 0.42f
+    var fogB: Float = 0.68f
 
     private var seedProgram = 0
     private var jfaProgram = 0
@@ -33,7 +40,6 @@ class ZeroGlobalIlluminationSystem(
     private var blurProgram = 0
     private var compositeProgram = 0
 
-    // 1/4 分辨率管线 FBO
     private var occluderFbo = 0
     private var occluderTex = 0
     private var jfaFboA = 0
@@ -146,9 +152,6 @@ class ZeroGlobalIlluminationSystem(
         rcGiProgram = 0; blurProgram = 0; compositeProgram = 0
     }
 
-    /**
-     * 绑定 1/4 分辨率遮挡物 FBO，清空为全透明，准备光栅化所有 shadowCaster 节点
-     */
     fun beginOccluderPass(): Boolean {
         sdfBuiltThisFrame = false
         if (!isJfaReady) return false
@@ -159,15 +162,11 @@ class ZeroGlobalIlluminationSystem(
         return true
     }
 
-    /**
-     * 执行 JFA 种子提取 -> 8 趟 Jump Flood -> 全屏精确距离场生成
-     */
     fun buildJfaDistanceField(onDrawCall: () -> Unit) {
         if (!isJfaReady) return
         GLES20.glDisable(GLES20.GL_BLEND)
         GLES20.glViewport(0, 0, giW, giH)
 
-        // 1. Seed Pass: occluderTex -> jfaFboA
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, jfaFboA)
         GLES20.glUseProgram(seedProgram)
         bindQuadAttribs()
@@ -177,7 +176,6 @@ class ZeroGlobalIlluminationSystem(
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
         onDrawCall()
 
-        // 2. Jump Flood 8 趟（覆盖最大 256px 半径，足以横跨 1/4 分辨率整屏）
         val maxDim = max(giW, giH)
         var step = 1
         while (step * 2 < maxDim) step *= 2
@@ -206,13 +204,11 @@ class ZeroGlobalIlluminationSystem(
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
             onDrawCall()
 
-            // Ping-Pong 交换
             val tmpF = srcFbo; srcFbo = dstFbo; dstFbo = tmpF
             val tmpT = srcTex; srcTex = dstTex; dstTex = tmpT
             step /= 2
         }
 
-        // 3. Distance Field Pass: srcTex -> sdfFbo
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, sdfFbo)
         GLES20.glUseProgram(sdfProgram)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
@@ -227,9 +223,6 @@ class ZeroGlobalIlluminationSystem(
         sdfBuiltThisFrame = true
     }
 
-    /**
-     * 执行双级联辐射 GI（SDF 球体步进 -> 水平降噪 -> 垂直降噪 -> 滤色叠加至屏幕）
-     */
     fun renderAndComposite(
         sceneColorTex: Int,
         lightMapTex: Int,
@@ -239,12 +232,13 @@ class ZeroGlobalIlluminationSystem(
         time: Float,
         onDrawCall: () -> Unit
     ) {
-        if (!enabled || !fboReady || intensity <= 0.001f || fadeAlpha <= 0.001f) return
+        if (!enabled || !fboReady || fadeAlpha <= 0.001f) return
+        if (intensity <= 0.001f && volumetricIntensity <= 0.001f && fogDensity <= 0.001f) return
         if (sceneColorTex == 0 || lightMapTex == 0) return
 
         GLES20.glDisable(GLES20.GL_BLEND)
 
-        // Pass 1：双级联辐射采集（带全像素 JFA 墙体遮挡与接触 AO）
+        // Pass 1：双级联辐射 GI + JFA 体积光 + 动态 FBM 迷雾
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, giFboA)
         GLES20.glViewport(0, 0, giW, giH)
         GLES20.glUseProgram(rcGiProgram)
@@ -265,11 +259,16 @@ class ZeroGlobalIlluminationSystem(
         val invAspectX = giH.toFloat() / max(1, giW).toFloat()
         GLES20.glUniform2f(GLES20.glGetUniformLocation(rcGiProgram, "uInvAspect"), invAspectX, 1.0f)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(rcGiProgram, "uUseJfa"), if (sdfBuiltThisFrame && jfaEnabled) 1 else 0)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(rcGiProgram, "uIntensity"), intensity)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(rcGiProgram, "uRadius"), radius)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(rcGiProgram, "uThreshold"), threshold)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(rcGiProgram, "uSaturation"), saturation)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(rcGiProgram, "uAoStrength"), aoStrength)
         GLES20.glUniform3f(GLES20.glGetUniformLocation(rcGiProgram, "uSkyColor"), skyR, skyG, skyB)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(rcGiProgram, "uVolumetric"), volumetricIntensity)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(rcGiProgram, "uFogDensity"), fogDensity)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(rcGiProgram, "uFogSpeed"), fogSpeed)
+        GLES20.glUniform3f(GLES20.glGetUniformLocation(rcGiProgram, "uFogColor"), fogR, fogG, fogB)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(rcGiProgram, "uTime"), time)
 
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
@@ -291,7 +290,7 @@ class ZeroGlobalIlluminationSystem(
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, giTexA)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(compositeProgram, "uGiTex"), 0)
-        GLES20.glUniform1f(GLES20.glGetUniformLocation(compositeProgram, "uIntensity"), intensity * fadeAlpha)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(compositeProgram, "uIntensity"), fadeAlpha)
 
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
         onDrawCall()
@@ -437,11 +436,16 @@ class ZeroGlobalIlluminationSystem(
             uniform sampler2D uSdfTex;
             uniform vec2 uInvAspect;
             uniform int uUseJfa;
+            uniform float uIntensity;
             uniform float uRadius;
             uniform float uThreshold;
             uniform float uSaturation;
             uniform float uAoStrength;
             uniform vec3 uSkyColor;
+            uniform float uVolumetric;
+            uniform float uFogDensity;
+            uniform float uFogSpeed;
+            uniform vec3 uFogColor;
             uniform float uTime;
 
             in vec2 vTexCoord;
@@ -453,12 +457,34 @@ class ZeroGlobalIlluminationSystem(
                 return fract((p3.x + p3.y) * p3.z);
             }
 
+            float vnoise(vec2 p) {
+                vec2 i = floor(p);
+                vec2 f = fract(p);
+                vec2 u = f * f * (3.0 - 2.0 * f);
+                float a = hash12(i);
+                float b = hash12(i + vec2(1.0, 0.0));
+                float c = hash12(i + vec2(0.0, 1.0));
+                float d = hash12(i + vec2(1.0, 1.0));
+                return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+            }
+
+            float fbm3(vec2 p) {
+                float v = 0.0;
+                float amp = 0.5;
+                for (int i = 0; i < 3; i++) {
+                    v += amp * vnoise(p);
+                    p = p * 2.03 + vec2(17.1, 31.7);
+                    amp *= 0.5;
+                }
+                return v;
+            }
+
             vec3 boostSat(vec3 c, float sat) {
                 float luma = dot(c, vec3(0.299, 0.587, 0.114));
                 return max(vec3(0.0), mix(vec3(luma), c, sat));
             }
 
-            vec3 traceCascadeRay(vec2 dir, float tStart, float tMax, int maxSteps, float minStep) {
+            vec3 traceCascadeRay(vec2 dir, float tStart, float tMax, int maxSteps, float minStep, inout vec3 volAccum) {
                 float t = tStart;
                 vec3 rayAccum = vec3(0.0);
                 for (int s = 0; s < 10; s++) {
@@ -466,24 +492,32 @@ class ZeroGlobalIlluminationSystem(
                     vec2 suv = vTexCoord + dir * t;
                     if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) break;
 
-                    vec3 direct = texture(uSceneTex, suv).rgb * texture(uLightTex, suv).rgb;
+                    vec3 lightCol = texture(uLightTex, suv).rgb;
+                    vec3 direct = texture(uSceneTex, suv).rgb * lightCol;
                     float lum = max(direct.r, max(direct.g, direct.b));
                     float falloff = 1.0 - (t / max(0.001, tMax)) * 0.72;
 
                     if (uUseJfa != 0) {
                         float d = texture(uSdfTex, suv).r;
                         if (d < 0.0045) {
-                            // 命中墙体/遮挡体：采集表面彩色漫反射反弹光并截断射线（彻底防穿墙漏光）
                             if (lum > uThreshold * 0.75) {
                                 rayAccum += direct * falloff * smoothstep(uThreshold * 0.75, uThreshold + 0.28, lum) * 1.35;
                             }
                             break;
+                        }
+                        if (uVolumetric > 0.001) {
+                            vec3 shaft = max(vec3(0.0), lightCol - vec3(0.42));
+                            volAccum += shaft * (falloff * falloff) * 0.11;
                         }
                         if (lum > uThreshold) {
                             rayAccum += direct * falloff * smoothstep(uThreshold, uThreshold + 0.35, lum) * 0.32;
                         }
                         t += max(minStep, d * 0.85);
                     } else {
+                        if (uVolumetric > 0.001) {
+                            vec3 shaft = max(vec3(0.0), lightCol - vec3(0.42));
+                            volAccum += shaft * (falloff * falloff) * 0.08;
+                        }
                         if (lum > uThreshold) {
                             rayAccum += direct * falloff * smoothstep(uThreshold, uThreshold + 0.35, lum) * 0.30;
                         }
@@ -497,30 +531,55 @@ class ZeroGlobalIlluminationSystem(
                 float jitter = hash12(gl_FragCoord.xy + fract(uTime) * 19.0) * 0.39269908;
                 vec3 nearAccum = vec3(0.0);
                 vec3 farAccum = vec3(0.0);
+                vec3 volAccum = vec3(0.0);
 
                 float nearMax = uRadius * 0.42;
                 float farStart = uRadius * 0.24;
 
-                // 双级联交错方向采集：Cascade 0（近场精细遮挡）+ Cascade 1（远场大范围溢色）
                 for (int i = 0; i < 16; i++) {
                     float ang0 = jitter + float(i) * 0.39269908;
                     vec2 dir0 = vec2(cos(ang0), sin(ang0)) * uInvAspect;
-                    nearAccum += traceCascadeRay(dir0, 0.008, nearMax, 7, nearMax / 7.0);
+                    nearAccum += traceCascadeRay(dir0, 0.008, nearMax, 7, nearMax / 7.0, volAccum);
 
                     float ang1 = ang0 + 0.19634954;
                     vec2 dir1 = vec2(cos(ang1), sin(ang1)) * uInvAspect;
-                    farAccum += traceCascadeRay(dir1, farStart, uRadius, 9, (uRadius - farStart) / 9.0);
+                    farAccum += traceCascadeRay(dir1, farStart, uRadius, 9, (uRadius - farStart) / 9.0, volAccum);
                 }
 
                 float ao = 1.0;
-                if (uUseJfa != 0 && uAoStrength > 0.001) {
+                float wallClear = 1.0;
+                if (uUseJfa != 0) {
                     float selfDist = texture(uSdfTex, vTexCoord).r;
-                    ao = mix(1.0, smoothstep(0.0, 0.045, selfDist), clamp(uAoStrength, 0.0, 1.0));
+                    wallClear = smoothstep(0.002, 0.025, selfDist);
+                    if (uAoStrength > 0.001) {
+                        ao = mix(1.0, smoothstep(0.0, 0.045, selfDist), clamp(uAoStrength, 0.0, 1.0));
+                    }
                 }
 
+                // 1. 双级联辐射 GI
                 vec3 combined = (nearAccum * 0.62 + farAccum * 0.48) / 16.0;
-                vec3 gi = boostSat(combined, uSaturation) + uSkyColor * ao;
-                fragColor = vec4(gi, 1.0);
+                vec3 gi = (boostSat(combined, uSaturation) + uSkyColor * ao) * uIntensity;
+
+                // 2. 动态 FBM 流动迷雾（双层错向飘动 + 受局部光照染色）
+                float fogNoise = 0.5;
+                vec3 fogLayer = vec3(0.0);
+                if (uFogDensity > 0.001 || uVolumetric > 0.001) {
+                    vec2 fogUv = vTexCoord * vec2(1.0 / max(0.1, uInvAspect.x), 1.0);
+                    float drift = uTime * uFogSpeed;
+                    float n1 = fbm3(fogUv * 3.2 + vec2(drift, drift * 0.35));
+                    float n2 = fbm3(fogUv * 5.8 - vec2(drift * 0.65, -drift * 0.42));
+                    fogNoise = clamp(n1 * 0.62 + n2 * 0.38, 0.0, 1.0);
+                }
+                if (uFogDensity > 0.001) {
+                    vec3 localLight = texture(uLightTex, vTexCoord).rgb;
+                    float mist = smoothstep(0.22, 0.88, fogNoise) * uFogDensity * wallClear;
+                    fogLayer = uFogColor * (0.28 + localLight * 1.15) * mist;
+                }
+
+                // 3. JFA 体积光（丁达尔光束在流动雾气中产生明暗纹理）
+                vec3 godRays = (volAccum / 16.0) * uVolumetric * (0.58 + 0.52 * fogNoise) * wallClear;
+
+                fragColor = vec4(gi + godRays + fogLayer, 1.0);
             }
         """.trimIndent()
 
