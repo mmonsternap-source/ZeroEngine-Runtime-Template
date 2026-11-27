@@ -1,4 +1,4 @@
-# ZeroEngine
+# Zeno
 
 A lightweight 2D / 2.5D game engine in active development, focused on flexible architecture and a smooth build pipeline.
 
@@ -28,9 +28,10 @@ A lightweight 2D / 2.5D game engine in active development, focused on flexible a
 2. Run the build command from the project root:
    ```bash
    ./gradlew assembleDebug
-   、、、
-## Dev Notes / Known Issues
-​Track blockers, performance bottlenecks, or temporary workarounds here so you can pick up easily later.
+   ```
 
-## ​License & Notes
-​Currently in personal development (all rights reserved until explicitly licensed; add a license such as MIT or Apache-2.0 if open-sourced later).
+## Dev Notes / Known Issues
+Track blockers, performance bottlenecks, or temporary workarounds here so you can pick up easily later.
+
+## License & Notes
+Currently in personal development (all rights reserved until explicitly licensed; add a license such as MIT or Apache-2.0 if open-sourced later).
