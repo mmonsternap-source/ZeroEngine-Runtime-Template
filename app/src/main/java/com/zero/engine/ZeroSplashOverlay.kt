@@ -30,7 +30,7 @@ object ZeroSplashOverlay {
         var subtitle: String = "POWERED BY ZENO ENGINE",
         var bgColor: String = "#060913",
         var accentColor: String = "#38BDF8",
-        var durationMs: Int = 2100
+        var durationMs: Int = 3000
     )
 
     private fun isZh(ctx: Context): Boolean {
@@ -64,7 +64,7 @@ object ZeroSplashOverlay {
             cfg.subtitle = o.optString("subtitle", "POWERED BY ZENO ENGINE")
             cfg.bgColor = o.optString("bgColor", "#060913")
             cfg.accentColor = o.optString("accentColor", "#38BDF8")
-            cfg.durationMs = o.optInt("durationMs", 2100).coerceIn(1000, 5000)
+            cfg.durationMs = o.optInt("durationMs", 3000).coerceIn(1000, 6000)
             cfg
         } catch (_: Exception) {
             cfg
@@ -105,7 +105,7 @@ object ZeroSplashOverlay {
         isEditorLaunch: Boolean = false,
         onComplete: (() -> Unit)? = null
     ) {
-        val cfg = if (isEditorLaunch) SplashConfig(mode = "default", durationMs = 1900) else loadConfig(ctx, projectDir)
+        val cfg = if (isEditorLaunch) SplashConfig(mode = "default", durationMs = 2800) else loadConfig(ctx, projectDir)
         if (!isEditorLaunch && cfg.mode == "none") {
             onComplete?.invoke()
             return
@@ -324,6 +324,9 @@ object ZeroSplashOverlay {
         dialog.show()
     }
 
+    /**
+     * 60fps Zeno 棱镜流光开屏动画视图
+     */
     private class SplashAnimView(
         ctx: Context,
         private val isCustom: Boolean,
@@ -428,9 +431,10 @@ object ZeroSplashOverlay {
             val h = height.toFloat()
             if (w <= 0f || h <= 0f) return
 
-            val fadeOut = if (progress > 0.80f) ((1f - progress) / 0.20f).coerceIn(0f, 1f) else 1f
+            val fadeOut = if (progress > 0.85f) ((1f - progress) / 0.15f).coerceIn(0f, 1f) else 1f
             val masterAlpha = (fadeOut * 255f).toInt().coerceIn(0, 255)
 
+            // 1. 深空黑曜石径向光晕背景
             bgPaint.shader = RadialGradient(
                 w * 0.5f, h * 0.43f, max(w, h) * 0.72f,
                 Color.argb(masterAlpha, Color.red(accentInt) / 6, Color.green(accentInt) / 5, Color.blue(accentInt) / 4 + 32),
@@ -443,6 +447,7 @@ object ZeroSplashOverlay {
             val cy = h * 0.43f
             val baseR = min(w, h) * 0.165f
 
+            // 2. 能量波扩散光环
             val waveP = ((progress - 0.18f) / 0.45f).coerceIn(0f, 1f)
             if (waveP > 0f && waveP < 1f) {
                 val waveAlpha = ((1f - waveP) * 110f * fadeOut).toInt().coerceIn(0, 255)
@@ -474,6 +479,7 @@ object ZeroSplashOverlay {
                 titlePaint.alpha = (ringP * fadeOut * 255f).toInt().coerceIn(0, 255)
                 canvas.drawText(initial, cx, cy + baseR * 0.34f, titlePaint)
             } else {
+                // ==================== Zeno 官方六边形棱镜 + 光刃 Z 动效 ====================
                 hexPath.reset()
                 for (i in 0 until 6) {
                     val angle = Math.toRadians((i * 60.0) - 90.0)
@@ -548,6 +554,7 @@ object ZeroSplashOverlay {
                     canvas.drawPath(zBotPath, zFillPaint)
                     zFillPaint.shader = null
 
+                    // 镜面流光扫过
                     if (progress > 0.48f) {
                         val sweepT = ((progress - 0.48f) / 0.34f).coerceIn(0f, 1f)
                         val sweepX = cx - baseR * 1.3f + baseR * 2.6f * sweepT
@@ -572,6 +579,7 @@ object ZeroSplashOverlay {
                 }
             }
 
+            // 3. 标题与副标题滑入淡出
             val textP = ((progress - 0.24f) / 0.30f).coerceIn(0f, 1f)
             val textAlpha = (textP * fadeOut * 255f).toInt().coerceIn(0, 255)
             val slideY = (1f - textP) * 32f
