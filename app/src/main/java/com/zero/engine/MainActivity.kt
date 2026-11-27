@@ -15,7 +15,7 @@ import android.widget.Toast
 import java.io.File
 
 /**
- * ZeroEngine-Runtime-Template 纯运行态入口（独立商业游戏发布壳）
+ * Zeno 纯运行态入口（独立商业游戏发布壳）
  * 启动时自动释放 assets/game/ 至本地运行目录，播放开屏 Logo 动画并全屏加载 scenes/main.scene
  */
 class MainActivity : Activity() {
@@ -38,7 +38,7 @@ class MainActivity : Activity() {
             val runtimeDir = prepareRuntimeGameDir()
             val sceneJson = loadEntrySceneJson(runtimeDir)
             if (sceneJson.isBlank()) {
-                showStartupError("未找到入口场景 scenes/main.scene\n请通过 ZeroEngine 的「🚀发布」按钮重新打包工程。")
+                showStartupError("未找到入口场景 scenes/main.scene\n请通过 Zeno 的「🚀发布」按钮重新打包工程。")
                 return
             }
 
@@ -46,7 +46,7 @@ class MainActivity : Activity() {
                 context = this,
                 projectDir = runtimeDir,
                 sceneJson = sceneJson,
-                onConsoleLog = { msg -> Log.d("ZeroRuntime", msg) }
+                onConsoleLog = { msg -> Log.d("ZenoRuntime", msg) }
             )
             engineView = surface
             container.addView(
@@ -57,10 +57,10 @@ class MainActivity : Activity() {
                 )
             )
 
-            // 播放开屏 Logo 动画（默认 Zero Engine 动效，支持读取项目自定义 splash.json / splash_logo.png）
+            // 播放开屏 Logo 动画（默认 Zeno 动效，支持读取项目自定义 splash.json / splash_logo.png）
             ZeroSplashOverlay.show(this, container, runtimeDir, isEditorLaunch = false)
         } catch (e: Exception) {
-            Log.e("ZeroRuntime", "Boot failed", e)
+            Log.e("ZenoRuntime", "Boot failed", e)
             showStartupError("游戏启动异常：${e.message}")
         }
     }
@@ -81,9 +81,21 @@ class MainActivity : Activity() {
                 subDir.mkdirs()
             }
             extractAssetFolder("game", runtimeDir)
+            copyAssetIfExists("game/splash.json", File(runtimeDir, "splash.json"))
+            copyAssetIfExists("game/splash_logo.png", File(runtimeDir, "splash_logo.png"))
             stampFile.writeText(currentStamp)
         }
         return runtimeDir
+    }
+
+    private fun copyAssetIfExists(assetPath: String, destFile: File) {
+        try {
+            assets.open(assetPath).use { input ->
+                destFile.parentFile?.mkdirs()
+                destFile.outputStream().use { output -> input.copyTo(output) }
+            }
+        } catch (_: Exception) {
+        }
     }
 
     private fun computeBuildStamp(): String {
