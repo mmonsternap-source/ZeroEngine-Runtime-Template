@@ -8,7 +8,6 @@ import android.content.Context
 import android.graphics.*
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
-import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.animation.DecelerateInterpolator
@@ -19,17 +18,17 @@ import java.util.Locale
 import kotlin.math.*
 
 /**
- * ZeroEngine 统一开屏 Logo 动画 & 自定义开屏配置器
- * - 编辑器启动：播放 Zero Engine 官方矢量动效
- * - 运行/导出游戏：默认播放 Zero Engine 动效，支持读取项目内 splash.json + splash_logo.png 自定义
+ * Zeno 统一开屏 Logo 动画 & 自定义开屏配置器
+ * - 编辑器启动：播放 Zeno 官方棱镜流光动效
+ * - 运行/导出游戏：默认播放 Zeno 动效，支持读取项目内 splash.json + splash_logo.png 自定义
  */
 object ZeroSplashOverlay {
 
     data class SplashConfig(
         var mode: String = "default",        // default | custom | both | none
         var title: String = "MY STUDIO",
-        var subtitle: String = "POWERED BY ZERO ENGINE",
-        var bgColor: String = "#020617",
+        var subtitle: String = "POWERED BY ZENO ENGINE",
+        var bgColor: String = "#060913",
         var accentColor: String = "#38BDF8",
         var durationMs: Int = 2100
     )
@@ -47,9 +46,6 @@ object ZeroSplashOverlay {
         return lang.lowercase(Locale.US).startsWith("zh")
     }
 
-    /**
-     * 读取项目配置（优先读取 projectDir，导出独立 APK 时自动回退读取 assets）
-     */
     fun loadConfig(ctx: Context, projectDir: File?): SplashConfig {
         val cfg = SplashConfig()
         val raw = try {
@@ -65,8 +61,8 @@ object ZeroSplashOverlay {
             val o = JSONObject(raw)
             cfg.mode = o.optString("mode", "default")
             cfg.title = o.optString("title", "MY STUDIO")
-            cfg.subtitle = o.optString("subtitle", "POWERED BY ZERO ENGINE")
-            cfg.bgColor = o.optString("bgColor", "#020617")
+            cfg.subtitle = o.optString("subtitle", "POWERED BY ZENO ENGINE")
+            cfg.bgColor = o.optString("bgColor", "#060913")
             cfg.accentColor = o.optString("accentColor", "#38BDF8")
             cfg.durationMs = o.optInt("durationMs", 2100).coerceIn(1000, 5000)
             cfg
@@ -102,10 +98,6 @@ object ZeroSplashOverlay {
         }
     }
 
-    /**
-     * 在指定容器最顶层播放开屏 Logo 动画
-     * @param isEditorLaunch true=打开 ZeroEngine 编辑器（强制播官方 Logo）；false=运行/导出游戏（按项目配置播放）
-     */
     fun show(
         ctx: Context,
         container: ViewGroup,
@@ -136,7 +128,7 @@ object ZeroSplashOverlay {
             )
             view.bringToFront()
             view.startAnimation {
-                container.removeView(view)
+                try { container.removeView(view) } catch (_: Exception) {}
                 next()
             }
         }
@@ -149,9 +141,6 @@ object ZeroSplashOverlay {
         }
     }
 
-    /**
-     * 编辑器专用：弹出「游戏开屏 Logo 自定义」配置弹窗
-     */
     fun showConfigDialog(
         ctx: Context,
         projectDir: File,
@@ -179,9 +168,9 @@ object ZeroSplashOverlay {
 
         val descTv = TextView(ctx).apply {
             text = if (zh) {
-                "导出的游戏默认播放 Zero Engine 动画，你也可以改成自己的 Logo 或双开屏："
+                "导出的游戏默认播放 Zeno 动画，你也可以改成自己的 Logo 或双开屏："
             } else {
-                "Exported games show the Zero Engine logo by default. Customize or replace it here:"
+                "Exported games show the Zeno logo by default. Customize or replace it here:"
             }
             textSize = 12f
             setTextColor(Color.parseColor("#94A3B8"))
@@ -191,16 +180,16 @@ object ZeroSplashOverlay {
         val modes = listOf("default", "custom", "both", "none")
         val modeLabels = if (zh) {
             arrayOf(
-                "默认：仅播放 Zero Engine Logo 动画",
+                "默认：仅播放 Zeno 官方 Logo 动画",
                 "自定义：仅播放我制作的 Logo 动画",
-                "双开屏：先播 Zero Engine，再播我的 Logo",
+                "双开屏：先播 Zeno，再播我的 Logo",
                 "关闭：游戏直接进入画面（无开屏）"
             )
         } else {
             arrayOf(
-                "Default: Zero Engine Logo only",
+                "Default: Zeno Logo only",
                 "Custom: My Custom Logo only",
-                "Both: Zero Engine -> My Custom Logo",
+                "Both: Zeno -> My Custom Logo",
                 "Off: Skip splash screen"
             )
         }
@@ -232,7 +221,7 @@ object ZeroSplashOverlay {
         }
 
         val etTitle = makeInput(if (zh) "自定义主标题（如：我的工作室）" else "Custom Title (e.g. MY STUDIO)", cfg.title)
-        val etSub = makeInput(if (zh) "副标题（如：Presents）" else "Subtitle (e.g. Presents)", cfg.subtitle)
+        val etSub = makeInput(if (zh) "副标题（如：POWERED BY ZENO ENGINE）" else "Subtitle (e.g. POWERED BY ZENO ENGINE)", cfg.subtitle)
         val etAccent = makeInput(if (zh) "主题流光色（十六进制，如 #38BDF8）" else "Accent Hex Color (e.g. #38BDF8)", cfg.accentColor)
 
         val imgStatus = TextView(ctx).apply {
@@ -335,9 +324,6 @@ object ZeroSplashOverlay {
         dialog.show()
     }
 
-    /**
-     * 60fps 矢量流光开屏动画视图
-     */
     private class SplashAnimView(
         ctx: Context,
         private val isCustom: Boolean,
@@ -349,9 +335,9 @@ object ZeroSplashOverlay {
         private var animator: ValueAnimator? = null
         private var finished = false
 
-        private val bgColorInt = parseColorSafe(if (isCustom) cfg.bgColor else "#020617", Color.parseColor("#020617"))
+        private val bgColorInt = parseColorSafe(if (isCustom) cfg.bgColor else "#060913", Color.parseColor("#060913"))
         private val accentInt = parseColorSafe(if (isCustom) cfg.accentColor else "#38BDF8", Color.parseColor("#38BDF8"))
-        private val secondaryInt = Color.parseColor("#818CF8")
+        private val secondaryInt = Color.parseColor("#8B5CF6")
 
         private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -362,33 +348,46 @@ object ZeroSplashOverlay {
             style = Paint.Style.STROKE
             strokeCap = Paint.Cap.ROUND
         }
-        private val zPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeCap = Paint.Cap.ROUND
-            strokeJoin = Paint.Join.ROUND
+        private val hexFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = Color.parseColor("#0B1324")
         }
-        private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        private val hexStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeJoin = Paint.Join.ROUND
+            strokeCap = Paint.Cap.ROUND
+        }
+        private val zFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+        }
+        private val sweepPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+        }
         private val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.WHITE
             textAlign = Paint.Align.CENTER
             typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-            letterSpacing = 0.22f
+            letterSpacing = 0.28f
         }
         private val subPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#94A3B8")
+            color = Color.parseColor("#38BDF8")
             textAlign = Paint.Align.CENTER
             typeface = Typeface.MONOSPACE
-            letterSpacing = 0.16f
+            letterSpacing = 0.18f
         }
         private val bmpPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
         private val arcRect = RectF()
-        private val zPath = Path()
+        private val hexPath = Path()
+        private val partialHexPath = Path()
+        private val pathMeasure = PathMeasure()
+        private val zTopPath = Path()
+        private val zDiagPath = Path()
+        private val zBotPath = Path()
 
         init {
             isClickable = true
             isFocusable = true
             setOnClickListener {
-                // 播放超过 0.55 秒后点击可快速跳过
                 if (progress > 0.28f) finishNow()
             }
         }
@@ -400,7 +399,7 @@ object ZeroSplashOverlay {
             val dur = cfg.durationMs.toLong()
             animator = ValueAnimator.ofFloat(0f, 1f).apply {
                 duration = dur
-                interpolator = DecelerateInterpolator(1.1f)
+                interpolator = DecelerateInterpolator(1.15f)
                 addUpdateListener {
                     progress = it.animatedValue as Float
                     invalidate()
@@ -429,14 +428,12 @@ object ZeroSplashOverlay {
             val h = height.toFloat()
             if (w <= 0f || h <= 0f) return
 
-            // 全局淡出系数（最后 20% 平滑隐去）
             val fadeOut = if (progress > 0.80f) ((1f - progress) / 0.20f).coerceIn(0f, 1f) else 1f
             val masterAlpha = (fadeOut * 255f).toInt().coerceIn(0, 255)
 
-            // 1. 深空径向渐变背景
             bgPaint.shader = RadialGradient(
-                w * 0.5f, h * 0.44f, max(w, h) * 0.7f,
-                Color.argb(masterAlpha, Color.red(accentInt) / 6, Color.green(accentInt) / 5, Color.blue(accentInt) / 4 + 28),
+                w * 0.5f, h * 0.43f, max(w, h) * 0.72f,
+                Color.argb(masterAlpha, Color.red(accentInt) / 6, Color.green(accentInt) / 5, Color.blue(accentInt) / 4 + 32),
                 Color.argb(masterAlpha, Color.red(bgColorInt), Color.green(bgColorInt), Color.blue(bgColorInt)),
                 Shader.TileMode.CLAMP
             )
@@ -444,9 +441,8 @@ object ZeroSplashOverlay {
 
             val cx = w * 0.5f
             val cy = h * 0.43f
-            val baseR = min(w, h) * 0.16f
+            val baseR = min(w, h) * 0.165f
 
-            // 2. 冲击波扩散光环
             val waveP = ((progress - 0.18f) / 0.45f).coerceIn(0f, 1f)
             if (waveP > 0f && waveP < 1f) {
                 val waveAlpha = ((1f - waveP) * 110f * fadeOut).toInt().coerceIn(0, 255)
@@ -456,7 +452,6 @@ object ZeroSplashOverlay {
             }
 
             if (isCustom && customBitmap != null) {
-                // 自定义图片 Logo 动效
                 val popP = (progress / 0.35f).coerceIn(0f, 1f)
                 val scale = 0.78f + 0.22f * sin(popP * Math.PI * 0.5).toFloat()
                 val imgAlpha = (popP * fadeOut * 255f).toInt().coerceIn(0, 255)
@@ -468,7 +463,6 @@ object ZeroSplashOverlay {
                 val dst = RectF(cx - dw * 0.5f, cy - dh * 0.5f, cx + dw * 0.5f, cy + dh * 0.5f)
                 canvas.drawBitmap(customBitmap, null, dst, bmpPaint)
             } else if (isCustom) {
-                // 自定义纯文字流光徽章
                 val ringP = (progress / 0.42f).coerceIn(0f, 1f)
                 arcRect.set(cx - baseR, cy - baseR, cx + baseR, cy + baseR)
                 ringPaint.strokeWidth = baseR * 0.10f
@@ -480,63 +474,118 @@ object ZeroSplashOverlay {
                 titlePaint.alpha = (ringP * fadeOut * 255f).toInt().coerceIn(0, 255)
                 canvas.drawText(initial, cx, cy + baseR * 0.34f, titlePaint)
             } else {
-                // ==================== Zero Engine 官方矢量 Logo 动效 ====================
-                val ringP = (progress / 0.40f).coerceIn(0f, 1f)
-                val zP = ((progress - 0.10f) / 0.32f).coerceIn(0f, 1f)
-                val rotOffset = -90f + (1f - ringP) * 90f
+                hexPath.reset()
+                for (i in 0 until 6) {
+                    val angle = Math.toRadians((i * 60.0) - 90.0)
+                    val px = cx + (baseR * cos(angle)).toFloat()
+                    val py = cy + (baseR * sin(angle)).toFloat()
+                    if (i == 0) hexPath.moveTo(px, py) else hexPath.lineTo(px, py)
+                }
+                hexPath.close()
 
-                // 外圈发光光晕
-                arcRect.set(cx - baseR, cy - baseR, cx + baseR, cy + baseR)
-                glowPaint.strokeWidth = baseR * 0.24f
-                glowPaint.color = Color.argb((55 * fadeOut).toInt(), Color.red(accentInt), Color.green(accentInt), Color.blue(accentInt))
-                canvas.drawArc(arcRect, rotOffset, 320f * ringP, false, glowPaint)
+                val fillAlpha = (((progress - 0.10f) / 0.32f).coerceIn(0f, 1f) * fadeOut * 235f).toInt().coerceIn(0, 255)
+                hexFillPaint.alpha = fillAlpha
+                canvas.drawPath(hexPath, hexFillPaint)
 
-                // 主 "0" 能量双弧环
-                ringPaint.strokeWidth = baseR * 0.11f
-                ringPaint.shader = LinearGradient(
+                val strokeP = (progress / 0.44f).coerceIn(0f, 1f)
+                pathMeasure.setPath(hexPath, false)
+                partialHexPath.reset()
+                pathMeasure.getSegment(0f, pathMeasure.length * strokeP, partialHexPath, true)
+
+                hexStrokePaint.strokeWidth = baseR * 0.085f
+                hexStrokePaint.alpha = masterAlpha
+                hexStrokePaint.shader = LinearGradient(
                     cx - baseR, cy - baseR, cx + baseR, cy + baseR,
                     accentInt, secondaryInt, Shader.TileMode.CLAMP
                 )
-                ringPaint.alpha = masterAlpha
-                canvas.drawArc(arcRect, rotOffset, 315f * ringP, false, ringPaint)
-                ringPaint.shader = null
+                canvas.drawPath(partialHexPath, hexStrokePaint)
+                hexStrokePaint.shader = null
 
-                // 轨道流光星点
-                val orbitAngle = Math.toRadians((rotOffset + 315f * ringP + progress * 45f).toDouble())
-                val ox = cx + cos(orbitAngle).toFloat() * baseR
-                val oy = cy + sin(orbitAngle).toFloat() * baseR
-                dotPaint.color = Color.argb(masterAlpha, 255, 255, 255)
-                canvas.drawCircle(ox, oy, baseR * 0.08f, dotPaint)
+                val zP = ((progress - 0.16f) / 0.38f).coerceIn(0f, 1f)
+                if (zP > 0f) {
+                    val zScale = 0.80f + 0.20f * sin(zP * Math.PI * 0.5).toFloat()
+                    val zAlpha = (zP * fadeOut * 255f).toInt().coerceIn(0, 255)
+                    canvas.save()
+                    canvas.scale(zScale, zScale, cx, cy)
 
-                // 内部锐利 "Z" 核心缩放绘制
-                val zScale = 0.6f + 0.4f * sin(zP * Math.PI * 0.5).toFloat()
-                val zr = baseR * 0.46f * zScale
-                zPath.reset()
-                zPath.moveTo(cx - zr, cy - zr * 0.78f)
-                zPath.lineTo(cx + zr, cy - zr * 0.78f)
-                zPath.lineTo(cx - zr, cy + zr * 0.78f)
-                zPath.lineTo(cx + zr, cy + zr * 0.78f)
+                    val half = baseR * 0.52f
+                    val thick = baseR * 0.19f
 
-                zPaint.strokeWidth = baseR * 0.14f
-                zPaint.color = Color.argb((zP * fadeOut * 255f).toInt().coerceIn(0, 255), 248, 250, 252)
-                canvas.drawPath(zPath, zPaint)
+                    zTopPath.reset()
+                    zTopPath.moveTo(cx - half, cy - half)
+                    zTopPath.lineTo(cx + half, cy - half)
+                    zTopPath.lineTo(cx + half - thick * 0.85f, cy - half + thick)
+                    zTopPath.lineTo(cx - half, cy - half + thick)
+                    zTopPath.close()
+
+                    zDiagPath.reset()
+                    zDiagPath.moveTo(cx + half, cy - half)
+                    zDiagPath.lineTo(cx - half + thick * 0.9f, cy + half)
+                    zDiagPath.lineTo(cx - half, cy + half)
+                    zDiagPath.lineTo(cx + half - thick * 0.9f, cy - half)
+                    zDiagPath.close()
+
+                    zBotPath.reset()
+                    zBotPath.moveTo(cx - half + thick * 0.85f, cy + half - thick)
+                    zBotPath.lineTo(cx + half, cy + half - thick)
+                    zBotPath.lineTo(cx + half, cy + half)
+                    zBotPath.lineTo(cx - half, cy + half)
+                    zBotPath.close()
+
+                    zFillPaint.alpha = zAlpha
+                    zFillPaint.shader = LinearGradient(
+                        cx - half, cy - half, cx + half, cy + half,
+                        intArrayOf(
+                            Color.parseColor("#E0F2FE"),
+                            Color.parseColor("#38BDF8"),
+                            Color.parseColor("#A855F7")
+                        ),
+                        floatArrayOf(0f, 0.48f, 1f),
+                        Shader.TileMode.CLAMP
+                    )
+                    canvas.drawPath(zTopPath, zFillPaint)
+                    canvas.drawPath(zDiagPath, zFillPaint)
+                    canvas.drawPath(zBotPath, zFillPaint)
+                    zFillPaint.shader = null
+
+                    if (progress > 0.48f) {
+                        val sweepT = ((progress - 0.48f) / 0.34f).coerceIn(0f, 1f)
+                        val sweepX = cx - baseR * 1.3f + baseR * 2.6f * sweepT
+                        canvas.save()
+                        canvas.clipPath(hexPath)
+                        sweepPaint.shader = LinearGradient(
+                            sweepX - baseR * 0.35f, cy - baseR,
+                            sweepX + baseR * 0.35f, cy + baseR,
+                            intArrayOf(
+                                Color.TRANSPARENT,
+                                Color.argb((120 * fadeOut).toInt(), 255, 255, 255),
+                                Color.TRANSPARENT
+                            ),
+                            floatArrayOf(0f, 0.5f, 1f),
+                            Shader.TileMode.CLAMP
+                        )
+                        canvas.drawRect(cx - baseR, cy - baseR, cx + baseR, cy + baseR, sweepPaint)
+                        sweepPaint.shader = null
+                        canvas.restore()
+                    }
+                    canvas.restore()
+                }
             }
 
-            // 3. 标题与副标题滑入淡出
             val textP = ((progress - 0.24f) / 0.30f).coerceIn(0f, 1f)
             val textAlpha = (textP * fadeOut * 255f).toInt().coerceIn(0, 255)
             val slideY = (1f - textP) * 32f
 
-            val mainTitle = if (isCustom) cfg.title else "ZERO ENGINE"
-            val subTitle = if (isCustom) cfg.subtitle else "POWERED BY ZERO ENGINE v2.0"
+            val mainTitle = if (isCustom) cfg.title else "ZENO"
+            val subTitle = if (isCustom) cfg.subtitle else "POWERED BY ZENO ENGINE"
 
-            titlePaint.textSize = min(w, h) * 0.062f
+            titlePaint.textSize = min(w, h) * 0.068f
             titlePaint.alpha = textAlpha
             canvas.drawText(mainTitle, cx, cy + baseR * 1.65f + slideY, titlePaint)
 
             if (subTitle.isNotBlank()) {
-                subPaint.textSize = min(w, h) * 0.026f
-                subPaint.alpha = (textAlpha * 0.85f).toInt()
+                subPaint.textSize = min(w, h) * 0.025f
+                subPaint.alpha = (textAlpha * 0.88f).toInt()
                 canvas.drawText(subTitle, cx, cy + baseR * 2.02f + slideY, subPaint)
             }
         }
